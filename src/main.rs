@@ -654,9 +654,16 @@ fn install_wrapper() -> Result<()> {
     let config = cargo_config()?;
     let exe = fs::canonicalize(std::env::current_exe()?)?;
     let current = fs::read_to_string(&config).unwrap_or_default();
+    let entry = format!("rustc-wrapper = {:?}  # cargo-pool: disk check on every pooled build", exe.to_string_lossy());
     if let Some(line) = current.lines().find(|l| l.trim_start().starts_with("rustc-wrapper")) {
-        if line.contains("cargo-pool") {
+        if line.trim() == entry {
             println!("already installed in {}", config.display());
+            return Ok(());
+        }
+        if is_our_wrapper_line(line) {
+            // Installed from another location before: point it at this binary.
+            fs::write(&config, current.replacen(line, &entry, 1))?;
+            println!("updated rustc-wrapper in {} to {}", config.display(), exe.display());
             return Ok(());
         }
         bail!(
@@ -665,7 +672,6 @@ fn install_wrapper() -> Result<()> {
             line.trim()
         );
     }
-    let entry = format!("rustc-wrapper = {:?}  # cargo-pool: disk check on every pooled build", exe.to_string_lossy());
     let updated = match current.lines().position(|l| l.trim() == "[build]") {
         Some(i) => {
             let mut lines: Vec<&str> = current.lines().collect();
