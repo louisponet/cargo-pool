@@ -10,7 +10,7 @@
 use std::collections::BTreeMap;
 use std::ffi::{CString, OsString};
 use std::fs::{self, File, OpenOptions};
-use std::io::Write;
+use std::io::{Read, Write};
 use std::os::fd::AsRawFd;
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{MetadataExt, symlink};
@@ -102,6 +102,9 @@ enum Cmd {
     InstallWrapper,
     /// Remove the `build.rustc-wrapper` entry added by `install-wrapper`.
     UninstallWrapper,
+    /// Snapshot a slot's worktree once the running build finishes (spawned by the wrapper).
+    #[command(hide = true)]
+    SnapshotAfterBuild { slot: PathBuf },
     /// Hook entry point (called by the installed post-checkout hook).
     #[command(hide = true)]
     PostCheckout { prev: String, new: String, flag: String },
@@ -157,6 +160,7 @@ fn run(cli: Cli) -> Result<()> {
         }
         Cmd::InstallHook { path, repo } => install_hook_auto(path, repo),
         Cmd::UninstallHook { path } => uninstall_hook_auto(path),
+        Cmd::SnapshotAfterBuild { slot } => snapshot_after_build(&slot),
         Cmd::InstallWrapper => install_wrapper(),
         Cmd::UninstallWrapper => uninstall_wrapper(),
         Cmd::PostCheckout { prev, .. } => {
@@ -295,13 +299,23 @@ fn pool_root() -> Result<PathBuf> {
     Ok(PathBuf::from(home).join(".cache/cargo-pool"))
 }
 
-/// Stable hash for directory names (std's hasher isn't guaranteed stable).
+const FNV_OFFSET: u64 = 0xcbf29ce484222325;
+
+/// Stable hash for directory names and file contents (std's hasher isn't guaranteed stable).
 fn fnv1a(bytes: &[u8]) -> u64 {
-    bytes.iter().fold(0xcbf29ce484222325, |h, b| (h ^ *b as u64).wrapping_mul(0x100000001b3))
+    fnv1a_update(FNV_OFFSET, bytes)
+}
+
+fn fnv1a_update(h: u64, bytes: &[u8]) -> u64 {
+    bytes.iter().fold(h, |h, b| (h ^ *b as u64).wrapping_mul(0x100000001b3))
 }
 
 fn now() -> u64 {
     SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs()
+}
+
+fn now_ns() -> u64 {
+    SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos() as u64
 }
 
 // ---------------------------------------------------------------------------
@@ -354,7 +368,12 @@ fn lock_target(target: &Path) -> Option<Vec<FileLock>> {
 
 /// Last time cargo produced output in this target dir.
 fn last_activity(target: &Path) -> u64 {
-    let mut newest = mtime(target);
+    last_activity_ns(target) / 1_000_000_000
+}
+
+/// Newest mtime of cargo's output dirs (not of `target` itself: moving it changes that).
+fn last_activity_ns(target: &Path) -> u64 {
+    let mut newest = 0;
     let mut stack = vec![(target.to_path_buf(), 0)];
     while let Some((dir, depth)) = stack.pop() {
         let Ok(rd) = fs::read_dir(&dir) else { continue };
@@ -364,7 +383,7 @@ fn last_activity(target: &Path) -> u64 {
             }
             let name = e.file_name();
             if name == "deps" || name == ".fingerprint" || name == "incremental" {
-                newest = newest.max(mtime(&e.path()));
+                newest = newest.max(mtime_ns(&e.path()));
             } else if depth < 2 {
                 stack.push((e.path(), depth + 1));
             }
@@ -373,12 +392,15 @@ fn last_activity(target: &Path) -> u64 {
     newest
 }
 
-fn mtime(p: &Path) -> u64 {
-    fs::metadata(p)
-        .and_then(|m| m.modified())
+fn mtime_ns(p: &Path) -> u64 {
+    fs::metadata(p).map_or(0, |m| modified_ns(&m))
+}
+
+fn modified_ns(m: &fs::Metadata) -> u64 {
+    m.modified()
         .ok()
         .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
-        .map_or(0, |d| d.as_secs())
+        .map_or(0, |d| d.as_nanos() as u64)
 }
 
 // ---------------------------------------------------------------------------
@@ -611,9 +633,17 @@ fn check_disk_during_build(rustc_args: &[OsString]) -> Result<()> {
     let (Ok(out_dir), Ok(root)) = (fs::canonicalize(out_dir), fs::canonicalize(pool_root()?)) else {
         return Ok(());
     };
-    let Some(pool) = out_dir.strip_prefix(&root).ok().and_then(|p| p.components().next()) else {
-        return Ok(());
-    };
+    let Ok(rel) = out_dir.strip_prefix(&root) else { return Ok(()) };
+    let mut parts = rel.components().map(|c| c.as_os_str());
+    let Some(pool) = parts.next() else { return Ok(()) };
+    if let (Some(slots), Some(id)) = (parts.next(), parts.next())
+        && slots == "slots"
+    {
+        let slot_dir = root.join(pool).join(slots).join(id);
+        if let Err(e) = note_pooled_compile(&slot_dir) {
+            eprintln!("cargo-pool: warning: can't track build for mtime snapshots: {e:#}");
+        }
+    }
     let git_dir = PathBuf::from(fs::read_to_string(root.join(pool).join("repo")).unwrap_or_default());
     let max_disk = setting(&git_dir, "CARGO_POOL_MAX_DISK_PERCENT", "cargo-pool.maxDiskPercent", 90.0);
     if disk_percent(&root, 0)? < max_disk {
@@ -754,6 +784,252 @@ fn uninstall_wrapper() -> Result<()> {
 }
 
 // ---------------------------------------------------------------------------
+// snapshots: carry file mtimes over to the next worktree
+//
+// Cargo decides freshness of workspace crates by comparing source mtimes with the time of
+// the last build, so a fresh checkout (all mtimes "now") rebuilds every workspace crate.
+// After each build into a slot we record (size, mtime, content hash) of every file in its
+// worktree. When the slot moves to a new worktree, files whose content matches get their
+// recorded mtime back: cargo then sees exactly what it saw after that build, as if the new
+// worktree's changes had been made in the old one. Cargo itself treats files modified
+// during a build as dirty, so copying exact (content, mtime) pairs inherits its correctness.
+
+/// State of a worktree's files right after a build into the slot.
+#[derive(Serialize, Deserialize, Default)]
+struct Snapshot {
+    /// When the snapshot was started (ns). Only valid while nothing compiled since.
+    taken_at: u64,
+    /// Path relative to the worktree -> (size, mtime in ns, content hash).
+    files: BTreeMap<String, (u64, u64, u64)>,
+    /// Directories holding those files -> (mtime in ns, hash of entry names). Cargo checks
+    /// directory mtimes for `rerun-if-changed=<dir>`.
+    #[serde(default)]
+    dirs: BTreeMap<String, (u64, u64)>,
+}
+
+fn dir_listing_hash(p: &Path) -> Option<u64> {
+    let mut names: Vec<_> = fs::read_dir(p).ok()?.flatten().map(|e| e.file_name()).collect();
+    names.sort();
+    Some(names.iter().fold(FNV_OFFSET, |h, n| fnv1a_update(fnv1a_update(h, n.as_encoded_bytes()), b"\0")))
+}
+
+fn hash_file(p: &Path) -> Option<u64> {
+    let mut f = File::open(p).ok()?;
+    let mut buf = vec![0; 1 << 16];
+    let mut h = FNV_OFFSET;
+    loop {
+        match f.read(&mut buf).ok()? {
+            0 => return Some(h),
+            n => h = fnv1a_update(h, &buf[..n]),
+        }
+    }
+}
+
+/// Tracked and untracked (not ignored) files of a worktree, relative to its root.
+fn worktree_files(wt: &Path) -> Result<Vec<String>> {
+    let out = git(wt, &["ls-files", "-z", "--cached", "--others", "--exclude-standard"])?;
+    let mut files: Vec<String> = out.split('\0').filter(|f| !f.is_empty()).map(String::from).collect();
+    files.dedup();
+    Ok(files)
+}
+
+fn take_snapshot(wt: &Path, prev: Option<&Snapshot>) -> Result<Snapshot> {
+    let mut snap = Snapshot { taken_at: now_ns(), ..Default::default() };
+    for rel in worktree_files(wt)? {
+        let p = wt.join(&rel);
+        let Ok(m) = fs::symlink_metadata(&p) else { continue };
+        if !m.is_file() {
+            continue;
+        }
+        let (size, mtime) = (m.len(), modified_ns(&m));
+        let hash = match prev.and_then(|s| s.files.get(&rel)) {
+            Some(&(s, t, h)) if (s, t) == (size, mtime) => h,
+            _ => {
+                let Some(h) = hash_file(&p) else { continue };
+                // Modified while hashing: the hash may not belong to this mtime.
+                match fs::symlink_metadata(&p) {
+                    Ok(m) if (m.len(), modified_ns(&m)) == (size, mtime) => h,
+                    _ => continue,
+                }
+            }
+        };
+        snap.files.insert(rel, (size, mtime, hash));
+    }
+    let dirs: std::collections::BTreeSet<String> = snap
+        .files
+        .keys()
+        .flat_map(|f| Path::new(f).ancestors().skip(1).map(|d| d.to_string_lossy().into_owned()))
+        .collect();
+    for rel in dirs {
+        let p = wt.join(&rel);
+        let mtime = mtime_ns(&p);
+        if let Some(listing) = dir_listing_hash(&p)
+            && mtime_ns(&p) == mtime
+        {
+            snap.dirs.insert(rel, (mtime, listing));
+        }
+    }
+    Ok(snap)
+}
+
+fn load_snapshot(slot_dir: &Path) -> Option<Snapshot> {
+    serde_json::from_slice(&fs::read(slot_dir.join("snapshot.json")).ok()?).ok()
+}
+
+fn save_snapshot(slot_dir: &Path, snap: &Snapshot) -> Result<()> {
+    let tmp = slot_dir.join("snapshot.json.tmp");
+    fs::write(&tmp, serde_json::to_vec(snap)?)?;
+    fs::rename(tmp, slot_dir.join("snapshot.json"))?;
+    Ok(())
+}
+
+/// Last time anything was compiled into the slot: the rustc wrapper's marker, or cargo's
+/// output directories for builds that bypassed the wrapper.
+fn last_compile_ns(slot_dir: &Path) -> u64 {
+    mtime_ns(&slot_dir.join("last-compile")).max(last_activity_ns(&slot_dir.join("target")))
+}
+
+/// The slot's snapshot, if nothing has been compiled into the slot since it was taken.
+fn valid_snapshot(slot_dir: &Path) -> Option<Snapshot> {
+    load_snapshot(slot_dir).filter(|s| s.taken_at > last_compile_ns(slot_dir))
+}
+
+/// Give every file in `wt` whose content matches the snapshot its recorded mtime.
+/// Returns (files matched, files in the worktree).
+fn backdate(wt: &Path, snap: &Snapshot) -> Result<(usize, usize)> {
+    let files = worktree_files(wt)?;
+    let mut matched = 0;
+    for rel in &files {
+        let Some(&(size, mtime, hash)) = snap.files.get(rel) else { continue };
+        let p = wt.join(rel);
+        let Ok(m) = fs::symlink_metadata(&p) else { continue };
+        if !m.is_file() || m.len() != size {
+            continue;
+        }
+        if modified_ns(&m) != mtime {
+            if hash_file(&p) != Some(hash) {
+                continue;
+            }
+            File::open(&p)?.set_modified(UNIX_EPOCH + Duration::from_nanos(mtime))?;
+        }
+        matched += 1;
+    }
+    // Same for directories whose entries are unchanged (setting a child's mtime doesn't
+    // touch its parent's, so the order doesn't matter).
+    for (rel, &(mtime, listing)) in &snap.dirs {
+        let p = wt.join(rel);
+        if mtime_ns(&p) != mtime && dir_listing_hash(&p) == Some(listing) {
+            File::open(&p)?.set_modified(UNIX_EPOCH + Duration::from_nanos(mtime))?;
+        }
+    }
+    // Refresh git's cached stat info so `git status` doesn't rehash everything.
+    let _ = git(wt, &["update-index", "-q", "--refresh"]);
+    Ok((matched, files.len()))
+}
+
+/// Delete the fingerprints of units whose recorded inputs include git metadata of another
+/// checkout, e.g. `git_version!()` tracking `.git/worktrees/<other>/HEAD`. Those inputs
+/// don't change when this worktree moves to another commit, so the units would stay fresh
+/// and keep embedding the other checkout's version info. Returns how many were reset.
+fn invalidate_foreign_git_inputs(repo: &Repo, target: &Path) -> Result<usize> {
+    let own_gitdir = git(&repo.worktree, &["rev-parse", "--path-format=absolute", "--git-dir"])?;
+    let common = repo.common_dir.as_os_str().as_bytes();
+    let refers_elsewhere = |bytes: &[u8]| {
+        bytes
+            .windows(common.len())
+            .enumerate()
+            .filter(|(_, w)| *w == common)
+            .any(|(i, _)| !bytes[i..].starts_with(own_gitdir.as_bytes()))
+    };
+    let mut fingerprint_dirs = vec![];
+    let mut stack = vec![(target.to_path_buf(), 0)];
+    while let Some((dir, depth)) = stack.pop() {
+        for e in fs::read_dir(&dir).into_iter().flatten().flatten() {
+            if !e.file_type().is_ok_and(|t| t.is_dir()) {
+                continue;
+            }
+            if e.file_name() == ".fingerprint" {
+                fingerprint_dirs.push(e.path());
+            } else if depth < 2 {
+                stack.push((e.path(), depth + 1));
+            }
+        }
+    }
+    let mut reset = 0;
+    for unit in fingerprint_dirs.iter().flat_map(|d| fs::read_dir(d).into_iter().flatten().flatten()) {
+        let foreign = fs::read_dir(unit.path())
+            .into_iter()
+            .flatten()
+            .flatten()
+            .any(|f| fs::read(f.path()).is_ok_and(|b| refers_elsewhere(&b)));
+        if foreign {
+            fs::remove_dir_all(unit.path())?;
+            reset += 1;
+        }
+    }
+    Ok(reset)
+}
+
+fn backdate_enabled(repo: &Repo) -> bool {
+    setting(&repo.common_dir, "CARGO_POOL_BACKDATE", "cargo-pool.backdate", true)
+}
+
+/// Called by the rustc wrapper for every compile into a slot: invalidate the slot's
+/// snapshot and make sure a waiter will snapshot the worktree once the build ends.
+fn note_pooled_compile(slot_dir: &Path) -> Result<()> {
+    let marker = OpenOptions::new().create(true).truncate(false).write(true).open(slot_dir.join("last-compile"))?;
+    marker.set_modified(SystemTime::now())?;
+    // A waiter holds this lock; don't start a second one.
+    if FileLock::acquire(&slot_dir.join("snapshot.lock"), false)?.is_none() {
+        return Ok(());
+    }
+    let mut cmd = Command::new(std::env::current_exe()?);
+    cmd.arg("snapshot-after-build")
+        .arg(slot_dir)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+    // Detach: cargo must not wait for it, and it outlives this rustc.
+    unsafe {
+        cmd.pre_exec(|| {
+            libc::setsid();
+            Ok(())
+        });
+    }
+    cmd.spawn()?;
+    Ok(())
+}
+
+/// Wait until no build is running in the slot, then snapshot its worktree. Retries if a
+/// build started meanwhile, so the snapshot always reflects the state after the last one.
+fn snapshot_after_build(slot_dir: &Path) -> Result<()> {
+    let target = slot_dir.join("target");
+    loop {
+        let Some(_lock) = FileLock::acquire(&slot_dir.join("snapshot.lock"), false)? else { return Ok(()) };
+        loop {
+            for l in cargo_locks(&target) {
+                drop(FileLock::acquire(&l, true)?);
+            }
+            let meta: SlotMeta = serde_json::from_slice(&fs::read(slot_dir.join("slot.json"))?)?;
+            let Some(lease) = meta.lease.filter(|l| !l.pending) else { return Ok(()) };
+            if fs::read_link(lease.worktree.join("target")).ok().as_deref() != Some(target.as_path()) {
+                return Ok(());
+            }
+            let snap = take_snapshot(&lease.worktree, load_snapshot(slot_dir).as_ref())?;
+            if last_compile_ns(slot_dir) < snap.taken_at {
+                save_snapshot(slot_dir, &snap)?;
+                break;
+            }
+        }
+        drop(_lock);
+        // A compile that saw our lock held didn't start a waiter: if one slipped in, go again.
+        if load_snapshot(slot_dir).is_some_and(|s| s.taken_at > last_compile_ns(slot_dir)) {
+            return Ok(());
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // attach / detach
 
 struct AttachOpts {
@@ -870,6 +1146,20 @@ fn attach(path: &Path, opts: AttachOpts) -> Result<()> {
     symlink(slot.target(), &link).with_context(|| format!("creating {}", link.display()))?;
     exclude_target(&repo)?;
     warn_path_dependent_config(&repo);
+    if backdate_enabled(&repo)
+        && let Some(snap) = valid_snapshot(&slot.dir)
+    {
+        let (matched, total) = backdate(&repo.worktree, &snap)?;
+        println!(
+            "cargo-pool: {matched} of {total} files are unchanged since the slot's last build; only the other {} count as edits",
+            total - matched
+        );
+    }
+    // After backdating: this changes the target, which invalidates the snapshot.
+    let reset = invalidate_foreign_git_inputs(&repo, &slot.target())?;
+    if reset > 0 {
+        println!("cargo-pool: {reset} build units recorded another checkout's git state (e.g. git_version!); they'll rebuild here");
+    }
     println!("cargo-pool: {} -> slot {}", link.display(), slot.id);
     Ok(())
 }
@@ -983,6 +1273,16 @@ fn seed(repo: &Repo, slot: &Slot, head: &str, sources: Vec<(PathBuf, Option<Stri
         }
         let _ = fs::remove_dir_all(slot.target());
         fs::rename(&tmp, slot.target())?;
+        // Carry over the file snapshot that matches this target, so the new worktree can
+        // be backdated: the source slot's (if still valid), or one of the main checkout.
+        let snap = match (&repo.main_worktree, src.parent()) {
+            (Some(main), _) if src == main.join("target") => take_snapshot(main, None).ok(),
+            (_, Some(src_slot)) => valid_snapshot(src_slot),
+            _ => None,
+        };
+        if let Some(snap) = snap {
+            save_snapshot(&slot.dir, &snap)?;
+        }
         let secs = started.elapsed().unwrap_or(Duration::ZERO).as_secs();
         eprintln!("cargo-pool: seeded in {secs}s");
         return Ok(h);
@@ -1308,5 +1608,41 @@ mod tests {
         let found = path_dependent_linkers(&dir);
         fs::remove_dir_all(&dir).unwrap();
         assert_eq!(found, vec![("x86_64-unknown-linux-gnu".to_string(), "scripts/ld.sh".to_string())]);
+    }
+
+    #[test]
+    fn backdates_only_unchanged_files() {
+        let base = std::env::temp_dir().join(format!("cargo-pool-bd-{}", std::process::id()));
+        let (a, b) = (base.join("a"), base.join("b"));
+        for d in [&a, &b] {
+            fs::create_dir_all(d).unwrap();
+            git(d, &["init", "-q"]).unwrap();
+        }
+        fs::write(a.join("same.rs"), "fn same() {}").unwrap();
+        fs::write(a.join("edited.rs"), "fn old() {}").unwrap();
+        fs::create_dir(a.join("proto")).unwrap();
+        fs::write(a.join("proto/x.proto"), "message X {}").unwrap();
+        let old = UNIX_EPOCH + Duration::from_secs(1_000_000);
+        for f in ["same.rs", "edited.rs", "proto/x.proto", "proto"] {
+            File::open(a.join(f)).unwrap().set_modified(old).unwrap();
+        }
+        let snap = take_snapshot(&a, None).unwrap();
+        assert_eq!(snap.files.len(), 3);
+
+        // A fresh checkout: same content for one file, an edit in the other, new mtimes.
+        fs::write(b.join("same.rs"), "fn same() {}").unwrap();
+        fs::write(b.join("edited.rs"), "fn new() {}").unwrap();
+        fs::write(b.join("added.rs"), "fn added() {}").unwrap();
+        fs::create_dir(b.join("proto")).unwrap();
+        fs::write(b.join("proto/x.proto"), "message X {}").unwrap();
+        assert_eq!(backdate(&b, &snap).unwrap(), (2, 4));
+
+        let mtime = |f: &str| fs::metadata(b.join(f)).unwrap().modified().unwrap();
+        assert_eq!(mtime("same.rs"), old);
+        assert!(mtime("edited.rs") > old);
+        assert!(mtime("added.rs") > old);
+        // Unchanged directory (rerun-if-changed=<dir>) gets its old mtime back too.
+        assert_eq!(mtime("proto"), old);
+        fs::remove_dir_all(&base).unwrap();
     }
 }

@@ -32,10 +32,32 @@ Share warm cargo `target/` directories between git worktrees, so a fresh worktre
 - `/target` is added to `.git/info/exclude`, because `target/` patterns in `.gitignore`
   don't match symlinks.
 
-Cargo hashes path dependencies relative to the workspace root, so all third-party
-crates are reused as-is across worktrees at different paths. Workspace crates are
-recompiled once because a fresh checkout has new file mtimes, but they reuse the slot's
-incremental cache.
+Cargo hashes path dependencies relative to the workspace root, so third-party crates are
+reused as-is across worktrees at different paths (unless the repo's config depends on the
+checkout path, see below).
+
+### As if the changes were made in the old checkout
+
+A fresh checkout gives every file a new mtime, which would make cargo rebuild every
+workspace crate. To avoid that, cargo-pool snapshots each slot's worktree after every build
+into it: size, mtime and content hash of every file, plus the mtime and entry list of every
+directory (for `rerun-if-changed=<dir>`). The rustc wrapper starts a background process
+that waits for cargo's build lock to be released, then takes the snapshot.
+
+When the slot is attached to a new worktree, files and directories whose content matches
+the snapshot get their recorded mtime back. Cargo then sees exactly what it saw after the
+last build: only the files that actually differ count as changes. Copying exact
+(content, mtime) pairs inherits cargo's own correctness, including edits made during a
+build. A snapshot is only used if nothing has been compiled into the slot since it was
+taken; otherwise nothing is backdated and you get the normal rebuild. Disable it with
+`cargo-pool.backdate = false`.
+
+On attach, cargo-pool also resets build units whose recorded inputs are another checkout's
+git metadata, e.g. `git_version!()` tracking `.git/worktrees/<other>/HEAD`. Those would
+otherwise stay fresh and keep embedding the other checkout's commit.
+
+Measured on a 1,316-crate workspace: 150 s from scratch; a new worktree on a pooled slot
+builds in under a second with no edits, or in about a second plus the edited crates.
 
 ## Install
 
@@ -94,7 +116,10 @@ linker = "scripts/my-linker.sh"
 
 Cargo resolves the path inside each worktree and hashes the absolute linker path into every
 crate's fingerprint, so every worktree recompiles everything (`Dirty …: the config settings
-changed` in `cargo build -v`). `cargo-pool attach` warns about this. To fix it, give the
+changed` in `cargo build -v`). `cargo-pool attach` warns about this. Build scripts that print
+absolute `rerun-if-changed` paths outside their package have the same effect for everything
+depending on them ("the rerun-if-changed instructions changed"); print paths relative to
+the package instead. To fix it, give the
 linker a path that's identical in every checkout, e.g. the main checkout's copy:
 
 ```sh
@@ -122,6 +147,7 @@ Each setting comes from an environment variable or git config, with the env var 
 | `CARGO_POOL_DIR` | – | `$XDG_CACHE_HOME/cargo-pool` or `~/.cache/cargo-pool` |
 | `CARGO_POOL_IDLE_HOURS` | `cargo-pool.idleHours` | 48 |
 | `CARGO_POOL_MAX_DISK_PERCENT` | `cargo-pool.maxDiskPercent` | 90 |
+| `CARGO_POOL_BACKDATE` | `cargo-pool.backdate` | true |
 | `CARGO_POOL_RUSTC_WRAPPER` | – | none (e.g. `sccache`) |
 
 Keep the pool on the same filesystem as your repos. On btrfs/XFS, seeding uses
