@@ -16,17 +16,17 @@ Share warm cargo `target/` directories between git worktrees, so a fresh worktre
   worktree's `HEAD` wins.
 - If no slot is free, a new one is created and **seeded** by copying the closest existing
   target dir (another slot or the main checkout's `target/`). It holds cargo's build lock
-  during the copy, so it never copies a half-written build.
-- When the pool is full, a slot whose worktree hasn't built anything for `idleHours`
-  is taken over. That worktree's `target` link is removed, so it starts over in its own
-  directory if it ever builds again. If nothing is idle, a slot is created anyway and a
-  warning is printed.
+  during the copy, so it never copies a half-written build. There is no limit on the
+  number of slots: disk usage is the only limit.
 - **Disk limit**: if the disk holding the pool is above `maxDiskPercent` (default 90%),
-  every attach, every pooled build (with the rustc wrapper installed, see below) and `gc` deletes pooled target dirs, across all repos' pools, until
-  usage is back under the limit. Free slots go first, then slots of worktrees idle for
-  over `idleHours`, least recently used first. Slots with a build running are never
-  deleted, and neither is the main checkout's `target/`. A new slot is only seeded if the
-  copy fits under the limit; otherwise it starts empty.
+  pooled target dirs are deleted, across all repos' pools, until usage is back under the
+  limit. This happens on every attach, on every pooled build (with the rustc wrapper
+  installed, see below) and on `gc`. Free slots go first, then slots of worktrees that
+  haven't built anything for `idleHours`, least recently used first. An idle worktree
+  whose slot is deleted loses its `target` link, so it starts over in its own directory
+  if it ever builds again. Slots with a build running are never deleted, and neither is
+  the main checkout's `target/`. A new slot is only seeded if the copy fits under the
+  limit; otherwise it starts empty.
 - Leases end on their own when the worktree is deleted (`git worktree remove`),
   or explicitly with `cargo-pool detach`.
 - `/target` is added to `.git/info/exclude`, because `target/` patterns in `.gitignore`
@@ -70,7 +70,7 @@ runs the compiler through it.
 | `cargo pool attach [path] [--force] [--no-seed] [--allow-main]` | attach a worktree (idempotent) |
 | `cargo pool detach [path]` | release the slot and remove the symlink |
 | `cargo pool status [--size]` | show slots for this repo (all pools outside a repo) |
-| `cargo pool gc [--keep N] [--max-age-days D] [--dry-run]` | delete old / surplus free slots |
+| `cargo pool gc [--max-age-days D] [--dry-run]` | free disk space if over the limit; optionally delete free slots older than D days |
 | `cargo pool install-hook` / `uninstall-hook` | manage the post-checkout hook |
 | `cargo pool install-wrapper` / `uninstall-wrapper` | manage the global rustc wrapper |
 
@@ -81,7 +81,6 @@ Each setting comes from an environment variable or git config, with the env var 
 | env | git config | default |
 |---|---|---|
 | `CARGO_POOL_DIR` | – | `$XDG_CACHE_HOME/cargo-pool` or `~/.cache/cargo-pool` |
-| `CARGO_POOL_MAX_SLOTS` | `cargo-pool.maxSlots` | 4 |
 | `CARGO_POOL_IDLE_HOURS` | `cargo-pool.idleHours` | 48 |
 | `CARGO_POOL_MAX_DISK_PERCENT` | `cargo-pool.maxDiskPercent` | 90 |
 | `CARGO_POOL_RUSTC_WRAPPER` | – | none (e.g. `sccache`) |

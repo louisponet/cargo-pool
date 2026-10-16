@@ -42,9 +42,6 @@ enum Cmd {
     Attach {
         /// Worktree path (default: current directory).
         path: Option<PathBuf>,
-        /// Maximum number of slots before idle slots get stolen / a warning is printed.
-        #[arg(long)]
-        max_slots: Option<usize>,
         /// Don't seed a newly created slot by copying the closest existing target dir.
         #[arg(long)]
         no_seed: bool,
@@ -69,14 +66,11 @@ enum Cmd {
         #[arg(long)]
         size: bool,
     },
-    /// Reclaim stale leases and delete free slots that are old or over the limit.
+    /// Reclaim stale leases and free disk space if usage is above the limit.
     Gc {
-        /// Number of free slots to keep (default: max slots setting).
+        /// Also delete free slots unused for longer than this many days.
         #[arg(long)]
-        keep: Option<usize>,
-        /// Delete free slots unused for longer than this many days.
-        #[arg(long, default_value_t = 14)]
-        max_age_days: u64,
+        max_age_days: Option<u64>,
         #[arg(long)]
         dry_run: bool,
     },
@@ -108,6 +102,8 @@ fn main() {
     if is_rustc_wrapper(&args) {
         rustc_wrapper(args);
     }
+    // Die quietly on a closed stdout (`cargo pool status | head`) instead of panicking.
+    unsafe { libc::signal(libc::SIGPIPE, libc::SIG_DFL) };
     let cli = Cli::parse_from(args);
     let from_hook = matches!(
         cli.cmd,
@@ -124,12 +120,12 @@ fn main() {
 
 fn run(cli: Cli) -> Result<()> {
     match cli.cmd {
-        Cmd::Attach { path, max_slots, no_seed, force, allow_main, from_hook } => {
-            attach(&path_or_cwd(path)?, AttachOpts { max_slots, seed: !no_seed, force, allow_main, from_hook })
+        Cmd::Attach { path, no_seed, force, allow_main, from_hook } => {
+            attach(&path_or_cwd(path)?, AttachOpts { seed: !no_seed, force, allow_main, from_hook })
         }
         Cmd::Detach { path } => detach(&path_or_cwd(path)?),
         Cmd::Status { size } => status(size),
-        Cmd::Gc { keep, max_age_days, dry_run } => gc(keep, max_age_days, dry_run),
+        Cmd::Gc { max_age_days, dry_run } => gc(max_age_days, dry_run),
         Cmd::InstallHook { path } => install_hook(&path_or_cwd(path)?),
         Cmd::UninstallHook { path } => uninstall_hook(&path_or_cwd(path)?),
         Cmd::InstallWrapper => install_wrapper(),
@@ -139,7 +135,7 @@ fn run(cli: Cli) -> Result<()> {
             if prev != NULL_SHA {
                 return Ok(());
             }
-            let opts = AttachOpts { max_slots: None, seed: true, force: false, allow_main: false, from_hook: true };
+            let opts = AttachOpts { seed: true, force: false, allow_main: false, from_hook: true };
             attach(&std::env::current_dir()?, opts)
         }
     }
@@ -228,14 +224,6 @@ impl Repo {
 
     fn head(&self) -> Result<String> {
         git(&self.worktree, &["rev-parse", "HEAD"])
-    }
-
-    fn max_slots(&self) -> usize {
-        setting(&self.common_dir, "CARGO_POOL_MAX_SLOTS", "cargo-pool.maxSlots", 4)
-    }
-
-    fn idle_hours(&self) -> u64 {
-        idle_hours(&self.common_dir)
     }
 
     fn max_disk_percent(&self) -> f64 {
@@ -702,7 +690,6 @@ fn uninstall_wrapper() -> Result<()> {
 // attach / detach
 
 struct AttachOpts {
-    max_slots: Option<usize>,
     seed: bool,
     force: bool,
     allow_main: bool,
@@ -765,7 +752,6 @@ fn attach(path: &Path, opts: AttachOpts) -> Result<()> {
     }
 
     let head = repo.head()?;
-    let max_slots = opts.max_slots.unwrap_or_else(|| repo.max_slots());
     let lease = |pending| Lease { worktree: repo.worktree.clone(), head: head.clone(), acquired_at: now(), pending };
 
     let lock = repo.lock()?;
@@ -773,16 +759,12 @@ fn attach(path: &Path, opts: AttachOpts) -> Result<()> {
     reclaim_stale(&mut slots)?;
 
     // Best free slot: closest commit, then most recently used.
-    let mut pick = slots
+    let pick = slots
         .iter()
         .enumerate()
         .filter(|(_, s)| s.state() == State::Free)
         .min_by_key(|(_, s)| (distance(&repo.worktree, s.meta.last_head.as_deref(), &head), u64::MAX - s.meta.last_used))
         .map(|(i, _)| i);
-
-    if pick.is_none() && slots.len() >= max_slots {
-        pick = steal_idle(&mut slots, repo.idle_hours())?;
-    }
 
     let slot_idx = match pick {
         Some(i) => {
@@ -796,13 +778,6 @@ fn attach(path: &Path, opts: AttachOpts) -> Result<()> {
             i
         }
         None => {
-            if slots.len() >= max_slots {
-                eprintln!(
-                    "cargo-pool: warning: all {} slots are in use, creating slot {} (raise cargo-pool.maxSlots or run `cargo-pool gc`)",
-                    slots.len(),
-                    slots.len()
-                );
-            }
             let id = slots.iter().map(|s| s.id + 1).max().unwrap_or(0);
             let dir = slots_dir.join(id.to_string());
             fs::create_dir_all(&dir)?;
@@ -836,29 +811,6 @@ fn report_pick(s: &Slot, d: u64) {
         (Some(h), d) => format!("{} ({d} commits away)", short(h)),
     };
     println!("cargo-pool: reusing slot {} last built at {built}", s.id);
-}
-
-/// Take the slot of the worktree that hasn't built anything for the longest time,
-/// if that's longer than `idle_hours`. The victim's `target` link is removed, so
-/// it simply starts a fresh target dir if it ever builds again.
-fn steal_idle(slots: &mut [Slot], idle_hours: u64) -> Result<Option<usize>> {
-    let cutoff = now().saturating_sub(idle_hours * 3600);
-    let victim = slots
-        .iter()
-        .enumerate()
-        .filter(|(_, s)| s.state() == State::Held && !s.meta.lease.as_ref().unwrap().pending)
-        .map(|(i, s)| (i, last_activity(&s.target()).max(s.meta.lease.as_ref().unwrap().acquired_at)))
-        .filter(|(_, t)| *t < cutoff)
-        .min_by_key(|(_, t)| *t);
-    let Some((i, _)) = victim else { return Ok(None) };
-    let s = &mut slots[i];
-    let wt = s.meta.lease.as_ref().unwrap().worktree.clone();
-    let head = git(&wt, &["rev-parse", "HEAD"]).ok();
-    fs::remove_file(wt.join("target"))?;
-    s.release(head);
-    s.save()?;
-    eprintln!("cargo-pool: took over slot {} from idle worktree {}", s.id, wt.display());
-    Ok(Some(i))
 }
 
 /// Candidate target dirs to copy into a new slot: every slot plus the main checkout's.
@@ -1011,9 +963,8 @@ fn status(size: bool) -> Result<()> {
     reclaim_stale(&mut slots)?;
     let head = repo.head().ok();
     println!(
-        "pool {} (max {} slots, disk at {:.1}%, limit {}%)",
+        "pool {} (disk at {:.1}%, limit {}%)",
         repo.pool.display(),
-        repo.max_slots(),
         disk_percent(&repo.pool, 0)?,
         repo.max_disk_percent()
     );
@@ -1045,37 +996,27 @@ fn status(size: bool) -> Result<()> {
     Ok(())
 }
 
-fn gc(keep: Option<usize>, max_age_days: u64, dry_run: bool) -> Result<()> {
+fn gc(max_age_days: Option<u64>, dry_run: bool) -> Result<()> {
     let repo = Repo::discover(&std::env::current_dir()?)?;
-    let keep = keep.unwrap_or_else(|| repo.max_slots());
     let lock = repo.lock()?;
     let mut slots = load_slots(&repo.slots_dir())?;
     if !dry_run {
         reclaim_stale(&mut slots)?;
     }
-    let cutoff = now().saturating_sub(max_age_days * 86400);
-    // Free slots, most recently used first; keep the first `keep` unless too old.
-    let mut free: Vec<_> = slots
+    let cutoff = max_age_days.map_or(0, |d| now().saturating_sub(d * 86400));
+    let removed: BTreeMap<_, _> = slots
         .iter()
-        .filter(|s| s.state() != State::Held)
-        .map(|s| (s.meta.last_used.max(last_activity(&s.target())), s))
+        .filter(|s| s.state() != State::Held && s.meta.last_used.max(last_activity(&s.target())) < cutoff)
+        .map(|s| (s.id, s.dir.clone()))
         .collect();
-    free.sort_by_key(|(t, _)| u64::MAX - t);
-    let mut removed = BTreeMap::new();
-    for (i, (t, s)) in free.into_iter().enumerate() {
-        if i < keep && t >= cutoff {
-            continue;
-        }
-        removed.insert(s.id, s.dir.clone());
-    }
     for (id, dir) in &removed {
         println!("{} slot {id} ({})", if dry_run { "would remove" } else { "removing" }, dir.display());
         if !dry_run {
             fs::remove_dir_all(dir)?;
         }
     }
-    if removed.is_empty() {
-        println!("nothing to collect");
+    if let (Some(d), true) = (max_age_days, removed.is_empty()) {
+        println!("no free slots unused for more than {d} days");
     }
     drop(lock);
 
