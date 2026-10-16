@@ -14,6 +14,7 @@ use std::io::Write;
 use std::os::fd::AsRawFd;
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{MetadataExt, symlink};
+use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -88,6 +89,11 @@ enum Cmd {
     UninstallHook {
         path: Option<PathBuf>,
     },
+    /// Make cargo run every compiler call through cargo-pool (`build.rustc-wrapper` in
+    /// `$CARGO_HOME/config.toml`), so disk usage is checked during every pooled build.
+    InstallWrapper,
+    /// Remove the `build.rustc-wrapper` entry added by `install-wrapper`.
+    UninstallWrapper,
     /// Hook entry point (called by the installed post-checkout hook).
     #[command(hide = true)]
     PostCheckout { prev: String, new: String, flag: String },
@@ -98,6 +104,9 @@ fn main() {
     let mut args: Vec<OsString> = std::env::args_os().collect();
     if args.get(1).is_some_and(|a| a == "pool") {
         args.remove(1);
+    }
+    if is_rustc_wrapper(&args) {
+        rustc_wrapper(args);
     }
     let cli = Cli::parse_from(args);
     let from_hook = matches!(
@@ -123,6 +132,8 @@ fn run(cli: Cli) -> Result<()> {
         Cmd::Gc { keep, max_age_days, dry_run } => gc(keep, max_age_days, dry_run),
         Cmd::InstallHook { path } => install_hook(&path_or_cwd(path)?),
         Cmd::UninstallHook { path } => uninstall_hook(&path_or_cwd(path)?),
+        Cmd::InstallWrapper => install_wrapper(),
+        Cmd::UninstallWrapper => uninstall_wrapper(),
         Cmd::PostCheckout { prev, .. } => {
             // A null previous HEAD means a fresh checkout: `git worktree add` or clone.
             if prev != NULL_SHA {
@@ -545,6 +556,146 @@ fn free_disk(max_percent: f64, extra: u64, protect: &[&Path]) -> Result<bool> {
         }
     }
     Ok(false)
+}
+
+// ---------------------------------------------------------------------------
+// rustc wrapper
+
+/// Cargo runs a `build.rustc-wrapper` as `<wrapper> <rustc> <args...>`: a compiler path
+/// (or name) in place of one of our subcommands means we're wrapping a compiler call.
+fn is_rustc_wrapper(args: &[OsString]) -> bool {
+    let Some(first) = args.get(1) else { return false };
+    let name = Path::new(first).file_name().unwrap_or_default().to_string_lossy();
+    let is_subcommand = <Cli as clap::CommandFactory>::command()
+        .get_subcommands()
+        .any(|c| c.get_name() == first.to_string_lossy());
+    !is_subcommand && (Path::new(first).is_file() || name.starts_with("rustc") || name.starts_with("clippy-driver"))
+}
+
+/// Check disk usage if this compile writes into a pooled target dir, then exec the
+/// compiler (through `CARGO_POOL_RUSTC_WRAPPER`, e.g. sccache, if set).
+fn rustc_wrapper(args: Vec<OsString>) -> ! {
+    if let Err(e) = check_disk_during_build(&args[2..]) {
+        eprintln!("cargo-pool: warning: disk check failed: {e:#}");
+    }
+    let (program, rest) = match std::env::var_os("CARGO_POOL_RUSTC_WRAPPER").filter(|w| !w.is_empty()) {
+        Some(inner) => (inner, &args[1..]),
+        None => (args[1].clone(), &args[2..]),
+    };
+    let err = Command::new(&program).args(rest).exec();
+    eprintln!("cargo-pool: failed to run {}: {err}", program.to_string_lossy());
+    std::process::exit(1);
+}
+
+fn check_disk_during_build(rustc_args: &[OsString]) -> Result<()> {
+    let Some(out_dir) = rustc_args.iter().position(|a| a == "--out-dir").and_then(|i| rustc_args.get(i + 1)) else {
+        return Ok(());
+    };
+    let (Ok(out_dir), Ok(root)) = (fs::canonicalize(out_dir), fs::canonicalize(pool_root()?)) else {
+        return Ok(());
+    };
+    let Some(pool) = out_dir.strip_prefix(&root).ok().and_then(|p| p.components().next()) else {
+        return Ok(());
+    };
+    let git_dir = PathBuf::from(fs::read_to_string(root.join(pool).join("repo")).unwrap_or_default());
+    let max_disk = setting(&git_dir, "CARGO_POOL_MAX_DISK_PERCENT", "cargo-pool.maxDiskPercent", 90.0);
+    if disk_percent(&root, 0)? < max_disk {
+        return Ok(());
+    }
+    // Over the limit. Many rustc processes run in parallel: let one of them clean up,
+    // and don't rescan more than once a minute if the disk can't be brought under.
+    // The marker holds the time of the last cleanup (its mtime changes when locking it).
+    let marker = root.join(".disk-cleanup");
+    let recent = || {
+        let last: u64 = fs::read_to_string(&marker).ok().and_then(|s| s.trim().parse().ok()).unwrap_or(0);
+        now().saturating_sub(last) < 60
+    };
+    if recent() {
+        return Ok(());
+    }
+    let Some(_lock) = FileLock::acquire(&marker, false)? else { return Ok(()) };
+    if recent() {
+        return Ok(());
+    }
+    let ok = free_disk(max_disk, 0, &[]);
+    fs::write(&marker, now().to_string())?;
+    if !ok? {
+        eprintln!("cargo-pool: warning: disk is still above {max_disk}% after cleaning up all pools");
+    }
+    Ok(())
+}
+
+fn cargo_config() -> Result<PathBuf> {
+    let home = match std::env::var_os("CARGO_HOME") {
+        Some(h) => PathBuf::from(h),
+        None => PathBuf::from(std::env::var_os("HOME").ok_or_else(|| anyhow!("HOME not set"))?).join(".cargo"),
+    };
+    Ok(home.join("config.toml"))
+}
+
+fn install_wrapper() -> Result<()> {
+    let config = cargo_config()?;
+    let exe = fs::canonicalize(std::env::current_exe()?)?;
+    let current = fs::read_to_string(&config).unwrap_or_default();
+    if let Some(line) = current.lines().find(|l| l.trim_start().starts_with("rustc-wrapper")) {
+        if line.contains("cargo-pool") {
+            println!("already installed in {}", config.display());
+            return Ok(());
+        }
+        bail!(
+            "{} already sets `{}`; remove it first (set CARGO_POOL_RUSTC_WRAPPER to keep using it through cargo-pool)",
+            config.display(),
+            line.trim()
+        );
+    }
+    let entry = format!("rustc-wrapper = {:?}  # cargo-pool: disk check on every pooled build", exe.to_string_lossy());
+    let updated = match current.lines().position(|l| l.trim() == "[build]") {
+        Some(i) => {
+            let mut lines: Vec<&str> = current.lines().collect();
+            lines.insert(i + 1, &entry);
+            lines.join("\n") + "\n"
+        }
+        None => {
+            let sep = if current.is_empty() { "" } else if current.ends_with('\n') { "\n" } else { "\n\n" };
+            format!("{current}{sep}[build]\n{entry}\n")
+        }
+    };
+    fs::create_dir_all(config.parent().unwrap())?;
+    fs::write(&config, updated)?;
+    println!("installed rustc-wrapper in {}", config.display());
+    if let Some(w) = std::env::var_os("RUSTC_WRAPPER").filter(|w| !w.is_empty()) {
+        eprintln!(
+            "cargo-pool: warning: RUSTC_WRAPPER={} is set in this environment and overrides the config",
+            w.to_string_lossy()
+        );
+    }
+    Ok(())
+}
+
+fn uninstall_wrapper() -> Result<()> {
+    let config = cargo_config()?;
+    let current = fs::read_to_string(&config).with_context(|| format!("reading {}", config.display()))?;
+    let kept: Vec<&str> = current
+        .lines()
+        .filter(|l| !(l.trim_start().starts_with("rustc-wrapper") && l.contains("cargo-pool")))
+        .collect();
+    // Drop a `[build]` table we left empty.
+    let mut out: Vec<&str> = vec![];
+    for (i, l) in kept.iter().enumerate() {
+        let next = kept[i + 1..].iter().find(|n| !n.trim().is_empty());
+        if l.trim() == "[build]" && next.is_none_or(|n| n.trim_start().starts_with('[')) {
+            continue;
+        }
+        out.push(l);
+    }
+    let text = out.join("\n").trim().to_string();
+    if text.is_empty() {
+        fs::remove_file(&config)?;
+    } else {
+        fs::write(&config, text + "\n")?;
+    }
+    println!("removed cargo-pool rustc-wrapper from {}", config.display());
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------

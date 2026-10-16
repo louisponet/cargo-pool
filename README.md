@@ -22,7 +22,7 @@ Share warm cargo `target/` directories between git worktrees, so a fresh worktre
   directory if it ever builds again. If nothing is idle, a slot is created anyway and a
   warning is printed.
 - **Disk limit**: if the disk holding the pool is above `maxDiskPercent` (default 90%),
-  every attach and `gc` deletes pooled target dirs, across all repos' pools, until
+  every attach, every pooled build (with the rustc wrapper installed, see below) and `gc` deletes pooled target dirs, across all repos' pools, until
   usage is back under the limit. Free slots go first, then slots of worktrees idle for
   over `idleHours`, least recently used first. Slots with a build running are never
   deleted, and neither is the main checkout's `target/`. A new slot is only seeded if the
@@ -49,6 +49,20 @@ cd /path/to/rust/repo && cargo pool install-hook
 `git worktree add`, so every tool that creates worktrees picks it up automatically.
 The hook never fails the checkout and ignores repos without a top-level `Cargo.toml`.
 
+### Disk check on every build
+
+```sh
+cargo pool install-wrapper   # adds build.rustc-wrapper to ~/.cargo/config.toml
+```
+
+Cargo then runs every compiler call through `cargo-pool`. Builds that don't write into a
+pooled target dir pass straight through to the compiler. For pooled builds, `cargo-pool`
+checks disk usage before handing off. If usage is over the limit, a single compiler
+process runs the cleanup, at most once a minute. The slot being built is never deleted,
+because cargo holds its build lock. A `RUSTC_WRAPPER` env var overrides the config; to
+keep using sccache, set `CARGO_POOL_RUSTC_WRAPPER=sccache` instead and `cargo-pool`
+runs the compiler through it.
+
 ## Commands
 
 | command | |
@@ -58,6 +72,7 @@ The hook never fails the checkout and ignores repos without a top-level `Cargo.t
 | `cargo pool status [--size]` | show slots for this repo (all pools outside a repo) |
 | `cargo pool gc [--keep N] [--max-age-days D] [--dry-run]` | delete old / surplus free slots |
 | `cargo pool install-hook` / `uninstall-hook` | manage the post-checkout hook |
+| `cargo pool install-wrapper` / `uninstall-wrapper` | manage the global rustc wrapper |
 
 ## Settings
 
@@ -69,6 +84,7 @@ Each setting comes from an environment variable or git config, with the env var 
 | `CARGO_POOL_MAX_SLOTS` | `cargo-pool.maxSlots` | 4 |
 | `CARGO_POOL_IDLE_HOURS` | `cargo-pool.idleHours` | 48 |
 | `CARGO_POOL_MAX_DISK_PERCENT` | `cargo-pool.maxDiskPercent` | 90 |
+| `CARGO_POOL_RUSTC_WRAPPER` | – | none (e.g. `sccache`) |
 
 Keep the pool on the same filesystem as your repos. On btrfs/XFS, seeding uses
 reflinks and is instant; on ext4 it's a full copy.
