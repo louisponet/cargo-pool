@@ -642,28 +642,55 @@ fn check_disk_during_build(rustc_args: &[OsString]) -> Result<()> {
     Ok(())
 }
 
-fn cargo_config() -> Result<PathBuf> {
-    let home = match std::env::var_os("CARGO_HOME") {
+fn cargo_home() -> Result<PathBuf> {
+    Ok(match std::env::var_os("CARGO_HOME") {
         Some(h) => PathBuf::from(h),
         None => PathBuf::from(std::env::var_os("HOME").ok_or_else(|| anyhow!("HOME not set"))?).join(".cargo"),
-    };
-    Ok(home.join("config.toml"))
+    })
+}
+
+fn cargo_config() -> Result<PathBuf> {
+    Ok(cargo_home()?.join("config.toml"))
+}
+
+/// Cargo's config points at this script rather than at the binary itself: it lives
+/// outside `$CARGO_HOME/bin`, so a plain `cargo uninstall cargo-pool` can't leave cargo
+/// calling a missing wrapper. Without cargo-pool it runs the compiler directly.
+fn wrapper_shim() -> Result<PathBuf> {
+    Ok(cargo_home()?.join("cargo-pool-rustc-wrapper"))
+}
+
+fn shim_script(exe: &Path) -> String {
+    format!(
+        r#"#!/bin/sh
+# rustc wrapper installed by `cargo pool install`; remove with `cargo pool uninstall`.
+# Falls back to running the compiler directly once cargo-pool is uninstalled.
+pool={exe:?}
+[ -x "$pool" ] || pool=$(command -v cargo-pool) || pool=
+[ -n "$pool" ] && exec "$pool" "$@"
+exec ${{CARGO_POOL_RUSTC_WRAPPER:+"$CARGO_POOL_RUSTC_WRAPPER"}} "$@"
+"#
+    )
 }
 
 fn install_wrapper() -> Result<()> {
     let config = cargo_config()?;
     let exe = fs::canonicalize(std::env::current_exe()?)?;
+    let shim = wrapper_shim()?;
+    fs::create_dir_all(shim.parent().unwrap())?;
+    fs::write(&shim, shim_script(&exe))?;
+    fs::set_permissions(&shim, std::os::unix::fs::PermissionsExt::from_mode(0o755))?;
     let current = fs::read_to_string(&config).unwrap_or_default();
-    let entry = format!("rustc-wrapper = {:?}  # cargo-pool: disk check on every pooled build", exe.to_string_lossy());
+    let entry = format!("rustc-wrapper = {:?}  # cargo-pool: disk check on every pooled build", shim.to_string_lossy());
     if let Some(line) = current.lines().find(|l| l.trim_start().starts_with("rustc-wrapper")) {
         if line.trim() == entry {
             println!("already installed in {}", config.display());
             return Ok(());
         }
         if is_our_wrapper_line(line) {
-            // Installed from another location before: point it at this binary.
+            // Installed by an older version or from another location: repoint it.
             fs::write(&config, current.replacen(line, &entry, 1))?;
-            println!("updated rustc-wrapper in {} to {}", config.display(), exe.display());
+            println!("updated rustc-wrapper in {} to {}", config.display(), shim.display());
             return Ok(());
         }
         bail!(
@@ -721,6 +748,7 @@ fn uninstall_wrapper() -> Result<()> {
     } else {
         fs::write(&config, text + "\n")?;
     }
+    let _ = fs::remove_file(wrapper_shim()?);
     println!("removed cargo-pool rustc-wrapper from {}", config.display());
     Ok(())
 }
@@ -1163,7 +1191,9 @@ fn install_global_hook() -> Result<()> {
     let cwd = std::env::current_dir()?;
     let set = |key: &str, value: &str| git(&cwd, &["config", "--global", "--replace-all", &format!("{GLOBAL_HOOK}.{key}"), value]);
     set("event", "post-checkout")?;
-    set("command", &format!("{:?} post-checkout", exe.to_string_lossy()))?;
+    // A no-op once the binary is gone, so `cargo uninstall` can't break checkouts.
+    // Git appends the hook arguments to the command.
+    set("command", &format!("f={:?}; [ -x \"$f\" ] || exit 0; exec \"$f\" post-checkout", exe.to_string_lossy()))?;
     println!("installed global post-checkout hook ({GLOBAL_HOOK}) in your global git config");
     // A per-repo hook block would now attach twice (harmlessly); point it out.
     if let Ok(hook) = hook_path(&cwd)

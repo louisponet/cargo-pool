@@ -55,13 +55,14 @@ That runs `cargo install --git https://github.com/louisponet/cargo-pool` followe
   ```ini
   [hook "cargo-pool"]
   	event = post-checkout
-  	command = "/home/you/.cargo/bin/cargo-pool" post-checkout
+  	command = "f=\"/home/you/.cargo/bin/cargo-pool\"; [ -x \"$f\" ] || exit 0; exec \"$f\" post-checkout"
   ```
 
   On older git it falls back to appending a guarded block to the current repository's
   `.git/hooks/post-checkout`; run `cargo pool install-hook` in each other repo too. The hook
   never fails the checkout and ignores repos without a top-level `Cargo.toml`.
-- **The rustc wrapper** (`build.rustc-wrapper` in `~/.cargo/config.toml`), which checks
+- **The rustc wrapper** (`build.rustc-wrapper` in `~/.cargo/config.toml`, via a small shim
+  script), which checks
   disk usage on every pooled build. Cargo runs every compiler call through `cargo-pool`.
   Builds that don't write into a pooled target dir pass straight through to the compiler.
   For pooled builds, `cargo-pool` checks disk usage before handing off; if usage is over the
@@ -75,8 +76,11 @@ A `RUSTC_WRAPPER` env var overrides the config entry. To keep using sccache, set
 Worktrees that already exist aren't attached by the hook; run `cargo pool attach` inside
 them. Linux only for now.
 
-To remove it, run `cargo pool uninstall` **before** `cargo uninstall cargo-pool`.
-Otherwise cargo keeps calling the wrapper binary and every build fails.
+To remove it, run `cargo pool uninstall`, then `cargo uninstall cargo-pool`. Skipping the
+first step leaves nothing broken: cargo's config points at a small script
+(`~/.cargo/cargo-pool-rustc-wrapper`) that runs the compiler directly once cargo-pool is
+gone, and the git hook does nothing if the binary is missing. Only the two leftover config
+entries remain.
 
 ## Commands
 
