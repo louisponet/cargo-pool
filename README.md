@@ -21,6 +21,12 @@ Share warm cargo `target/` directories between git worktrees, so a fresh worktre
   is taken over. That worktree's `target` link is removed, so it starts over in its own
   directory if it ever builds again. If nothing is idle, a slot is created anyway and a
   warning is printed.
+- **Disk limit**: if the disk holding the pool is above `maxDiskPercent` (default 90%),
+  every attach and `gc` deletes pooled target dirs, across all repos' pools, until
+  usage is back under the limit. Free slots go first, then slots of worktrees idle for
+  over `idleHours`, least recently used first. Slots with a build running are never
+  deleted, and neither is the main checkout's `target/`. A new slot is only seeded if the
+  copy fits under the limit; otherwise it starts empty.
 - Leases end on their own when the worktree is deleted (`git worktree remove`),
   or explicitly with `cargo-pool detach`.
 - `/target` is added to `.git/info/exclude`, because `target/` patterns in `.gitignore`
@@ -62,6 +68,7 @@ Each setting comes from an environment variable or git config, with the env var 
 | `CARGO_POOL_DIR` | – | `$XDG_CACHE_HOME/cargo-pool` or `~/.cache/cargo-pool` |
 | `CARGO_POOL_MAX_SLOTS` | `cargo-pool.maxSlots` | 4 |
 | `CARGO_POOL_IDLE_HOURS` | `cargo-pool.idleHours` | 48 |
+| `CARGO_POOL_MAX_DISK_PERCENT` | `cargo-pool.maxDiskPercent` | 90 |
 
 Keep the pool on the same filesystem as your repos. On btrfs/XFS, seeding uses
 reflinks and is instant; on ext4 it's a full copy.
