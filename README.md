@@ -40,9 +40,13 @@ incremental cache.
 ## Install
 
 ```sh
-cargo install --path .
-cd /path/to/rust/repo && cargo pool install-hook
+cargo install --git https://github.com/louisponet/cargo-pool
+cargo pool install-wrapper                          # once per machine, see below
+cd /path/to/rust/repo && cargo pool install-hook    # once per repo
 ```
+
+Worktrees that already exist aren't attached by the hook; run `cargo pool attach`
+inside them. Linux only for now.
 
 `install-hook` appends a guarded block to the repo's `post-checkout` hook (it respects
 `core.hooksPath` and keeps existing hooks such as git-lfs). Git runs `post-checkout` on

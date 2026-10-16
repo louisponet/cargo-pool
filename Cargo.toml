@@ -1,4 +1,6 @@
 [package]
+description = "Share warm cargo target dirs between git worktrees"
+repository = "https://github.com/louisponet/cargo-pool"
 name = "cargo-pool"
 version = "0.1.0"
 edition = "2024"
