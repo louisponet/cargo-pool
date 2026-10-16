@@ -74,20 +74,28 @@ enum Cmd {
         #[arg(long)]
         dry_run: bool,
     },
-    /// Install a post-checkout hook that attaches every newly created worktree.
-    InstallHook {
-        /// Repository path (default: current directory).
-        path: Option<PathBuf>,
-        /// Install for every repository via a config-based hook in ~/.gitconfig
-        /// (needs git 2.54+). Runs alongside each repository's own hooks.
-        #[arg(long, conflicts_with = "path")]
-        global: bool,
+    /// Set everything up: the worktree hook (for every repository if git supports
+    /// config-based hooks, otherwise the current one) and the rustc wrapper.
+    Install {
+        /// Don't install the rustc wrapper (no disk check during builds).
+        #[arg(long)]
+        no_wrapper: bool,
     },
-    /// Remove the hook installed by `install-hook`.
+    /// Remove the hooks and rustc wrapper installed by cargo-pool (slots are kept).
+    Uninstall,
+    /// Install the post-checkout hook that attaches every newly created worktree.
+    /// Global (all repositories) when git supports config-based hooks (2.54+),
+    /// otherwise for the current repository.
+    InstallHook {
+        /// Install into this repository's hooks instead of globally.
+        path: Option<PathBuf>,
+        /// Install into the current repository's hooks instead of globally.
+        #[arg(long)]
+        repo: bool,
+    },
+    /// Remove the global hook and the current repository's hook block (or only `path`'s).
     UninstallHook {
         path: Option<PathBuf>,
-        #[arg(long, conflicts_with = "path")]
-        global: bool,
     },
     /// Make cargo run every compiler call through cargo-pool (`build.rustc-wrapper` in
     /// `$CARGO_HOME/config.toml`), so disk usage is checked during every pooled build.
@@ -132,10 +140,23 @@ fn run(cli: Cli) -> Result<()> {
         Cmd::Detach { path } => detach(&path_or_cwd(path)?),
         Cmd::Status { size } => status(size),
         Cmd::Gc { max_age_days, dry_run } => gc(max_age_days, dry_run),
-        Cmd::InstallHook { global: true, .. } => install_global_hook(),
-        Cmd::UninstallHook { global: true, .. } => uninstall_global_hook(),
-        Cmd::InstallHook { path, .. } => install_hook(&path_or_cwd(path)?),
-        Cmd::UninstallHook { path, .. } => uninstall_hook(&path_or_cwd(path)?),
+        Cmd::Install { no_wrapper } => {
+            install_hook_auto(None, false)?;
+            if !no_wrapper {
+                install_wrapper()?;
+            }
+            Ok(())
+        }
+        Cmd::Uninstall => {
+            uninstall_hook_auto(None)?;
+            if fs::read_to_string(cargo_config()?).is_ok_and(|s| s.lines().any(is_our_wrapper_line)) {
+                uninstall_wrapper()?;
+            }
+            println!("pooled target dirs are kept in {}; delete it to free their space", pool_root()?.display());
+            Ok(())
+        }
+        Cmd::InstallHook { path, repo } => install_hook_auto(path, repo),
+        Cmd::UninstallHook { path } => uninstall_hook_auto(path),
         Cmd::InstallWrapper => install_wrapper(),
         Cmd::UninstallWrapper => uninstall_wrapper(),
         Cmd::PostCheckout { prev, .. } => {
@@ -668,12 +689,16 @@ fn install_wrapper() -> Result<()> {
     Ok(())
 }
 
+fn is_our_wrapper_line(l: &str) -> bool {
+    l.trim_start().starts_with("rustc-wrapper") && l.contains("cargo-pool")
+}
+
 fn uninstall_wrapper() -> Result<()> {
     let config = cargo_config()?;
     let current = fs::read_to_string(&config).with_context(|| format!("reading {}", config.display()))?;
     let kept: Vec<&str> = current
         .lines()
-        .filter(|l| !(l.trim_start().starts_with("rustc-wrapper") && l.contains("cargo-pool")))
+        .filter(|l| !is_our_wrapper_line(l))
         .collect();
     // Drop a `[build]` table we left empty.
     let mut out: Vec<&str> = vec![];
@@ -1071,12 +1096,67 @@ fn strip_block(s: &str) -> String {
 
 const GLOBAL_HOOK: &str = "hook.cargo-pool";
 
+/// Whether this git runs hooks defined in config (`hook.<name>.command`, git 2.54+).
+/// Feature-tested rather than version-parsed: ask git to list a probe hook.
+fn git_supports_config_hooks() -> bool {
+    let dir = std::env::temp_dir().join(format!("cargo-pool-probe-{}", std::process::id()));
+    let supported = fs::create_dir_all(&dir).is_ok()
+        && git(&dir, &["init", "-q"]).is_ok()
+        && git(
+            &dir,
+            &["-c", "hook.cargo-pool-probe.event=post-checkout", "-c", "hook.cargo-pool-probe.command=true", "hook", "list", "post-checkout"],
+        )
+        .is_ok_and(|out| out.contains("cargo-pool-probe"));
+    let _ = fs::remove_dir_all(&dir);
+    supported
+}
+
+/// Global hook when git supports it, otherwise (or when asked) the repository's hook.
+fn install_hook_auto(path: Option<PathBuf>, repo_only: bool) -> Result<()> {
+    if path.is_some() || repo_only {
+        return install_hook(&path_or_cwd(path)?);
+    }
+    if git_supports_config_hooks() {
+        return install_global_hook();
+    }
+    let cwd = std::env::current_dir()?;
+    let version = git(&cwd, &["--version"]).unwrap_or_default();
+    eprintln!("cargo-pool: {version} can't define hooks globally (needs git 2.54+)");
+    if git(&cwd, &["rev-parse", "--git-dir"]).is_err() {
+        eprintln!("cargo-pool: run `cargo pool install-hook` inside each Rust repository you want pooled");
+        return Ok(());
+    }
+    eprintln!("cargo-pool: installing for this repository only; repeat in other Rust repositories");
+    install_hook(&cwd)
+}
+
+/// Remove the global hook and the current repository's hook block, whichever exist.
+fn uninstall_hook_auto(path: Option<PathBuf>) -> Result<()> {
+    if let Some(p) = path {
+        return uninstall_hook(&path_or_cwd(Some(p))?);
+    }
+    let cwd = std::env::current_dir()?;
+    let mut removed = false;
+    if git(&cwd, &["config", "--global", "--get-regexp", r"^hook\.cargo-pool\."]).is_ok() {
+        uninstall_global_hook()?;
+        removed = true;
+    }
+    if hook_path(&cwd).is_ok_and(|h| fs::read_to_string(h).is_ok_and(|s| s.contains(HOOK_BEGIN))) {
+        uninstall_hook(&cwd)?;
+        removed = true;
+    }
+    if !removed {
+        println!("no cargo-pool hook installed (globally or in this repository)");
+    }
+    Ok(())
+}
+
 /// Global config-based hook: git appends the hook arguments to the command.
 fn install_global_hook() -> Result<()> {
     let exe = fs::canonicalize(std::env::current_exe()?)?;
     let cwd = std::env::current_dir()?;
     let set = |key: &str, value: &str| git(&cwd, &["config", "--global", "--replace-all", &format!("{GLOBAL_HOOK}.{key}"), value]);
-    set("event", "post-checkout").context("git 2.54+ is needed for config-based hooks")?;
+    set("event", "post-checkout")?;
     set("command", &format!("{:?} post-checkout", exe.to_string_lossy()))?;
     println!("installed global post-checkout hook ({GLOBAL_HOOK}) in your global git config");
     // A per-repo hook block would now attach twice (harmlessly); point it out.
@@ -1084,7 +1164,7 @@ fn install_global_hook() -> Result<()> {
         && fs::read_to_string(&hook).is_ok_and(|s| s.contains(HOOK_BEGIN))
     {
         eprintln!(
-            "cargo-pool: note: {} also has a cargo-pool block; `cargo pool uninstall-hook` removes it",
+            "cargo-pool: note: {} also has a cargo-pool block, so it would attach twice; `cargo pool uninstall-hook .` removes it",
             hook.display()
         );
     }

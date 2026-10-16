@@ -40,44 +40,43 @@ incremental cache.
 ## Install
 
 ```sh
-cargo install --git https://github.com/louisponet/cargo-pool
-cargo pool install-hook --global   # every repo on this machine (git 2.54+)
-cargo pool install-wrapper         # disk check on every build, see below
+curl -sSf https://raw.githubusercontent.com/louisponet/cargo-pool/main/install.sh | sh
 ```
 
-Worktrees that already exist aren't attached by the hook; run `cargo pool attach`
-inside them. Linux only for now.
+That runs `cargo install --git https://github.com/louisponet/cargo-pool` followed by
+`cargo pool install`, which sets up two things:
 
-Git runs the `post-checkout` hook on `git worktree add`, so every tool that creates
-worktrees (T3, Claude Code, plain git) picks it up automatically. The hook never fails
-the checkout and ignores repos without a top-level `Cargo.toml`.
+- **The worktree hook.** Git runs `post-checkout` on `git worktree add`, so every tool
+  that creates worktrees (T3, Claude Code, plain git) gets a pooled target dir. If your git
+  supports config-based hooks (2.54+), this is a single entry in `~/.gitconfig` that covers
+  every repository, including ones cloned later, and runs alongside each repository's own
+  `.git/hooks` (git-lfs and similar keep working):
 
-`install-hook --global` adds a config-based hook to `~/.gitconfig`:
+  ```ini
+  [hook "cargo-pool"]
+  	event = post-checkout
+  	command = "/home/you/.cargo/bin/cargo-pool" post-checkout
+  ```
 
-```ini
-[hook "cargo-pool"]
-	event = post-checkout
-	command = "/home/you/.cargo/bin/cargo-pool" post-checkout
-```
+  On older git it falls back to appending a guarded block to the current repository's
+  `.git/hooks/post-checkout`; run `cargo pool install-hook` in each other repo too. The hook
+  never fails the checkout and ignores repos without a top-level `Cargo.toml`.
+- **The rustc wrapper** (`build.rustc-wrapper` in `~/.cargo/config.toml`), which checks
+  disk usage on every pooled build. Cargo runs every compiler call through `cargo-pool`.
+  Builds that don't write into a pooled target dir pass straight through to the compiler.
+  For pooled builds, `cargo-pool` checks disk usage before handing off; if usage is over the
+  limit, a single compiler process runs the cleanup, at most once a minute. The slot being
+  built is never deleted, because cargo holds its build lock. Skip it with
+  `| sh -s -- --no-wrapper`.
 
-It applies to every repository, including ones cloned later, and runs alongside each
-repository's own `.git/hooks` (git-lfs and similar keep working), unlike `core.hooksPath`,
-which replaces them. On git older than 2.54, use `cargo pool install-hook` inside each
-repo instead: it appends a guarded block to that repo's `post-checkout` hook.
+A `RUSTC_WRAPPER` env var overrides the config entry. To keep using sccache, set
+`CARGO_POOL_RUSTC_WRAPPER=sccache` instead and `cargo-pool` runs the compiler through it.
 
-### Disk check on every build
+Worktrees that already exist aren't attached by the hook; run `cargo pool attach` inside
+them. Linux only for now.
 
-```sh
-cargo pool install-wrapper   # adds build.rustc-wrapper to ~/.cargo/config.toml
-```
-
-Cargo then runs every compiler call through `cargo-pool`. Builds that don't write into a
-pooled target dir pass straight through to the compiler. For pooled builds, `cargo-pool`
-checks disk usage before handing off. If usage is over the limit, a single compiler
-process runs the cleanup, at most once a minute. The slot being built is never deleted,
-because cargo holds its build lock. A `RUSTC_WRAPPER` env var overrides the config; to
-keep using sccache, set `CARGO_POOL_RUSTC_WRAPPER=sccache` instead and `cargo-pool`
-runs the compiler through it.
+To remove it, run `cargo pool uninstall` **before** `cargo uninstall cargo-pool`.
+Otherwise cargo keeps calling the wrapper binary and every build fails.
 
 ## Commands
 
@@ -87,8 +86,9 @@ runs the compiler through it.
 | `cargo pool detach [path]` | release the slot and remove the symlink |
 | `cargo pool status [--size]` | show slots for this repo (all pools outside a repo) |
 | `cargo pool gc [--max-age-days D] [--dry-run]` | free disk space if over the limit; optionally delete free slots older than D days |
-| `cargo pool install-hook [--global]` / `uninstall-hook [--global]` | manage the post-checkout hook (all repos, or the current one) |
-| `cargo pool install-wrapper` / `uninstall-wrapper` | manage the global rustc wrapper |
+| `cargo pool install [--no-wrapper]` / `uninstall` | set up / remove the hook and the rustc wrapper |
+| `cargo pool install-hook [path] [--repo]` / `uninstall-hook [path]` | only the hook (global if supported, else per repo) |
+| `cargo pool install-wrapper` / `uninstall-wrapper` | only the rustc wrapper |
 
 ## Settings
 
