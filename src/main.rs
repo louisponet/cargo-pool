@@ -869,8 +869,48 @@ fn attach(path: &Path, opts: AttachOpts) -> Result<()> {
     let slot = &slots[slot_idx];
     symlink(slot.target(), &link).with_context(|| format!("creating {}", link.display()))?;
     exclude_target(&repo)?;
+    warn_path_dependent_config(&repo);
     println!("cargo-pool: {} -> slot {}", link.display(), slot.id);
     Ok(())
+}
+
+/// `target.<triple>.linker` entries in the worktree's own cargo config that are relative
+/// paths. Cargo resolves those inside each checkout and hashes the resolved path into
+/// every crate's fingerprint, so a shared target dir gets fully rebuilt per worktree.
+fn path_dependent_linkers(worktree: &Path) -> Vec<(String, String)> {
+    let mut out = vec![];
+    for name in ["config.toml", "config"] {
+        let Ok(text) = fs::read_to_string(worktree.join(".cargo").join(name)) else { continue };
+        let Ok(table) = text.parse::<toml::Table>() else { continue };
+        let Some(targets) = table.get("target").and_then(|t| t.as_table()) else { continue };
+        for (triple, t) in targets {
+            if let Some(linker) = t.get("linker").and_then(|l| l.as_str())
+                && linker.contains('/')
+                && !Path::new(linker).is_absolute()
+            {
+                out.push((triple.clone(), linker.to_string()));
+            }
+        }
+    }
+    out
+}
+
+fn warn_path_dependent_config(repo: &Repo) {
+    for (triple, linker) in path_dependent_linkers(&repo.worktree) {
+        eprintln!(
+            "cargo-pool: warning: .cargo/config.toml sets target.{triple}.linker = \"{linker}\", a relative path.\n\
+             cargo-pool:   Cargo hashes the resolved linker path into every crate's fingerprint, so each\n\
+             cargo-pool:   worktree recompiles everything even with a shared target dir."
+        );
+        if let (false, Some(main)) = (triple.starts_with("cfg("), &repo.main_worktree) {
+            let var = format!("CARGO_TARGET_{}_LINKER", triple.to_uppercase().replace(['-', '.'], "_"));
+            eprintln!(
+                "cargo-pool:   Fix: point it at a path that's the same in every checkout, e.g.\n\
+                 cargo-pool:     export {var}={}",
+                main.join(&linker).display()
+            );
+        }
+    }
 }
 
 fn report_pick(s: &Slot, d: u64) {
@@ -1250,4 +1290,23 @@ fn uninstall_hook(path: &Path) -> Result<()> {
     }
     println!("removed cargo-pool block from {}", hook.display());
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn detects_relative_linker() {
+        let dir = std::env::temp_dir().join(format!("cargo-pool-test-{}", std::process::id()));
+        fs::create_dir_all(dir.join(".cargo")).unwrap();
+        fs::write(
+            dir.join(".cargo/config.toml"),
+            "[target.x86_64-unknown-linux-gnu]\nlinker = \"scripts/ld.sh\"\n\n[target.aarch64-unknown-linux-gnu]\nlinker = \"/usr/bin/cc\"\n",
+        )
+        .unwrap();
+        let found = path_dependent_linkers(&dir);
+        fs::remove_dir_all(&dir).unwrap();
+        assert_eq!(found, vec![("x86_64-unknown-linux-gnu".to_string(), "scripts/ld.sh".to_string())]);
+    }
 }

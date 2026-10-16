@@ -82,6 +82,25 @@ first step leaves nothing broken: cargo's config points at a small script
 gone, and the git hook does nothing if the binary is missing. Only the two leftover config
 entries remain.
 
+## Path-dependent cargo config
+
+Sharing a target dir only helps if cargo's fingerprints don't depend on where the
+checkout lives. A relative linker in the repo's own config breaks that:
+
+```toml
+[target.x86_64-unknown-linux-gnu]
+linker = "scripts/my-linker.sh"
+```
+
+Cargo resolves the path inside each worktree and hashes the absolute linker path into every
+crate's fingerprint, so every worktree recompiles everything (`Dirty …: the config settings
+changed` in `cargo build -v`). `cargo-pool attach` warns about this. To fix it, give the
+linker a path that's identical in every checkout, e.g. the main checkout's copy:
+
+```sh
+export CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER=/path/to/main/checkout/scripts/my-linker.sh
+```
+
 ## Commands
 
 | command | |
