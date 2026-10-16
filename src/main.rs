@@ -78,10 +78,16 @@ enum Cmd {
     InstallHook {
         /// Repository path (default: current directory).
         path: Option<PathBuf>,
+        /// Install for every repository via a config-based hook in ~/.gitconfig
+        /// (needs git 2.54+). Runs alongside each repository's own hooks.
+        #[arg(long, conflicts_with = "path")]
+        global: bool,
     },
-    /// Remove the hook block installed by `install-hook`.
+    /// Remove the hook installed by `install-hook`.
     UninstallHook {
         path: Option<PathBuf>,
+        #[arg(long, conflicts_with = "path")]
+        global: bool,
     },
     /// Make cargo run every compiler call through cargo-pool (`build.rustc-wrapper` in
     /// `$CARGO_HOME/config.toml`), so disk usage is checked during every pooled build.
@@ -126,8 +132,10 @@ fn run(cli: Cli) -> Result<()> {
         Cmd::Detach { path } => detach(&path_or_cwd(path)?),
         Cmd::Status { size } => status(size),
         Cmd::Gc { max_age_days, dry_run } => gc(max_age_days, dry_run),
-        Cmd::InstallHook { path } => install_hook(&path_or_cwd(path)?),
-        Cmd::UninstallHook { path } => uninstall_hook(&path_or_cwd(path)?),
+        Cmd::InstallHook { global: true, .. } => install_global_hook(),
+        Cmd::UninstallHook { global: true, .. } => uninstall_global_hook(),
+        Cmd::InstallHook { path, .. } => install_hook(&path_or_cwd(path)?),
+        Cmd::UninstallHook { path, .. } => uninstall_hook(&path_or_cwd(path)?),
         Cmd::InstallWrapper => install_wrapper(),
         Cmd::UninstallWrapper => uninstall_wrapper(),
         Cmd::PostCheckout { prev, .. } => {
@@ -723,7 +731,9 @@ fn attach(path: &Path, opts: AttachOpts) -> Result<()> {
                     s.target() == dest && s.meta.lease.as_ref().is_some_and(|l| l.worktree == repo.worktree)
                 });
                 if held {
-                    println!("already attached: {} -> {}", link.display(), dest.display());
+                    if !opts.from_hook {
+                        println!("already attached: {} -> {}", link.display(), dest.display());
+                    }
                     return Ok(());
                 }
                 // Our lease was stolen or lost; drop the dangling link and re-attach.
@@ -1057,6 +1067,34 @@ fn strip_block(s: &str) -> String {
         }
         _ => s.to_string(),
     }
+}
+
+const GLOBAL_HOOK: &str = "hook.cargo-pool";
+
+/// Global config-based hook: git appends the hook arguments to the command.
+fn install_global_hook() -> Result<()> {
+    let exe = fs::canonicalize(std::env::current_exe()?)?;
+    let cwd = std::env::current_dir()?;
+    let set = |key: &str, value: &str| git(&cwd, &["config", "--global", "--replace-all", &format!("{GLOBAL_HOOK}.{key}"), value]);
+    set("event", "post-checkout").context("git 2.54+ is needed for config-based hooks")?;
+    set("command", &format!("{:?} post-checkout", exe.to_string_lossy()))?;
+    println!("installed global post-checkout hook ({GLOBAL_HOOK}) in your global git config");
+    // A per-repo hook block would now attach twice (harmlessly); point it out.
+    if let Ok(hook) = hook_path(&cwd)
+        && fs::read_to_string(&hook).is_ok_and(|s| s.contains(HOOK_BEGIN))
+    {
+        eprintln!(
+            "cargo-pool: note: {} also has a cargo-pool block; `cargo pool uninstall-hook` removes it",
+            hook.display()
+        );
+    }
+    Ok(())
+}
+
+fn uninstall_global_hook() -> Result<()> {
+    git(&std::env::current_dir()?, &["config", "--global", "--remove-section", GLOBAL_HOOK])?;
+    println!("removed global post-checkout hook ({GLOBAL_HOOK})");
+    Ok(())
 }
 
 fn install_hook(path: &Path) -> Result<()> {

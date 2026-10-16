@@ -41,17 +41,29 @@ incremental cache.
 
 ```sh
 cargo install --git https://github.com/louisponet/cargo-pool
-cargo pool install-wrapper                          # once per machine, see below
-cd /path/to/rust/repo && cargo pool install-hook    # once per repo
+cargo pool install-hook --global   # every repo on this machine (git 2.54+)
+cargo pool install-wrapper         # disk check on every build, see below
 ```
 
 Worktrees that already exist aren't attached by the hook; run `cargo pool attach`
 inside them. Linux only for now.
 
-`install-hook` appends a guarded block to the repo's `post-checkout` hook (it respects
-`core.hooksPath` and keeps existing hooks such as git-lfs). Git runs `post-checkout` on
-`git worktree add`, so every tool that creates worktrees picks it up automatically.
-The hook never fails the checkout and ignores repos without a top-level `Cargo.toml`.
+Git runs the `post-checkout` hook on `git worktree add`, so every tool that creates
+worktrees (T3, Claude Code, plain git) picks it up automatically. The hook never fails
+the checkout and ignores repos without a top-level `Cargo.toml`.
+
+`install-hook --global` adds a config-based hook to `~/.gitconfig`:
+
+```ini
+[hook "cargo-pool"]
+	event = post-checkout
+	command = "/home/you/.cargo/bin/cargo-pool" post-checkout
+```
+
+It applies to every repository, including ones cloned later, and runs alongside each
+repository's own `.git/hooks` (git-lfs and similar keep working), unlike `core.hooksPath`,
+which replaces them. On git older than 2.54, use `cargo pool install-hook` inside each
+repo instead: it appends a guarded block to that repo's `post-checkout` hook.
 
 ### Disk check on every build
 
@@ -75,7 +87,7 @@ runs the compiler through it.
 | `cargo pool detach [path]` | release the slot and remove the symlink |
 | `cargo pool status [--size]` | show slots for this repo (all pools outside a repo) |
 | `cargo pool gc [--max-age-days D] [--dry-run]` | free disk space if over the limit; optionally delete free slots older than D days |
-| `cargo pool install-hook` / `uninstall-hook` | manage the post-checkout hook |
+| `cargo pool install-hook [--global]` / `uninstall-hook [--global]` | manage the post-checkout hook (all repos, or the current one) |
 | `cargo pool install-wrapper` / `uninstall-wrapper` | manage the global rustc wrapper |
 
 ## Settings
