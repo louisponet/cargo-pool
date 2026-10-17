@@ -419,6 +419,9 @@ struct Lease {
 #[derive(Serialize, Deserialize, Default)]
 struct SlotMeta {
     lease: Option<Lease>,
+    /// New slot that will be seeded on the first cargo command in its worktree.
+    #[serde(default)]
+    seed_pending: bool,
     /// Commit the target dir was last built for (best effort).
     last_head: Option<String>,
     last_used: u64,
@@ -614,6 +617,11 @@ fn is_rustc_wrapper(args: &[OsString]) -> bool {
 /// Check disk usage if this compile writes into a pooled target dir, then exec the
 /// compiler (through `CARGO_POOL_RUSTC_WRAPPER`, e.g. sccache, if set).
 fn rustc_wrapper(args: Vec<OsString>) -> ! {
+    if args[2..].iter().any(|a| a == "-vV")
+        && let Err(e) = seed_on_first_use()
+    {
+        eprintln!("cargo-pool: warning: seeding the slot failed, building from scratch: {e:#}");
+    }
     if let Err(e) = check_disk_during_build(&args[2..]) {
         eprintln!("cargo-pool: warning: disk check failed: {e:#}");
     }
@@ -1126,17 +1134,16 @@ fn attach(path: &Path, opts: AttachOpts) -> Result<()> {
             let id = slots.iter().map(|s| s.id + 1).max().unwrap_or(0);
             let dir = slots_dir.join(id.to_string());
             fs::create_dir_all(&dir)?;
-            let mut slot = Slot { id, dir, meta: SlotMeta { lease: Some(lease(true)), ..Default::default() } };
-            slot.save()?;
-            // Seed outside the pool lock: copying a big target takes a while.
-            let sources = seed_sources(&repo, &slots);
-            drop(lock);
-            let seeded_from = if opts.seed { seed(&repo, &slot, &head, sources)? } else { None };
+            // Don't copy anything yet: many worktrees never build. The slot is seeded by the
+            // rustc wrapper on the first cargo command (see `seed_on_first_use`).
+            let meta = SlotMeta { lease: Some(lease(false)), seed_pending: opts.seed, ..Default::default() };
+            let slot = Slot { id, dir, meta };
             fs::create_dir_all(slot.target())?;
-            let _lock = repo.lock()?;
-            slot.meta.last_head = seeded_from;
-            slot.meta.lease = Some(lease(false));
             slot.save()?;
+            drop(lock);
+            if opts.seed {
+                println!("cargo-pool: new slot {id}, filled from the closest warm target dir on the first cargo command");
+            }
             slots.push(slot);
             slots.len() - 1
         }
@@ -1146,21 +1153,88 @@ fn attach(path: &Path, opts: AttachOpts) -> Result<()> {
     symlink(slot.target(), &link).with_context(|| format!("creating {}", link.display()))?;
     exclude_target(&repo)?;
     warn_path_dependent_config(&repo);
-    if backdate_enabled(&repo)
-        && let Some(snap) = valid_snapshot(&slot.dir)
+    if !slot.meta.seed_pending {
+        prepare_worktree(&repo, &slot.dir)?;
+    }
+    println!("cargo-pool: {} -> slot {}", link.display(), slot.id);
+    Ok(())
+}
+
+/// Make a warm slot's build state fit the worktree it was just given to.
+fn prepare_worktree(repo: &Repo, slot_dir: &Path) -> Result<()> {
+    if backdate_enabled(repo)
+        && let Some(snap) = valid_snapshot(slot_dir)
     {
         let (matched, total) = backdate(&repo.worktree, &snap)?;
-        println!(
+        eprintln!(
             "cargo-pool: {matched} of {total} files are unchanged since the slot's last build; only the other {} count as edits",
             total - matched
         );
     }
     // After backdating: this changes the target, which invalidates the snapshot.
-    let reset = invalidate_foreign_git_inputs(&repo, &slot.target())?;
+    let reset = invalidate_foreign_git_inputs(repo, &slot_dir.join("target"))?;
     if reset > 0 {
-        println!("cargo-pool: {reset} build units recorded another checkout's git state (e.g. git_version!); they'll rebuild here");
+        eprintln!("cargo-pool: {reset} build units recorded another checkout's git state (e.g. git_version!); they'll rebuild here");
     }
-    println!("cargo-pool: {} -> slot {}", link.display(), slot.id);
+    Ok(())
+}
+
+/// Seed a pending slot when cargo first probes the compiler (`rustc -vV`) in its worktree.
+/// Cargo runs that probe before it creates or locks anything in the target dir, and an
+/// empty slot has no cached probe, so the first cargo command always comes through here.
+fn seed_on_first_use() -> Result<()> {
+    let root = fs::canonicalize(pool_root()?)?;
+    let cwd = std::env::current_dir()?;
+    let Some(target) = cwd
+        .ancestors()
+        .filter_map(|a| fs::read_link(a.join("target")).ok())
+        .find(|t| t.starts_with(&root))
+    else {
+        return Ok(());
+    };
+    let Some(slot_dir) = target.parent() else { return Ok(()) };
+    let pending = |dir: &Path| {
+        fs::read(dir.join("slot.json"))
+            .ok()
+            .and_then(|b| serde_json::from_slice::<SlotMeta>(&b).ok())
+            .is_some_and(|m| m.seed_pending)
+    };
+    if !pending(slot_dir) {
+        return Ok(());
+    }
+    // Parallel cargo commands (an agent's build and rust-analyzer) wait for one seeding.
+    let _seed_lock = FileLock::acquire(&slot_dir.join("seed.lock"), true)?;
+    if !pending(slot_dir) {
+        return Ok(());
+    }
+    let id: u32 = slot_dir.file_name().and_then(|n| n.to_str()).and_then(|n| n.parse().ok()).unwrap_or(0);
+    let meta: SlotMeta = serde_json::from_slice(&fs::read(slot_dir.join("slot.json"))?)?;
+    let Some(lease) = meta.lease.clone() else { return Ok(()) };
+    let repo = Repo::discover(&lease.worktree)?;
+    let mut slot = Slot { id, dir: slot_dir.to_path_buf(), meta };
+    // Another cargo already started building into it: too late to swap the dir out.
+    let seeded_from = if cargo_locks(&slot.target()).is_empty() {
+        let sources = {
+            let _pool = repo.lock()?;
+            let others: Vec<Slot> = load_slots(&repo.slots_dir())?.into_iter().filter(|s| s.id != id).collect();
+            seed_sources(&repo, &others)
+        };
+        let head = repo.head().unwrap_or(lease.head);
+        seed(&repo, &slot, &head, sources)?
+    } else {
+        None
+    };
+    fs::create_dir_all(slot.target())?;
+    {
+        let _pool = repo.lock()?;
+        slot.meta = serde_json::from_slice(&fs::read(slot_dir.join("slot.json"))?)?;
+        slot.meta.seed_pending = false;
+        slot.meta.last_head = seeded_from.clone().or(slot.meta.last_head.take());
+        slot.save()?;
+    }
+    if seeded_from.is_some() {
+        prepare_worktree(&repo, slot_dir)?;
+    }
     Ok(())
 }
 
@@ -1391,6 +1465,9 @@ fn status(size: bool) -> Result<()> {
         };
         let state = match (&s.meta.lease, s.state()) {
             (Some(l), State::Held) if l.pending => format!("seeding for {}", l.worktree.display()),
+            (Some(l), State::Held) if s.meta.seed_pending => {
+                format!("held by {} (filled on its first cargo command)", l.worktree.display())
+            }
             (Some(l), State::Held) => format!("held by {}", l.worktree.display()),
             _ => "free".into(),
         };

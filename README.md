@@ -14,9 +14,13 @@ Share warm cargo `target/` directories between git worktrees, so a fresh worktre
   cargo build lock.
 - A free slot is picked by the commit it was last built at: the closest to the new
   worktree's `HEAD` wins.
-- If no slot is free, a new one is created and **seeded** by copying the closest existing
-  target dir (another slot or the main checkout's `target/`). It holds cargo's build lock
-  during the copy, so it never copies a half-written build. There is no limit on the
+- If no slot is free, a new, empty one is created. It's **seeded** on the worktree's first
+  cargo command, by copying the closest existing target dir (another slot or the main
+  checkout's `target/`), so worktrees that never build cost no disk. Cargo asks the compiler
+  for its version (`rustc -vV`, through the rustc wrapper) before it touches the target dir,
+  and the copy happens then; that first command waits for it. The copy holds the source's
+  build lock, so it never copies a half-written build. Without the rustc wrapper installed,
+  new slots stay empty. There is no limit on the
   number of slots: disk usage is the only limit.
 - **Disk limit**: if the disk holding the pool is above `maxDiskPercent` (default 90%),
   pooled target dirs are deleted, across all repos' pools, until usage is back under the
