@@ -8,12 +8,15 @@ Share warm cargo `target/` directories between git worktrees, so a fresh worktre
 ## How it works
 
 - Every repository (keyed by its git common dir) gets a pool of **slots** in
-  `~/.cache/cargo-pool/<repo>-<hash>/slots/<n>/target`.
+  `<pool-directory>/<repo>-<hash>/slots/<n>/target`. The default pool directory is
+  `~/.cache/cargo-pool`.
 - `cargo-pool attach` replaces a worktree's `target` with a symlink to a slot. Each slot
   is leased to one worktree at a time, so parallel agents never block on each other's
   cargo build lock.
-- A free slot is picked by the commit it was last built at: the closest to the new
-  worktree's `HEAD` wins.
+- A free slot is picked across all configured pool directories by the commit it was
+  last built at: the closest to the new worktree's `HEAD` wins. Directories at or above
+  `maxDiskPercent` are excluded from reuse. New slots use the directory with the most
+  available bytes. Existing attachments stay in their current directory.
 - If no slot is free, a new, empty one is created. It's **seeded** on the worktree's first
   cargo command, by copying the closest existing target dir (another slot or the main
   checkout's `target/`), so worktrees that never build cost no disk. Cargo asks the compiler
@@ -23,8 +26,8 @@ Share warm cargo `target/` directories between git worktrees, so a fresh worktre
   new slots stay empty. There is no limit on the
   number of slots: disk usage is the only limit.
 - **Disk limit**: if the disk holding the pool is above `maxDiskPercent` (default 90%),
-  pooled target dirs are deleted, across all repos' pools, until usage is back under the
-  limit. This happens on every attach, on every pooled build (with the rustc wrapper
+  pooled target dirs on that filesystem are deleted, across all repos' pools and configured
+  directories, until usage is back under the limit. This happens on every attach, on every pooled build (with the rustc wrapper
   installed, see below) and on `gc`. Free slots go first, then slots of worktrees that
   haven't built anything for `idleHours`, least recently used first. An idle worktree
   whose slot is deleted loses its `target` link, so it starts over in its own directory
@@ -148,11 +151,35 @@ Each setting comes from an environment variable or git config, with the env var 
 
 | env | git config | default |
 |---|---|---|
+| `CARGO_POOL_DIRS` | global `cargo-pool.directory` entries | unset |
 | `CARGO_POOL_DIR` | – | `$XDG_CACHE_HOME/cargo-pool` or `~/.cache/cargo-pool` |
 | `CARGO_POOL_IDLE_HOURS` | `cargo-pool.idleHours` | 48 |
 | `CARGO_POOL_MAX_DISK_PERCENT` | `cargo-pool.maxDiskPercent` | 90 |
 | `CARGO_POOL_BACKDATE` | `cargo-pool.backdate` | true |
 | `CARGO_POOL_RUSTC_WRAPPER` | – | none (e.g. `sccache`) |
 
-Keep the pool on the same filesystem as your repos. On btrfs/XFS, seeding uses
-reflinks and is instant; on ext4 it's a full copy.
+### Use multiple pool directories
+
+Set a colon-separated list of absolute paths for a command:
+
+```sh
+CARGO_POOL_DIRS=/mnt/fast/cargo-pool:/mnt/large/cargo-pool cargo pool attach
+```
+
+To use the same directories for hooks and builds in every shell, save them in global git config:
+
+```sh
+git config --global --add cargo-pool.directory /mnt/fast/cargo-pool
+git config --global --add cargo-pool.directory /mnt/large/cargo-pool
+```
+
+`CARGO_POOL_DIRS` overrides `CARGO_POOL_DIR`, which overrides the global directory list.
+Without these settings, the existing default directory is used. Missing directories are
+created when a repository is opened by cargo-pool. All configured paths must be writable.
+
+Include the old pool directory in the list to keep reusing its slots. Existing slots are
+not moved. `status` and `gc` cover every configured directory, and new slots can be seeded
+from any of them. Cleanup affects only the filesystem that needs space.
+
+Seeding uses reflinks where supported on the same filesystem, such as btrfs or XFS.
+Copies between filesystems, or on ext4, require a full copy.

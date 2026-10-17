@@ -1,7 +1,7 @@
 //! cargo-pool: share warm cargo `target/` directories between git worktrees.
 //!
 //! Each repository (identified by its git common dir) gets a pool of slots under
-//! `$CARGO_POOL_DIR` (default `~/.cache/cargo-pool`). A worktree attaches to a slot
+//! the configured pool directories (default `~/.cache/cargo-pool`). A worktree attaches to a slot
 //! by having its `target` replaced with a symlink into the slot. A slot is leased
 //! to at most one worktree at a time, so concurrent agents never fight over the
 //! same cargo build lock. Leases are released explicitly with `detach`, or
@@ -155,7 +155,9 @@ fn run(cli: Cli) -> Result<()> {
             if fs::read_to_string(cargo_config()?).is_ok_and(|s| s.lines().any(is_our_wrapper_line)) {
                 uninstall_wrapper()?;
             }
-            println!("pooled target dirs are kept in {}; delete it to free their space", pool_root()?.display());
+            for root in pool_roots()? {
+                println!("pooled target dirs are kept in {}; delete it to free their space", root.display());
+            }
             Ok(())
         }
         Cmd::InstallHook { path, repo } => install_hook_auto(path, repo),
@@ -223,6 +225,7 @@ fn distance(dir: &Path, a: Option<&str>, b: &str) -> u64 {
         .unwrap_or(u64::MAX)
 }
 
+#[derive(Clone)]
 struct Repo {
     /// Top level of the worktree we're operating on.
     worktree: PathBuf,
@@ -247,7 +250,8 @@ impl Repo {
             .map(|n| n.to_string_lossy().trim_end_matches(".git").to_string())
             .unwrap_or_else(|| "repo".into());
         let key = format!("{name}-{:016x}", fnv1a(common_dir.as_os_str().as_encoded_bytes()));
-        let pool = pool_root()?.join(key);
+        let roots = pool_roots()?;
+        let pool = select_pool(&roots, &key, &worktree, &common_dir)?;
         Ok(Repo { worktree, common_dir, main_worktree, pool })
     }
 
@@ -288,15 +292,90 @@ fn idle_hours(git_dir: &Path) -> u64 {
     setting(git_dir, "CARGO_POOL_IDLE_HOURS", "cargo-pool.idleHours", 48)
 }
 
-fn pool_root() -> Result<PathBuf> {
-    if let Some(d) = std::env::var_os("CARGO_POOL_DIR") {
-        return Ok(PathBuf::from(d));
+fn pool_roots() -> Result<Vec<PathBuf>> {
+    let configured = if let Some(dirs) = std::env::var_os("CARGO_POOL_DIRS") {
+        std::env::split_paths(&dirs).collect::<Vec<_>>()
+    } else if let Some(dir) = std::env::var_os("CARGO_POOL_DIR") {
+        vec![PathBuf::from(dir)]
+    } else {
+        let output = Command::new("git")
+            .args(["config", "--global", "--path", "--get-all", "cargo-pool.directory"])
+            .output()?;
+        String::from_utf8(output.stdout)?.lines().map(PathBuf::from).collect()
+    };
+    let configured = if configured.is_empty() {
+        let root = if let Some(d) = std::env::var_os("XDG_CACHE_HOME") {
+            PathBuf::from(d).join("cargo-pool")
+        } else {
+            let home = std::env::var_os("HOME").ok_or_else(|| anyhow!("HOME not set"))?;
+            PathBuf::from(home).join(".cache/cargo-pool")
+        };
+        vec![root]
+    } else {
+        configured
+    };
+    let mut roots = Vec::new();
+    for root in configured {
+        if root.as_os_str().is_empty() || !root.is_absolute() {
+            bail!("pool directories must be nonempty absolute paths: {}", root.display());
+        }
+        let root = fs::canonicalize(&root).unwrap_or(root);
+        if !roots.contains(&root) {
+            roots.push(root);
+        }
     }
-    if let Some(d) = std::env::var_os("XDG_CACHE_HOME") {
-        return Ok(PathBuf::from(d).join("cargo-pool"));
+    Ok(roots)
+}
+
+fn select_pool(roots: &[PathBuf], key: &str, worktree: &Path, common_dir: &Path) -> Result<PathBuf> {
+    let attached = fs::read_link(worktree.join("target")).ok();
+    let head = git(worktree, &["rev-parse", "HEAD"]).ok();
+    let max_disk = setting(common_dir, "CARGO_POOL_MAX_DISK_PERCENT", "cargo-pool.maxDiskPercent", 90.0);
+    let mut warm = Vec::new();
+    let mut capacity = Vec::new();
+    for root in roots {
+        fs::create_dir_all(root).with_context(|| format!("creating pool directory {}", root.display()))?;
     }
-    let home = std::env::var_os("HOME").ok_or_else(|| anyhow!("HOME not set"))?;
-    Ok(PathBuf::from(home).join(".cache/cargo-pool"))
+    for root in roots {
+        let pool = fs::canonicalize(root)?.join(key);
+        if attached.as_ref().is_some_and(|target| target.starts_with(pool.join("slots"))) {
+            return Ok(pool);
+        }
+        capacity.push((available_bytes(root)?, pool.clone()));
+        if disk_percent(root, 0)? < max_disk {
+            for slot in load_slots(&pool.join("slots"))? {
+                if slot.state() != State::Held {
+                    warm.push((
+                        distance(worktree, slot.meta.last_head.as_deref(), head.as_deref().unwrap_or("")),
+                        u64::MAX - slot.meta.last_used,
+                        pool.clone(),
+                    ));
+                }
+            }
+        }
+    }
+    if let Some((_, _, pool)) = warm.into_iter().min() {
+        return Ok(pool);
+    }
+    Ok(capacity.into_iter().max_by_key(|(bytes, _)| *bytes).unwrap().1)
+}
+
+fn available_bytes(path: &Path) -> Result<u64> {
+    let c = CString::new(path.as_os_str().as_bytes())?;
+    let mut st: libc::statvfs = unsafe { std::mem::zeroed() };
+    if unsafe { libc::statvfs(c.as_ptr(), &mut st) } != 0 {
+        return Err(std::io::Error::last_os_error()).with_context(|| format!("statvfs {}", path.display()));
+    }
+    Ok((st.f_bavail as u64).saturating_mul(st.f_frsize as u64))
+}
+
+fn containing_pool_root(path: &Path) -> Result<Option<PathBuf>> {
+    let path = fs::canonicalize(path)?;
+    Ok(pool_roots()?
+        .into_iter()
+        .filter_map(|root| fs::canonicalize(root).ok())
+        .filter(|root| path.starts_with(root))
+        .max_by_key(|root| root.components().count()))
 }
 
 const FNV_OFFSET: u64 = 0xcbf29ce484222325;
@@ -534,36 +613,41 @@ fn human(bytes: u64) -> String {
     if gb >= 1.0 { format!("{gb:.1}G") } else { format!("{:.0}M", bytes as f64 / (1u64 << 20) as f64) }
 }
 
-/// Delete pooled target dirs, across every pool on this machine, until disk usage
+/// Delete pooled target dirs on `root`'s filesystem, across configured directories, until disk usage
 /// (plus `extra` bytes about to be written) is below `max_percent`.
 ///
 /// Free slots go first, then slots of worktrees idle for longer than their repo's
 /// `idleHours`, least recently used first. Slots in `protect`, slots with a cargo
 /// build running and pools locked by another cargo-pool process are never touched.
 /// Must be called without holding any pool lock. Returns whether the goal was met.
-fn free_disk(max_percent: f64, extra: u64, protect: &[&Path]) -> Result<bool> {
-    let root = pool_root()?;
-    fs::create_dir_all(&root)?;
-    if disk_percent(&root, extra)? < max_percent {
+fn free_disk(root: &Path, max_percent: f64, extra: u64, protect: &[&Path]) -> Result<bool> {
+    fs::create_dir_all(root)?;
+    if disk_percent(root, extra)? < max_percent {
         return Ok(true);
     }
 
     // (idle-held?, last used, pool, slot id)
     let mut candidates = vec![];
-    for pool in fs::read_dir(&root)?.flatten().map(|e| e.path()) {
-        let git_dir = PathBuf::from(fs::read_to_string(pool.join("repo")).unwrap_or_default());
-        let cutoff = now().saturating_sub(idle_hours(&git_dir) * 3600);
-        for s in load_slots(&pool.join("slots"))? {
-            if protect.contains(&s.dir.as_path()) {
-                continue;
-            }
-            let used = s.meta.last_used.max(last_activity(&s.target()));
-            match (s.state(), &s.meta.lease) {
-                (State::Free | State::Stale, _) => candidates.push((false, used, pool.clone(), s.id)),
-                (State::Held, Some(l)) if !l.pending && used.max(l.acquired_at) < cutoff => {
-                    candidates.push((true, used.max(l.acquired_at), pool.clone(), s.id))
+    let device = fs::metadata(root)?.dev();
+    for directory in pool_roots()? {
+        if !fs::metadata(&directory).is_ok_and(|m| m.dev() == device) {
+            continue;
+        }
+        for pool in fs::read_dir(directory)?.flatten().map(|e| e.path()) {
+            let git_dir = PathBuf::from(fs::read_to_string(pool.join("repo")).unwrap_or_default());
+            let cutoff = now().saturating_sub(idle_hours(&git_dir) * 3600);
+            for s in load_slots(&pool.join("slots"))? {
+                if protect.contains(&s.dir.as_path()) {
+                    continue;
                 }
-                _ => {}
+                let used = s.meta.last_used.max(last_activity(&s.target()));
+                match (s.state(), &s.meta.lease) {
+                    (State::Free | State::Stale, _) => candidates.push((false, used, pool.clone(), s.id)),
+                    (State::Held, Some(l)) if !l.pending && used.max(l.acquired_at) < cutoff => {
+                        candidates.push((true, used.max(l.acquired_at), pool.clone(), s.id))
+                    }
+                    _ => {}
+                }
             }
         }
     }
@@ -593,7 +677,7 @@ fn free_disk(max_percent: f64, extra: u64, protect: &[&Path]) -> Result<bool> {
             pool.file_name().unwrap_or_default().to_string_lossy(),
             human(size)
         );
-        if disk_percent(&root, extra)? < max_percent {
+        if disk_percent(root, extra)? < max_percent {
             return Ok(true);
         }
     }
@@ -638,9 +722,8 @@ fn check_disk_during_build(rustc_args: &[OsString]) -> Result<()> {
     let Some(out_dir) = rustc_args.iter().position(|a| a == "--out-dir").and_then(|i| rustc_args.get(i + 1)) else {
         return Ok(());
     };
-    let (Ok(out_dir), Ok(root)) = (fs::canonicalize(out_dir), fs::canonicalize(pool_root()?)) else {
-        return Ok(());
-    };
+    let Ok(out_dir) = fs::canonicalize(out_dir) else { return Ok(()) };
+    let Some(root) = containing_pool_root(&out_dir)? else { return Ok(()) };
     let Ok(rel) = out_dir.strip_prefix(&root) else { return Ok(()) };
     let mut parts = rel.components().map(|c| c.as_os_str());
     let Some(pool) = parts.next() else { return Ok(()) };
@@ -672,7 +755,7 @@ fn check_disk_during_build(rustc_args: &[OsString]) -> Result<()> {
     if recent() {
         return Ok(());
     }
-    let ok = free_disk(max_disk, 0, &[]);
+    let ok = free_disk(&root, max_disk, 0, &[]);
     fs::write(&marker, now().to_string())?;
     if !ok? {
         eprintln!("cargo-pool: warning: disk is still above {max_disk}% after cleaning up all pools");
@@ -1100,7 +1183,7 @@ fn attach(path: &Path, opts: AttachOpts) -> Result<()> {
     }
 
     let max_disk = repo.max_disk_percent();
-    if !free_disk(max_disk, 0, &[])? {
+    if !free_disk(repo.pool.parent().unwrap(), max_disk, 0, &[])? {
         eprintln!("cargo-pool: warning: disk is still above {max_disk}% after cleaning up all pools");
     }
 
@@ -1183,12 +1266,11 @@ fn prepare_worktree(repo: &Repo, slot_dir: &Path) -> Result<()> {
 /// Cargo runs that probe before it creates or locks anything in the target dir, and an
 /// empty slot has no cached probe, so the first cargo command always comes through here.
 fn seed_on_first_use() -> Result<()> {
-    let root = fs::canonicalize(pool_root()?)?;
     let cwd = std::env::current_dir()?;
     let Some(target) = cwd
         .ancestors()
         .filter_map(|a| fs::read_link(a.join("target")).ok())
-        .find(|t| t.starts_with(&root))
+        .find(|t| containing_pool_root(t).ok().flatten().is_some())
     else {
         return Ok(());
     };
@@ -1216,7 +1298,11 @@ fn seed_on_first_use() -> Result<()> {
     let seeded_from = if cargo_locks(&slot.target()).is_empty() {
         let sources = {
             let _pool = repo.lock()?;
-            let others: Vec<Slot> = load_slots(&repo.slots_dir())?.into_iter().filter(|s| s.id != id).collect();
+            let mut others = Vec::new();
+            for root in pool_roots()? {
+                let pool = root.join(repo.pool.file_name().unwrap());
+                others.extend(load_slots(&pool.join("slots"))?.into_iter().filter(|s| s.dir != slot_dir));
+            }
             seed_sources(&repo, &others)
         };
         let head = repo.head().unwrap_or(lease.head);
@@ -1321,7 +1407,7 @@ fn seed(repo: &Repo, slot: &Slot, head: &str, sources: Vec<(PathBuf, Option<Stri
         // Make room for the copy first; never let seeding push the disk over the limit.
         let size = dir_size(&src);
         let protect: Vec<&Path> = [src.parent(), Some(slot.dir.as_path())].into_iter().flatten().collect();
-        if !free_disk(max_disk, size, &protect)? {
+        if !free_disk(repo.pool.parent().unwrap(), max_disk, size, &protect)? {
             eprintln!(
                 "cargo-pool: copying {} ({}) would push the disk above {max_disk}%, skipping it",
                 src.display(),
@@ -1432,86 +1518,93 @@ fn du(p: &Path) -> String {
 fn status(size: bool) -> Result<()> {
     let cwd = std::env::current_dir()?;
     let Ok(repo) = Repo::discover(&cwd) else {
-        let root = pool_root()?;
-        println!("pools in {}:", root.display());
-        for e in fs::read_dir(&root).into_iter().flatten().flatten() {
-            let repo = fs::read_to_string(e.path().join("repo")).unwrap_or_default();
-            let n = fs::read_dir(e.path().join("slots")).map_or(0, |d| d.count());
-            println!("  {:<40} {n} slots  {repo}", e.file_name().to_string_lossy());
+        for root in pool_roots()? {
+            println!("pools in {}:", root.display());
+            for e in fs::read_dir(&root).into_iter().flatten().flatten() {
+                let repo = fs::read_to_string(e.path().join("repo")).unwrap_or_default();
+                let n = fs::read_dir(e.path().join("slots")).map_or(0, |d| d.count());
+                println!("  {:<40} {n} slots  {repo}", e.file_name().to_string_lossy());
+            }
         }
         return Ok(());
     };
-    let _lock = repo.lock()?;
-    let mut slots = load_slots(&repo.slots_dir())?;
-    reclaim_stale(&mut slots)?;
-    let head = repo.head().ok();
-    println!(
-        "pool {} (disk at {:.1}%, limit {}%)",
-        repo.pool.display(),
-        disk_percent(&repo.pool, 0)?,
-        repo.max_disk_percent()
-    );
-    if slots.is_empty() {
-        println!("  (no slots yet)");
-    }
-    for s in &slots {
-        let built = s.meta.lease.as_ref().map(|l| l.head.as_str()).or(s.meta.last_head.as_deref());
-        let dist = match (&head, built) {
-            (Some(h), Some(b)) => match distance(&repo.worktree, Some(b), h) {
-                u64::MAX => "unrelated".into(),
-                d => format!("{d} from HEAD"),
-            },
-            _ => String::new(),
-        };
-        let state = match (&s.meta.lease, s.state()) {
-            (Some(l), State::Held) if l.pending => format!("seeding for {}", l.worktree.display()),
-            (Some(l), State::Held) if s.meta.seed_pending => {
-                format!("held by {} (filled on its first cargo command)", l.worktree.display())
-            }
-            (Some(l), State::Held) => format!("held by {}", l.worktree.display()),
-            _ => "free".into(),
-        };
-        let size = if size { format!("  {}", du(&s.target())) } else { String::new() };
+    for root in pool_roots()? {
+        let repo = Repo { pool: fs::canonicalize(root)?.join(repo.pool.file_name().unwrap()), ..repo.clone() };
+        let _lock = repo.lock()?;
+        let mut slots = load_slots(&repo.slots_dir())?;
+        reclaim_stale(&mut slots)?;
+        let head = repo.head().ok();
         println!(
-            "  slot {:<3} {state}\n           commit {} {dist}, last build {}{size}",
-            s.id,
-            built.map_or("?", short),
-            ago(last_activity(&s.target()).max(s.meta.last_used)),
+            "pool {} (disk at {:.1}%, limit {}%)",
+            repo.pool.display(),
+            disk_percent(&repo.pool, 0)?,
+            repo.max_disk_percent()
         );
+        if slots.is_empty() {
+            println!("  (no slots yet)");
+        }
+        for s in &slots {
+            let built = s.meta.lease.as_ref().map(|l| l.head.as_str()).or(s.meta.last_head.as_deref());
+            let dist = match (&head, built) {
+                (Some(h), Some(b)) => match distance(&repo.worktree, Some(b), h) {
+                    u64::MAX => "unrelated".into(),
+                    d => format!("{d} from HEAD"),
+                },
+                _ => String::new(),
+            };
+            let state = match (&s.meta.lease, s.state()) {
+                (Some(l), State::Held) if l.pending => format!("seeding for {}", l.worktree.display()),
+                (Some(l), State::Held) if s.meta.seed_pending => {
+                    format!("held by {} (filled on its first cargo command)", l.worktree.display())
+                }
+                (Some(l), State::Held) => format!("held by {}", l.worktree.display()),
+                _ => "free".into(),
+            };
+            let size = if size { format!("  {}", du(&s.target())) } else { String::new() };
+            println!(
+                "  slot {:<3} {state}\n           commit {} {dist}, last build {}{size}",
+                s.id,
+                built.map_or("?", short),
+                ago(last_activity(&s.target()).max(s.meta.last_used)),
+            );
+        }
     }
     Ok(())
 }
 
 fn gc(max_age_days: Option<u64>, dry_run: bool) -> Result<()> {
     let repo = Repo::discover(&std::env::current_dir()?)?;
-    let lock = repo.lock()?;
-    let mut slots = load_slots(&repo.slots_dir())?;
-    if !dry_run {
-        reclaim_stale(&mut slots)?;
-    }
-    let cutoff = max_age_days.map_or(0, |d| now().saturating_sub(d * 86400));
-    let removed: BTreeMap<_, _> = slots
-        .iter()
-        .filter(|s| s.state() != State::Held && s.meta.last_used.max(last_activity(&s.target())) < cutoff)
-        .map(|s| (s.id, s.dir.clone()))
-        .collect();
-    for (id, dir) in &removed {
-        println!("{} slot {id} ({})", if dry_run { "would remove" } else { "removing" }, dir.display());
+    for root in pool_roots()? {
+        let repo = Repo { pool: fs::canonicalize(root)?.join(repo.pool.file_name().unwrap()), ..repo.clone() };
+        let lock = repo.lock()?;
+        let mut slots = load_slots(&repo.slots_dir())?;
         if !dry_run {
-            fs::remove_dir_all(dir)?;
+            reclaim_stale(&mut slots)?;
         }
-    }
-    if let (Some(d), true) = (max_age_days, removed.is_empty()) {
-        println!("no free slots unused for more than {d} days");
-    }
-    drop(lock);
+        let cutoff = max_age_days.map_or(0, |d| now().saturating_sub(d * 86400));
+        let removed: BTreeMap<_, _> = slots
+            .iter()
+            .filter(|s| s.state() != State::Held && s.meta.last_used.max(last_activity(&s.target())) < cutoff)
+            .map(|s| (s.id, s.dir.clone()))
+            .collect();
+        for (id, dir) in &removed {
+            println!("{} slot {id} ({})", if dry_run { "would remove" } else { "removing" }, dir.display());
+            if !dry_run {
+                fs::remove_dir_all(dir)?;
+            }
+        }
+        if let (Some(d), true) = (max_age_days, removed.is_empty()) {
+            println!("no free slots unused for more than {d} days");
+        }
+        drop(lock);
 
-    let max_disk = repo.max_disk_percent();
-    let pct = disk_percent(&repo.pool, 0)?;
-    if dry_run {
-        println!("disk at {pct:.1}% (limit {max_disk}%)");
-    } else if !free_disk(max_disk, 0, &[])? {
-        eprintln!("cargo-pool: warning: disk is still above {max_disk}% after cleaning up all pools");
+        let max_disk = repo.max_disk_percent();
+        let pct = disk_percent(&repo.pool, 0)?;
+        if dry_run {
+            println!("disk at {pct:.1}% (limit {max_disk}%)");
+        } else if !free_disk(repo.pool.parent().unwrap(), max_disk, 0, &[])? {
+            eprintln!("cargo-pool: warning: disk is still above {max_disk}% after cleaning up all pools");
+        }
     }
     Ok(())
 }
