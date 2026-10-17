@@ -153,8 +153,20 @@ fn global_directories_and_legacy_environment_override() {
     let f = Fixture::new();
     let a = f.worktree("a");
     let b = f.worktree("b");
+    let local_config = f.dir.join(".gitconfig.local");
+    f.git(&f.repo, &["config", "--global", "include.path", local_config.to_str().unwrap()]);
     for root in &f.roots {
-        f.git(&f.repo, &["config", "--global", "--add", "cargo-pool.directory", root.to_str().unwrap()]);
+        f.git(
+            &f.repo,
+            &[
+                "config",
+                "--file",
+                local_config.to_str().unwrap(),
+                "--add",
+                "cargo-pool.directory",
+                root.to_str().unwrap(),
+            ],
+        );
     }
     let run = |cwd: &Path, single: Option<&Path>, multiple: Option<&[PathBuf]>| {
         let mut cmd = f.command(env!("CARGO_BIN_EXE_cargo-pool"), cwd);

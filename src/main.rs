@@ -299,7 +299,7 @@ fn pool_roots() -> Result<Vec<PathBuf>> {
         vec![PathBuf::from(dir)]
     } else {
         let output = Command::new("git")
-            .args(["config", "--global", "--path", "--get-all", "cargo-pool.directory"])
+            .args(["config", "--global", "--includes", "--path", "--get-all", "cargo-pool.directory"])
             .output()?;
         String::from_utf8(output.stdout)?.lines().map(PathBuf::from).collect()
     };
