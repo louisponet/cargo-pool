@@ -17,7 +17,7 @@ use std::os::unix::fs::{MetadataExt, symlink};
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, anyhow, bail};
 use clap::{Parser, Subcommand};
@@ -65,6 +65,12 @@ enum Cmd {
         /// Compute on-disk size of every slot (slow for big targets).
         #[arg(long)]
         size: bool,
+    },
+    /// Summarize recorded metrics for the current repository (or all pools outside a repo).
+    Stats {
+        /// Only count events from the last this many days.
+        #[arg(long)]
+        days: Option<u64>,
     },
     /// Reclaim stale leases and free disk space if usage is above the limit.
     Gc {
@@ -142,6 +148,7 @@ fn run(cli: Cli) -> Result<()> {
         }
         Cmd::Detach { path } => detach(&path_or_cwd(path)?),
         Cmd::Status { size } => status(size),
+        Cmd::Stats { days } => stats(days),
         Cmd::Gc { max_age_days, dry_run } => gc(max_age_days, dry_run),
         Cmd::Install { no_wrapper } => {
             install_hook_auto(None, false)?;
@@ -672,6 +679,7 @@ fn free_disk(root: &Path, max_percent: f64, extra: u64, protect: &[&Path]) -> Re
         }
         let size = dir_size(&s.dir);
         fs::remove_dir_all(&s.dir).with_context(|| format!("removing {}", s.dir.display()))?;
+        record(&s.dir, Event::Evict { bytes: size });
         eprintln!(
             "cargo-pool: disk above {max_percent}%: deleted slot {id} of {} ({}{from})",
             pool.file_name().unwrap_or_default().to_string_lossy(),
@@ -1070,6 +1078,12 @@ fn backdate_enabled(repo: &Repo) -> bool {
 fn note_pooled_compile(slot_dir: &Path) -> Result<()> {
     let marker = OpenOptions::new().create(true).truncate(false).write(true).open(slot_dir.join("last-compile"))?;
     marker.set_modified(SystemTime::now())?;
+    // One line per compile; the snapshot waiter turns them into a `Build` event.
+    let _ = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(slot_dir.join("compiles"))
+        .and_then(|mut f| f.write_all(format!("{}\n", now_ns()).as_bytes()));
     // A waiter holds this lock; don't start a second one.
     if FileLock::acquire(&slot_dir.join("snapshot.lock"), false)?.is_none() {
         return Ok(());
@@ -1101,14 +1115,17 @@ fn snapshot_after_build(slot_dir: &Path) -> Result<()> {
             for l in cargo_locks(&target) {
                 drop(FileLock::acquire(&l, true)?);
             }
+            record_build(slot_dir);
             let meta: SlotMeta = serde_json::from_slice(&fs::read(slot_dir.join("slot.json"))?)?;
             let Some(lease) = meta.lease.filter(|l| !l.pending) else { return Ok(()) };
             if fs::read_link(lease.worktree.join("target")).ok().as_deref() != Some(target.as_path()) {
                 return Ok(());
             }
+            let started = Instant::now();
             let snap = take_snapshot(&lease.worktree, load_snapshot(slot_dir).as_ref())?;
             if last_compile_ns(slot_dir) < snap.taken_at {
                 save_snapshot(slot_dir, &snap)?;
+                record(slot_dir, Event::Snapshot { files: snap.files.len() as u64, ms: ms_since(started) });
                 break;
             }
         }
@@ -1118,6 +1135,67 @@ fn snapshot_after_build(slot_dir: &Path) -> Result<()> {
             return Ok(());
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// metrics: an append-only event log per pool (`<pool>/events.jsonl`), summarized by `stats`
+
+#[derive(Serialize, Deserialize)]
+#[serde(tag = "event", rename_all = "kebab-case")]
+enum Event {
+    /// A worktree leased a slot: finding it, disk cleanup and linking (not `Prepare`).
+    Attach { reused: bool, ms: u64 },
+    /// A warm slot was fitted to its new worktree: backdating and fingerprint resets.
+    Prepare { backdated: u64, files: u64, reset: u64, ms: u64 },
+    /// A new slot was filled on its first cargo command; `bytes` is None if nothing was copied.
+    Seed { bytes: Option<u64>, ms: u64 },
+    /// A cargo command compiled into the slot: from its first compile until it released the build lock.
+    Build { units: u64, ms: u64 },
+    /// Background snapshot of the worktree after a build.
+    Snapshot { files: u64, ms: u64 },
+    /// Slot deleted to free disk space, or by `gc --max-age-days`.
+    Evict { bytes: u64 },
+}
+
+#[derive(Serialize, Deserialize)]
+struct Record {
+    at: u64,
+    slot: u32,
+    #[serde(flatten)]
+    event: Event,
+}
+
+/// Append an event for the slot at `slot_dir` to its pool's log. Metrics never fail an operation.
+fn record(slot_dir: &Path, event: Event) {
+    let Some(pool) = slot_dir.parent().and_then(Path::parent) else { return };
+    let Some(slot) = slot_dir.file_name().and_then(|n| n.to_str()).and_then(|n| n.parse().ok()) else { return };
+    let Ok(mut line) = serde_json::to_vec(&Record { at: now(), slot, event }) else { return };
+    line.push(b'\n');
+    // A single O_APPEND write keeps lines from concurrent processes whole.
+    let _ = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(pool.join("events.jsonl"))
+        .and_then(|mut f| f.write_all(&line));
+}
+
+/// Turn the compiles logged by the rustc wrapper since the last call into a `Build` event.
+fn record_build(slot_dir: &Path) {
+    let taken = slot_dir.join("compiles.taken");
+    if fs::rename(slot_dir.join("compiles"), &taken).is_err() {
+        return;
+    }
+    let starts: Vec<u64> =
+        fs::read_to_string(&taken).unwrap_or_default().lines().filter_map(|l| l.parse().ok()).collect();
+    let _ = fs::remove_file(&taken);
+    if let Some(first) = starts.iter().min() {
+        let ms = now_ns().saturating_sub(*first) / 1_000_000;
+        record(slot_dir, Event::Build { units: starts.len() as u64, ms });
+    }
+}
+
+fn ms_since(t: Instant) -> u64 {
+    t.elapsed().as_millis() as u64
 }
 
 // ---------------------------------------------------------------------------
@@ -1131,6 +1209,7 @@ struct AttachOpts {
 }
 
 fn attach(path: &Path, opts: AttachOpts) -> Result<()> {
+    let started = Instant::now();
     let repo = Repo::discover(path)?;
     if !repo.worktree.join("Cargo.toml").exists() {
         if !opts.from_hook {
@@ -1236,6 +1315,7 @@ fn attach(path: &Path, opts: AttachOpts) -> Result<()> {
     symlink(slot.target(), &link).with_context(|| format!("creating {}", link.display()))?;
     exclude_target(&repo)?;
     warn_path_dependent_config(&repo);
+    record(&slot.dir, Event::Attach { reused: pick.is_some(), ms: ms_since(started) });
     if !slot.meta.seed_pending {
         prepare_worktree(&repo, &slot.dir)?;
     }
@@ -1245,10 +1325,12 @@ fn attach(path: &Path, opts: AttachOpts) -> Result<()> {
 
 /// Make a warm slot's build state fit the worktree it was just given to.
 fn prepare_worktree(repo: &Repo, slot_dir: &Path) -> Result<()> {
+    let started = Instant::now();
+    let (mut matched, mut total) = (0, 0);
     if backdate_enabled(repo)
         && let Some(snap) = valid_snapshot(slot_dir)
     {
-        let (matched, total) = backdate(&repo.worktree, &snap)?;
+        (matched, total) = backdate(&repo.worktree, &snap)?;
         eprintln!(
             "cargo-pool: {matched} of {total} files are unchanged since the slot's last build; only the other {} count as edits",
             total - matched
@@ -1259,6 +1341,10 @@ fn prepare_worktree(repo: &Repo, slot_dir: &Path) -> Result<()> {
     if reset > 0 {
         eprintln!("cargo-pool: {reset} build units recorded another checkout's git state (e.g. git_version!); they'll rebuild here");
     }
+    record(
+        slot_dir,
+        Event::Prepare { backdated: matched as u64, files: total as u64, reset: reset as u64, ms: ms_since(started) },
+    );
     Ok(())
 }
 
@@ -1401,6 +1487,7 @@ fn seed(repo: &Repo, slot: &Slot, head: &str, sources: Vec<(PathBuf, Option<Stri
         .map(|(t, h)| (distance(&repo.worktree, h.as_deref(), head), last_activity(&t), t, h))
         .collect();
     ranked.sort_by_key(|(d, act, ..)| (*d, u64::MAX - act));
+    let begun = Instant::now();
 
     let max_disk = repo.max_disk_percent();
     for (d, _, src, h) in ranked {
@@ -1445,9 +1532,11 @@ fn seed(repo: &Repo, slot: &Slot, head: &str, sources: Vec<(PathBuf, Option<Stri
         }
         let secs = started.elapsed().unwrap_or(Duration::ZERO).as_secs();
         eprintln!("cargo-pool: seeded in {secs}s");
+        record(&slot.dir, Event::Seed { bytes: Some(size), ms: ms_since(begun) });
         return Ok(h);
     }
     eprintln!("cargo-pool: no seed available, slot {} starts empty", slot.id);
+    record(&slot.dir, Event::Seed { bytes: None, ms: ms_since(begun) });
     Ok(None)
 }
 
@@ -1572,6 +1661,129 @@ fn status(size: bool) -> Result<()> {
     Ok(())
 }
 
+#[derive(Default)]
+struct Totals {
+    repo: String,
+    slots: usize,
+    held: usize,
+    attaches: u64,
+    reused: u64,
+    attach_ms: u64,
+    prepares: u64,
+    backdated: u64,
+    files: u64,
+    reset: u64,
+    prepare_ms: u64,
+    seeds: u64,
+    seeded: u64,
+    seed_bytes: u64,
+    seed_ms: u64,
+    builds: u64,
+    units: u64,
+    build_ms: u64,
+    snapshots: u64,
+    snapshot_ms: u64,
+    evictions: u64,
+    evicted_bytes: u64,
+}
+
+fn stats(days: Option<u64>) -> Result<()> {
+    let key = Repo::discover(&std::env::current_dir()?).ok().map(|r| r.pool.file_name().unwrap().to_owned());
+    let cutoff = days.map_or(0, |d| now().saturating_sub(d * 86400));
+    // Keyed by pool name: a repository's slots can be spread over several pool directories.
+    let mut pools: BTreeMap<OsString, Totals> = BTreeMap::new();
+    for root in pool_roots()? {
+        for pool in fs::read_dir(&root).into_iter().flatten().flatten().map(|e| e.path()) {
+            let name = pool.file_name().unwrap().to_owned();
+            if key.as_ref().is_some_and(|k| *k != name) || !pool.join("slots").is_dir() {
+                continue;
+            }
+            let t = pools.entry(name).or_default();
+            t.repo = fs::read_to_string(pool.join("repo")).unwrap_or_default();
+            for s in load_slots(&pool.join("slots"))? {
+                t.slots += 1;
+                t.held += (s.state() == State::Held) as usize;
+            }
+            for line in fs::read_to_string(pool.join("events.jsonl")).unwrap_or_default().lines() {
+                let Ok(r) = serde_json::from_str::<Record>(line) else { continue };
+                if r.at < cutoff {
+                    continue;
+                }
+                match r.event {
+                    Event::Attach { reused, ms } => {
+                        t.attaches += 1;
+                        t.reused += reused as u64;
+                        t.attach_ms += ms;
+                    }
+                    Event::Prepare { backdated, files, reset, ms } => {
+                        t.prepares += 1;
+                        t.backdated += backdated;
+                        t.files += files;
+                        t.reset += reset;
+                        t.prepare_ms += ms;
+                    }
+                    Event::Seed { bytes, ms } => {
+                        t.seeds += 1;
+                        t.seeded += bytes.is_some() as u64;
+                        t.seed_bytes += bytes.unwrap_or(0);
+                        t.seed_ms += ms;
+                    }
+                    Event::Build { units, ms } => {
+                        t.builds += 1;
+                        t.units += units;
+                        t.build_ms += ms;
+                    }
+                    Event::Snapshot { ms, .. } => {
+                        t.snapshots += 1;
+                        t.snapshot_ms += ms;
+                    }
+                    Event::Evict { bytes } => {
+                        t.evictions += 1;
+                        t.evicted_bytes += bytes;
+                    }
+                }
+            }
+        }
+    }
+    if pools.is_empty() {
+        println!("no pools yet");
+    }
+    let window = days.map_or("all time".to_string(), |d| format!("last {d} days"));
+    for (name, t) in &pools {
+        println!("{} ({}): {} slots, {} in use, {window}", name.to_string_lossy(), t.repo, t.slots, t.held);
+        println!(
+            "  attached   {} worktrees: {} to a warm slot, {} to a new one; {}",
+            t.attaches,
+            t.reused,
+            t.attaches - t.reused,
+            dur(t.attach_ms)
+        );
+        println!("  seeded     {} of {} new slots, {} copied; {}", t.seeded, t.seeds, human(t.seed_bytes), dur(t.seed_ms));
+        println!(
+            "  prepared   {} slots: {} of {} files backdated, {} units reset; {}",
+            t.prepares,
+            t.backdated,
+            t.files,
+            t.reset,
+            dur(t.prepare_ms)
+        );
+        println!("  setup      {} in total (attach + seed + prepare)", dur(t.attach_ms + t.seed_ms + t.prepare_ms));
+        println!("  built      {} cargo commands, {} units compiled; {}", t.builds, t.units, dur(t.build_ms));
+        println!("  snapshots  {} in the background; {}", t.snapshots, dur(t.snapshot_ms));
+        println!("  evicted    {} slots, {} freed", t.evictions, human(t.evicted_bytes));
+    }
+    Ok(())
+}
+
+fn dur(ms: u64) -> String {
+    match ms {
+        0..1000 => format!("{ms}ms"),
+        1000..60_000 => format!("{:.1}s", ms as f64 / 1000.0),
+        60_000..3_600_000 => format!("{}m{:02}s", ms / 60_000, ms / 1000 % 60),
+        _ => format!("{}h{:02}m", ms / 3_600_000, ms / 60_000 % 60),
+    }
+}
+
 fn gc(max_age_days: Option<u64>, dry_run: bool) -> Result<()> {
     let repo = Repo::discover(&std::env::current_dir()?)?;
     for root in pool_roots()? {
@@ -1590,7 +1802,9 @@ fn gc(max_age_days: Option<u64>, dry_run: bool) -> Result<()> {
         for (id, dir) in &removed {
             println!("{} slot {id} ({})", if dry_run { "would remove" } else { "removing" }, dir.display());
             if !dry_run {
+                let size = dir_size(dir);
                 fs::remove_dir_all(dir)?;
+                record(dir, Event::Evict { bytes: size });
             }
         }
         if let (Some(d), true) = (max_age_days, removed.is_empty()) {

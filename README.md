@@ -133,6 +133,27 @@ linker a path that's identical in every checkout, e.g. the main checkout's copy:
 export CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER=/path/to/main/checkout/scripts/my-linker.sh
 ```
 
+## Metrics
+
+Every pool keeps an append-only log, `<pool-directory>/<repo>-<hash>/events.jsonl`, with one
+JSON line per attach, slot preparation (backdating), seed, build, snapshot and evicted slot,
+including how long it took. `cargo pool stats` sums it up:
+
+```
+cargo-pool-ac7e5f46c861e3b5 (/home/you/cargo-pool/.git): 4 slots, 2 in use, all time
+  attached   42 worktrees: 35 to a warm slot, 7 to a new one; 3.1s
+  seeded     6 of 7 new slots, 45.2G copied; 3m12s
+  prepared   41 slots: 98112 of 99840 files backdated, 12 units reset; 8.4s
+  setup      3m24s in total (attach + seed + prepare)
+  built      120 cargo commands, 3412 units compiled; 1h02m
+  snapshots  118 in the background; 1m03s
+  evicted    5 slots, 23.1G freed
+```
+
+Builds are recorded by the rustc wrapper: a build runs from its first compile into the slot
+until cargo releases the build lock, and counts the compiler calls in between. Cargo commands
+with nothing to compile don't show up, and without the wrapper no builds are recorded.
+
 ## Commands
 
 | command | |
@@ -140,6 +161,7 @@ export CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER=/path/to/main/checkout/scrip
 | `cargo pool attach [path] [--force] [--no-seed] [--allow-main]` | attach a worktree (idempotent) |
 | `cargo pool detach [path]` | release the slot and remove the symlink |
 | `cargo pool status [--size]` | show slots for this repo (all pools outside a repo) |
+| `cargo pool stats [--days D]` | show recorded metrics for this repo (all pools outside a repo) |
 | `cargo pool gc [--max-age-days D] [--dry-run]` | free disk space if over the limit; optionally delete free slots older than D days |
 | `cargo pool install [--no-wrapper]` / `uninstall` | set up / remove the hook and the rustc wrapper |
 | `cargo pool install-hook [path] [--repo]` / `uninstall-hook [path]` | only the hook (global if supported, else per repo) |

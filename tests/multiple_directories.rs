@@ -240,3 +240,43 @@ fn default_pool_still_uses_xdg_cache_home() {
     success(f.command(env!("CARGO_BIN_EXE_cargo-pool"), &a).args(["attach", "--no-seed"]).output().unwrap());
     assert!(fs::read_link(a.join("target")).unwrap().starts_with(f.dir.join("cache/cargo-pool")));
 }
+
+#[test]
+fn records_metrics() {
+    let f = Fixture::new();
+    let roots = &f.roots[..1];
+    let a = f.worktree("a");
+    let b = f.worktree("b");
+    f.pool(&a, roots, &["attach", "--no-seed"]);
+    fs::write(a.join("target/cached-artifact"), "warm").unwrap();
+    f.pool(&b, roots, &["attach"]);
+    f.pool(&b, roots, &["/bin/true", "-vV"]);
+    let target = fs::read_link(b.join("target")).unwrap();
+    let slot = target.parent().unwrap();
+    let out = target.join("debug/deps");
+    fs::create_dir_all(&out).unwrap();
+    {
+        // Keep the wrapper from spawning the background waiter; run it ourselves below.
+        let lock = fs::File::create(slot.join("snapshot.lock")).unwrap();
+        assert_eq!(unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX) }, 0);
+        for _ in 0..2 {
+            f.pool(&b, roots, &["/bin/true", "--out-dir", out.to_str().unwrap()]);
+        }
+    }
+    f.pool(&b, roots, &["snapshot-after-build", slot.to_str().unwrap()]);
+    f.pool(&a, roots, &["detach"]);
+    let c = f.worktree("c");
+    f.pool(&c, roots, &["attach"]);
+    let stats = f.pool(&c, roots, &["stats"]);
+    for expected in [
+        "2 slots, 2 in use",
+        "attached   3 worktrees: 1 to a warm slot, 2 to a new one",
+        "seeded     1 of 1 new slots",
+        "prepared   3 slots",
+        "built      1 cargo commands, 2 units compiled",
+        "snapshots  1 in the background",
+    ] {
+        assert!(stats.contains(expected), "missing {expected:?} in:\n{stats}");
+    }
+    assert!(f.pool(&c, roots, &["stats", "--days", "1"]).contains("attached   3 worktrees"));
+}
