@@ -152,7 +152,7 @@ fn run(cli: Cli) -> Result<()> {
         }
         Cmd::Uninstall => {
             uninstall_hook_auto(None)?;
-            if fs::read_to_string(cargo_config()?).is_ok_and(|s| s.lines().any(is_our_wrapper_line)) {
+            if wrapper_installed() {
                 uninstall_wrapper()?;
             }
             for root in pool_roots()? {
@@ -286,10 +286,6 @@ fn setting<T: std::str::FromStr>(git_dir: &Path, env: &str, git_key: &str, defau
         .or_else(|| git(git_dir, &["config", "--get", git_key]).ok())
         .and_then(|v| v.parse().ok())
         .unwrap_or(default)
-}
-
-fn idle_hours(git_dir: &Path) -> u64 {
-    setting(git_dir, "CARGO_POOL_IDLE_HOURS", "cargo-pool.idleHours", 48)
 }
 
 fn pool_roots() -> Result<Vec<PathBuf>> {
@@ -616,8 +612,8 @@ fn human(bytes: u64) -> String {
 /// Delete pooled target dirs on `root`'s filesystem, across configured directories, until disk usage
 /// (plus `extra` bytes about to be written) is below `max_percent`.
 ///
-/// Free slots go first, then slots of worktrees idle for longer than their repo's
-/// `idleHours`, least recently used first. Slots in `protect`, slots with a cargo
+/// Least recently used slots go first, held or not. A deleted held slot's worktree is
+/// re-attached on its next build. Slots in `protect`, slots being seeded or with a cargo
 /// build running and pools locked by another cargo-pool process are never touched.
 /// Must be called without holding any pool lock. Returns whether the goal was met.
 fn free_disk(root: &Path, max_percent: f64, extra: u64, protect: &[&Path]) -> Result<bool> {
@@ -626,7 +622,7 @@ fn free_disk(root: &Path, max_percent: f64, extra: u64, protect: &[&Path]) -> Re
         return Ok(true);
     }
 
-    // (idle-held?, last used, pool, slot id)
+    // (last used, pool, slot id)
     let mut candidates = vec![];
     let device = fs::metadata(root)?.dev();
     for directory in pool_roots()? {
@@ -634,41 +630,37 @@ fn free_disk(root: &Path, max_percent: f64, extra: u64, protect: &[&Path]) -> Re
             continue;
         }
         for pool in fs::read_dir(directory)?.flatten().map(|e| e.path()) {
-            let git_dir = PathBuf::from(fs::read_to_string(pool.join("repo")).unwrap_or_default());
-            let cutoff = now().saturating_sub(idle_hours(&git_dir) * 3600);
             for s in load_slots(&pool.join("slots"))? {
                 if protect.contains(&s.dir.as_path()) {
                     continue;
                 }
                 let used = s.meta.last_used.max(last_activity(&s.target()));
                 match (s.state(), &s.meta.lease) {
-                    (State::Free | State::Stale, _) => candidates.push((false, used, pool.clone(), s.id)),
-                    (State::Held, Some(l)) if !l.pending && used.max(l.acquired_at) < cutoff => {
-                        candidates.push((true, used.max(l.acquired_at), pool.clone(), s.id))
-                    }
-                    _ => {}
+                    (State::Held, Some(l)) if l.pending => {}
+                    (State::Held, Some(l)) => candidates.push((used.max(l.acquired_at), pool.clone(), s.id)),
+                    _ => candidates.push((used, pool.clone(), s.id)),
                 }
             }
         }
     }
     candidates.sort();
 
-    for (idle_held, _, pool, id) in candidates {
+    for (_, pool, id) in candidates {
         let Some(_pool_lock) = FileLock::acquire(&pool.join(".lock"), false)? else { continue };
         // Re-check under the lock, things may have changed since the scan.
         let Some(s) = load_slots(&pool.join("slots"))?.into_iter().find(|s| s.id == id) else { continue };
-        let state = s.state();
-        if state == State::Held && !idle_held {
-            continue;
-        }
+        let Some(_seed_lock) = FileLock::acquire(&s.dir.join("seed.lock"), false)? else { continue };
         let Some(_build_locks) = lock_target(&s.target()) else { continue };
         let mut from = String::new();
-        if let (State::Held, Some(l)) = (state, &s.meta.lease) {
+        if let (State::Held, Some(l)) = (s.state(), &s.meta.lease) {
             let link = l.worktree.join("target");
             if fs::read_link(&link).is_ok_and(|t| t == s.target()) {
                 fs::remove_file(&link)?;
+                if let Some(marker) = attach_marker(&l.worktree) {
+                    fs::write(marker, "")?;
+                }
             }
-            from = format!(", taken from idle worktree {}", l.worktree.display());
+            from = format!(", taken from worktree {}", l.worktree.display());
         }
         let size = dir_size(&s.dir);
         fs::remove_dir_all(&s.dir).with_context(|| format!("removing {}", s.dir.display()))?;
@@ -701,10 +693,13 @@ fn is_rustc_wrapper(args: &[OsString]) -> bool {
 /// Check disk usage if this compile writes into a pooled target dir, then exec the
 /// compiler (through `CARGO_POOL_RUSTC_WRAPPER`, e.g. sccache, if set).
 fn rustc_wrapper(args: Vec<OsString>) -> ! {
-    if args[2..].iter().any(|a| a == "-vV")
-        && let Err(e) = seed_on_first_use()
-    {
-        eprintln!("cargo-pool: warning: seeding the slot failed, building from scratch: {e:#}");
+    if args[2..].iter().any(|a| a == "-vV") {
+        if let Err(e) = attach_on_first_use() {
+            eprintln!("cargo-pool: warning: attaching to a pooled target dir failed: {e:#}");
+        }
+        if let Err(e) = seed_on_first_use() {
+            eprintln!("cargo-pool: warning: seeding the slot failed, building from scratch: {e:#}");
+        }
     }
     if let Err(e) = check_disk_during_build(&args[2..]) {
         eprintln!("cargo-pool: warning: disk check failed: {e:#}");
@@ -727,13 +722,15 @@ fn check_disk_during_build(rustc_args: &[OsString]) -> Result<()> {
     let Ok(rel) = out_dir.strip_prefix(&root) else { return Ok(()) };
     let mut parts = rel.components().map(|c| c.as_os_str());
     let Some(pool) = parts.next() else { return Ok(()) };
+    let mut slot_dir = None;
     if let (Some(slots), Some(id)) = (parts.next(), parts.next())
         && slots == "slots"
     {
-        let slot_dir = root.join(pool).join(slots).join(id);
-        if let Err(e) = note_pooled_compile(&slot_dir) {
+        let dir = root.join(pool).join(slots).join(id);
+        if let Err(e) = note_pooled_compile(&dir) {
             eprintln!("cargo-pool: warning: can't track build for mtime snapshots: {e:#}");
         }
+        slot_dir = Some(dir);
     }
     let git_dir = PathBuf::from(fs::read_to_string(root.join(pool).join("repo")).unwrap_or_default());
     let max_disk = setting(&git_dir, "CARGO_POOL_MAX_DISK_PERCENT", "cargo-pool.maxDiskPercent", 90.0);
@@ -755,7 +752,7 @@ fn check_disk_during_build(rustc_args: &[OsString]) -> Result<()> {
     if recent() {
         return Ok(());
     }
-    let ok = free_disk(&root, max_disk, 0, &[]);
+    let ok = free_disk(&root, max_disk, 0, slot_dir.as_deref().as_slice());
     fs::write(&marker, now().to_string())?;
     if !ok? {
         eprintln!("cargo-pool: warning: disk is still above {max_disk}% after cleaning up all pools");
@@ -1182,6 +1179,25 @@ fn attach(path: &Path, opts: AttachOpts) -> Result<()> {
         Ok(_) => bail!("{} exists and is not a directory", link.display()),
     }
 
+    // Worktrees often never build: from the hook, only take a slot on the first cargo
+    // command (see `attach_on_first_use`), which needs the rustc wrapper.
+    if opts.from_hook
+        && wrapper_installed()
+        && let Some(marker) = attach_marker(&repo.worktree)
+    {
+        fs::write(marker, "")?;
+        exclude_target(&repo)?;
+        warn_path_dependent_config(&repo);
+        eprintln!("cargo-pool: {} gets a pooled target dir on the first cargo command", link.display());
+        return Ok(());
+    }
+    lease_slot(&repo, opts.seed)
+}
+
+/// Lease the best free slot (or a new one) to the worktree and link its `target` to it.
+fn lease_slot(repo: &Repo, seed: bool) -> Result<()> {
+    let link = repo.worktree.join("target");
+    let slots_dir = repo.slots_dir();
     let max_disk = repo.max_disk_percent();
     if !free_disk(repo.pool.parent().unwrap(), max_disk, 0, &[])? {
         eprintln!("cargo-pool: warning: disk is still above {max_disk}% after cleaning up all pools");
@@ -1219,13 +1235,13 @@ fn attach(path: &Path, opts: AttachOpts) -> Result<()> {
             fs::create_dir_all(&dir)?;
             // Don't copy anything yet: many worktrees never build. The slot is seeded by the
             // rustc wrapper on the first cargo command (see `seed_on_first_use`).
-            let meta = SlotMeta { lease: Some(lease(false)), seed_pending: opts.seed, ..Default::default() };
+            let meta = SlotMeta { lease: Some(lease(false)), seed_pending: seed, ..Default::default() };
             let slot = Slot { id, dir, meta };
             fs::create_dir_all(slot.target())?;
             slot.save()?;
             drop(lock);
-            if opts.seed {
-                println!("cargo-pool: new slot {id}, filled from the closest warm target dir on the first cargo command");
+            if seed {
+                eprintln!("cargo-pool: new slot {id}, filled from the closest warm target dir on the first cargo command");
             }
             slots.push(slot);
             slots.len() - 1
@@ -1234,13 +1250,49 @@ fn attach(path: &Path, opts: AttachOpts) -> Result<()> {
 
     let slot = &slots[slot_idx];
     symlink(slot.target(), &link).with_context(|| format!("creating {}", link.display()))?;
-    exclude_target(&repo)?;
-    warn_path_dependent_config(&repo);
+    exclude_target(repo)?;
+    warn_path_dependent_config(repo);
     if !slot.meta.seed_pending {
-        prepare_worktree(&repo, &slot.dir)?;
+        prepare_worktree(repo, &slot.dir)?;
     }
-    println!("cargo-pool: {} -> slot {}", link.display(), slot.id);
+    eprintln!("cargo-pool: {} -> slot {}", link.display(), slot.id);
     Ok(())
+}
+
+/// Marks a worktree that should lease a slot on its next cargo command. Lives in the
+/// worktree's own git dir, so it disappears with the worktree.
+fn attach_marker(worktree: &Path) -> Option<PathBuf> {
+    let dot_git = worktree.join(".git");
+    let git_dir = match fs::read_to_string(&dot_git) {
+        Ok(s) => worktree.join(s.strip_prefix("gitdir:")?.trim()),
+        Err(_) if dot_git.is_dir() => dot_git,
+        Err(_) => return None,
+    };
+    Some(git_dir.join("cargo-pool-attach"))
+}
+
+/// Lease a slot for a worktree whose attach was deferred, when cargo first probes the
+/// compiler (`rustc -vV`). Without a target dir cargo has no cached probe, and it probes
+/// before touching the target dir, so the link is in place before cargo needs it.
+fn attach_on_first_use() -> Result<()> {
+    let cwd = std::env::current_dir()?;
+    let Some(worktree) = cwd.ancestors().find(|a| a.join(".git").exists()) else { return Ok(()) };
+    let Some(marker) = attach_marker(worktree).filter(|m| m.exists()) else { return Ok(()) };
+    // Parallel cargo commands wait for one attach.
+    let _lock = FileLock::acquire(&marker, true)?;
+    if !marker.exists() {
+        return Ok(());
+    }
+    let result = match fs::symlink_metadata(worktree.join("target")) {
+        Err(_) => Repo::discover(worktree).and_then(|repo| lease_slot(&repo, true)),
+        Ok(_) => Ok(()),
+    };
+    fs::remove_file(&marker)?;
+    result
+}
+
+fn wrapper_installed() -> bool {
+    cargo_config().is_ok_and(|c| fs::read_to_string(c).is_ok_and(|s| s.lines().any(is_our_wrapper_line)))
 }
 
 /// Make a warm slot's build state fit the worktree it was just given to.
@@ -1369,7 +1421,7 @@ fn report_pick(s: &Slot, d: u64) {
         (Some(h), u64::MAX) => format!("{} (unrelated)", short(h)),
         (Some(h), d) => format!("{} ({d} commits away)", short(h)),
     };
-    println!("cargo-pool: reusing slot {} last built at {built}", s.id);
+    eprintln!("cargo-pool: reusing slot {} last built at {built}", s.id);
 }
 
 /// Candidate target dirs to copy into a new slot: every slot plus the main checkout's.
@@ -1471,6 +1523,13 @@ fn exclude_target(repo: &Repo) -> Result<()> {
 fn detach(path: &Path) -> Result<()> {
     let repo = Repo::discover(path)?;
     let link = repo.worktree.join("target");
+    if let Some(marker) = attach_marker(&repo.worktree).filter(|m| m.exists()) {
+        fs::remove_file(marker)?;
+        if fs::symlink_metadata(&link).is_err() {
+            println!("cargo-pool: {} won't be attached on its first build anymore", repo.worktree.display());
+            return Ok(());
+        }
+    }
     let dest = fs::read_link(&link).map_err(|_| anyhow!("{} is not attached to a pool", link.display()))?;
     let _lock = repo.lock()?;
     let mut slots = load_slots(&repo.slots_dir())?;

@@ -13,26 +13,27 @@ Share warm cargo `target/` directories between git worktrees, so a fresh worktre
 - `cargo-pool attach` replaces a worktree's `target` with a symlink to a slot. Each slot
   is leased to one worktree at a time, so parallel agents never block on each other's
   cargo build lock.
+- Worktrees created through the hook take a slot only on their first cargo command, so
+  worktrees that never build hold none. Cargo asks the compiler for its version
+  (`rustc -vV`, through the rustc wrapper) before it touches the target dir, and the slot is
+  leased and linked then. Without the rustc wrapper installed, the hook attaches right away.
 - A free slot is picked across all configured pool directories by the commit it was
   last built at: the closest to the new worktree's `HEAD` wins. Directories at or above
   `maxDiskPercent` are excluded from reuse. New slots use the directory with the most
   available bytes. Existing attachments stay in their current directory.
 - If no slot is free, a new, empty one is created. It's **seeded** on the worktree's first
   cargo command, by copying the closest existing target dir (another slot or the main
-  checkout's `target/`), so worktrees that never build cost no disk. Cargo asks the compiler
-  for its version (`rustc -vV`, through the rustc wrapper) before it touches the target dir,
-  and the copy happens then; that first command waits for it. The copy holds the source's
+  checkout's `target/`); that first command waits for the copy. The copy holds the source's
   build lock, so it never copies a half-written build. Without the rustc wrapper installed,
   new slots stay empty. There is no limit on the
   number of slots: disk usage is the only limit.
 - **Disk limit**: if the disk holding the pool is above `maxDiskPercent` (default 90%),
   pooled target dirs on that filesystem are deleted, across all repos' pools and configured
   directories, until usage is back under the limit. This happens on every attach, on every pooled build (with the rustc wrapper
-  installed, see below) and on `gc`. Free slots go first, then slots of worktrees that
-  haven't built anything for `idleHours`, least recently used first. An idle worktree
-  whose slot is deleted loses its `target` link, so it starts over in its own directory
-  if it ever builds again. Slots with a build running are never deleted, and neither is
-  the main checkout's `target/`. A new slot is only seeded if the copy fits under the
+  installed, see below) and on `gc`. The least recently used slots go first, whether or
+  not a worktree holds them. A worktree whose slot is deleted loses its `target` link and
+  gets a new slot on its next cargo command. Slots with a build running or being seeded
+  are never deleted, and neither is the main checkout's `target/`. A new slot is only seeded if the copy fits under the
   limit; otherwise it starts empty.
 - Leases end on their own when the worktree is deleted (`git worktree remove`),
   or explicitly with `cargo-pool detach`.
@@ -138,7 +139,7 @@ export CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER=/path/to/main/checkout/scrip
 | command | |
 |---|---|
 | `cargo pool attach [path] [--force] [--no-seed] [--allow-main]` | attach a worktree (idempotent) |
-| `cargo pool detach [path]` | release the slot and remove the symlink |
+| `cargo pool detach [path]` | release the slot and remove the symlink (or cancel a pending attach) |
 | `cargo pool status [--size]` | show slots for this repo (all pools outside a repo) |
 | `cargo pool gc [--max-age-days D] [--dry-run]` | free disk space if over the limit; optionally delete free slots older than D days |
 | `cargo pool install [--no-wrapper]` / `uninstall` | set up / remove the hook and the rustc wrapper |
@@ -153,7 +154,6 @@ Each setting comes from an environment variable or git config, with the env var 
 |---|---|---|
 | `CARGO_POOL_DIRS` | global `cargo-pool.directory` entries | unset |
 | `CARGO_POOL_DIR` | – | `$XDG_CACHE_HOME/cargo-pool` or `~/.cache/cargo-pool` |
-| `CARGO_POOL_IDLE_HOURS` | `cargo-pool.idleHours` | 48 |
 | `CARGO_POOL_MAX_DISK_PERCENT` | `cargo-pool.maxDiskPercent` | 90 |
 | `CARGO_POOL_BACKDATE` | `cargo-pool.backdate` | true |
 | `CARGO_POOL_RUSTC_WRAPPER` | – | none (e.g. `sccache`) |
