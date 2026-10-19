@@ -31,6 +31,7 @@ impl Fixture {
         cmd.current_dir(cwd)
             .env("HOME", &self.dir)
             .env("XDG_CACHE_HOME", self.dir.join("cache"))
+            .env("CARGO_HOME", self.dir.join(".cargo"))
             .env("GIT_CONFIG_GLOBAL", self.dir.join(".gitconfig"))
             .env("GIT_CONFIG_NOSYSTEM", "1")
             .env("GIT_CONFIG_COUNT", "0")
@@ -279,4 +280,40 @@ fn records_metrics() {
         assert!(stats.contains(expected), "missing {expected:?} in:\n{stats}");
     }
     assert!(f.pool(&c, roots, &["stats", "--days", "1"]).contains("attached   3 worktrees"));
+}
+
+#[test]
+fn hook_leases_on_the_first_cargo_command_and_eviction_rearms_it() {
+    let f = Fixture::new();
+    let roots = &f.roots[..1];
+    f.pool(&f.repo, roots, &["install-wrapper"]);
+    let a = f.worktree("a");
+    f.pool(&a, roots, &["attach", "--no-seed"]);
+    fs::write(a.join("target/cached-artifact"), "warm").unwrap();
+    let warm = fs::read_link(a.join("target")).unwrap();
+    f.pool(&a, roots, &["detach"]);
+
+    let b = f.worktree("b");
+    let head = f.git(&b, &["rev-parse", "HEAD"]);
+    f.pool(&b, roots, &["post-checkout", "0000000000000000000000000000000000000000", head.trim(), "1"]);
+    assert!(fs::symlink_metadata(b.join("target")).is_err(), "the hook must not lease a slot");
+    assert!(f.pool(&b, roots, &["status"]).contains("free"));
+
+    // Cargo parses the probe's stdout: attaching must not write to it.
+    assert_eq!(f.pool(&b, roots, &["/bin/true", "-vV"]), "");
+    assert_eq!(fs::read_link(b.join("target")).unwrap(), warm);
+    assert_eq!(fs::read_to_string(b.join("target/cached-artifact")).unwrap(), "warm");
+
+    success(
+        f.command(env!("CARGO_BIN_EXE_cargo-pool"), &b)
+            .env("CARGO_POOL_DIRS", std::env::join_paths(roots).unwrap())
+            .env("CARGO_POOL_MAX_DISK_PERCENT", "0")
+            .arg("gc")
+            .output()
+            .unwrap(),
+    );
+    assert!(!warm.exists(), "held slots are evicted under disk pressure too");
+    assert!(fs::symlink_metadata(b.join("target")).is_err());
+    f.pool(&b, roots, &["/bin/true", "-vV"]);
+    assert!(fs::read_link(b.join("target")).unwrap().exists(), "an evicted worktree re-attaches on its next build");
 }
