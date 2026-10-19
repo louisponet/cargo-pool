@@ -1264,6 +1264,9 @@ fn attach(path: &Path, opts: AttachOpts) -> Result<()> {
         && let Some(marker) = attach_marker(&repo.worktree)
     {
         fs::write(marker, "")?;
+        // An empty dir rather than nothing: other post-checkout hooks may fill a missing
+        // `target` (e.g. by copying the main checkout's).
+        fs::create_dir_all(&link)?;
         exclude_target(&repo)?;
         warn_path_dependent_config(&repo);
         eprintln!("cargo-pool: {} gets a pooled target dir on the first cargo command", link.display());
@@ -1363,10 +1366,10 @@ fn attach_on_first_use() -> Result<()> {
     if !marker.exists() {
         return Ok(());
     }
-    let result = match fs::symlink_metadata(worktree.join("target")) {
-        Err(_) => Repo::discover(worktree).and_then(|repo| lease_slot(&repo, true)),
-        Ok(_) => Ok(()),
-    };
+    let link = worktree.join("target");
+    // Only fails if cargo already wrote into the placeholder dir.
+    let unclaimed = fs::symlink_metadata(&link).map_or(true, |m| m.is_dir() && fs::remove_dir(&link).is_ok());
+    let result = if unclaimed { Repo::discover(worktree).and_then(|repo| lease_slot(&repo, true)) } else { Ok(()) };
     fs::remove_file(&marker)?;
     result
 }
@@ -1614,7 +1617,8 @@ fn detach(path: &Path) -> Result<()> {
     let link = repo.worktree.join("target");
     if let Some(marker) = attach_marker(&repo.worktree).filter(|m| m.exists()) {
         fs::remove_file(marker)?;
-        if fs::symlink_metadata(&link).is_err() {
+        if !fs::symlink_metadata(&link).is_ok_and(|m| m.is_symlink()) {
+            let _ = fs::remove_dir(&link);
             println!("cargo-pool: {} won't be attached on its first build anymore", repo.worktree.display());
             return Ok(());
         }

@@ -296,7 +296,8 @@ fn hook_leases_on_the_first_cargo_command_and_eviction_rearms_it() {
     let b = f.worktree("b");
     let head = f.git(&b, &["rev-parse", "HEAD"]);
     f.pool(&b, roots, &["post-checkout", "0000000000000000000000000000000000000000", head.trim(), "1"]);
-    assert!(fs::symlink_metadata(b.join("target")).is_err(), "the hook must not lease a slot");
+    let placeholder = fs::symlink_metadata(b.join("target")).unwrap();
+    assert!(placeholder.is_dir() && fs::read_dir(b.join("target")).unwrap().next().is_none(), "the hook must not lease a slot");
     assert!(f.pool(&b, roots, &["status"]).contains("free"));
 
     // Cargo parses the probe's stdout: attaching must not write to it.
