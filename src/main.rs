@@ -7,7 +7,7 @@
 //! same cargo build lock. Leases are released explicitly with `detach`, or
 //! implicitly when the worktree disappears (e.g. `git worktree remove`).
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::ffi::{CString, OsString};
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
@@ -584,25 +584,29 @@ fn reclaim_stale(slots: &mut [Slot]) -> Result<()> {
 // disk pressure
 
 /// Disk usage (in percent, as `df` reports it) of the filesystem holding `path`,
-/// pretending `extra` more bytes had already been written.
-fn disk_percent(path: &Path, extra: u64) -> Result<f64> {
+/// pretending `extra` more bytes had already been written (or freed, if negative).
+fn disk_percent(path: &Path, extra: i64) -> Result<f64> {
     let c = CString::new(path.as_os_str().as_bytes())?;
     let mut st: libc::statvfs = unsafe { std::mem::zeroed() };
     if unsafe { libc::statvfs(c.as_ptr(), &mut st) } != 0 {
         return Err(std::io::Error::last_os_error()).with_context(|| format!("statvfs {}", path.display()));
     }
-    let bs = st.f_frsize as u64;
-    let used = (st.f_blocks - st.f_bfree) as u64 * bs + extra;
-    let avail = (st.f_bavail as u64 * bs).saturating_sub(extra);
+    let bs = st.f_frsize as i64;
+    let used = (st.f_blocks - st.f_bfree) as i64 * bs + extra;
+    let avail = st.f_bavail as i64 * bs - extra;
     Ok(100.0 * used as f64 / (used + avail).max(1) as f64)
 }
 
-/// Bytes allocated on disk by everything under `p` (symlinks not followed).
-fn dir_size(p: &Path) -> u64 {
+/// Bytes allocated on disk by everything under `roots` (symlinks not followed, hard links once).
+fn dir_size(roots: impl IntoIterator<Item = impl AsRef<Path>>) -> u64 {
     let mut total = 0;
-    let mut stack = vec![p.to_path_buf()];
+    let mut linked = HashSet::new();
+    let mut stack: Vec<PathBuf> = roots.into_iter().map(|r| r.as_ref().to_path_buf()).collect();
     while let Some(p) = stack.pop() {
         let Ok(m) = fs::symlink_metadata(&p) else { continue };
+        if !m.is_dir() && m.nlink() > 1 && !linked.insert((m.dev(), m.ino())) {
+            continue;
+        }
         total += m.blocks() * 512;
         if m.is_dir() {
             stack.extend(fs::read_dir(&p).into_iter().flatten().flatten().map(|e| e.path()));
@@ -623,13 +627,17 @@ fn human(bytes: u64) -> String {
 /// re-attached on its next build. Slots in `protect`, slots being seeded or with a cargo
 /// build running and pools locked by another cargo-pool process are never touched.
 /// Must be called without holding any pool lock. Returns whether the goal was met.
+///
+/// With `extra` bytes to make room for, nothing is deleted unless they fit once everything
+/// eligible is gone: a copy that can't fit anyway isn't worth a single warm slot.
 fn free_disk(root: &Path, max_percent: f64, extra: u64, protect: &[&Path]) -> Result<bool> {
     fs::create_dir_all(root)?;
-    if disk_percent(root, extra)? < max_percent {
+    let fits = |freed: u64| disk_percent(root, extra as i64 - freed as i64).map(|p| p < max_percent);
+    if fits(0)? {
         return Ok(true);
     }
 
-    // (last used, pool, slot id)
+    // (last used, pool, slot)
     let mut candidates = vec![];
     let device = fs::metadata(root)?.dev();
     for directory in pool_roots()? {
@@ -644,18 +652,34 @@ fn free_disk(root: &Path, max_percent: f64, extra: u64, protect: &[&Path]) -> Re
                 let used = s.meta.last_used.max(last_activity(&s.target()));
                 match (s.state(), &s.meta.lease) {
                     (State::Held, Some(l)) if l.pending => {}
-                    (State::Held, Some(l)) => candidates.push((used.max(l.acquired_at), pool.clone(), s.id)),
-                    _ => candidates.push((used, pool.clone(), s.id)),
+                    (State::Held, Some(l)) => candidates.push((used.max(l.acquired_at), pool.clone(), s)),
+                    _ => candidates.push((used, pool.clone(), s)),
                 }
             }
         }
     }
-    candidates.sort();
+    candidates.sort_by_key(|(used, ..)| *used);
+    if extra > 0 {
+        // Only count what the loop below could delete: probe its locks, and let them go again
+        // before the walk, which would otherwise stall a build starting in that slot.
+        let (mut freed, mut rest) = (0, candidates.iter());
+        while !fits(freed)? {
+            let Some((_, pool, s)) = rest.next() else { return Ok(false) };
+            let pool_lock = FileLock::acquire(&pool.join(".lock"), false)?;
+            let evictable = pool_lock.is_some()
+                && FileLock::acquire(&s.dir.join("seed.lock"), false).ok().flatten().is_some()
+                && lock_target(&s.target()).is_some();
+            drop(pool_lock);
+            if evictable {
+                freed += dir_size([&s.dir]);
+            }
+        }
+    }
 
-    for (_, pool, id) in candidates {
+    for (_, pool, candidate) in candidates {
         let Some(_pool_lock) = FileLock::acquire(&pool.join(".lock"), false)? else { continue };
         // Re-check under the lock, things may have changed since the scan.
-        let Some(s) = load_slots(&pool.join("slots"))?.into_iter().find(|s| s.id == id) else { continue };
+        let Some(s) = load_slots(&pool.join("slots"))?.into_iter().find(|s| s.id == candidate.id) else { continue };
         let Some(_seed_lock) = FileLock::acquire(&s.dir.join("seed.lock"), false)? else { continue };
         let Some(_build_locks) = lock_target(&s.target()) else { continue };
         let mut from = String::new();
@@ -669,15 +693,16 @@ fn free_disk(root: &Path, max_percent: f64, extra: u64, protect: &[&Path]) -> Re
             }
             from = format!(", taken from worktree {}", l.worktree.display());
         }
-        let size = dir_size(&s.dir);
+        let size = dir_size([&s.dir]);
         fs::remove_dir_all(&s.dir).with_context(|| format!("removing {}", s.dir.display()))?;
         record(&s.dir, Event::Evict { bytes: size });
         eprintln!(
-            "cargo-pool: disk above {max_percent}%: deleted slot {id} of {} ({}{from})",
+            "cargo-pool: disk above {max_percent}%: deleted slot {} of {} ({}{from})",
+            s.id,
             pool.file_name().unwrap_or_default().to_string_lossy(),
             human(size)
         );
-        if disk_percent(root, extra)? < max_percent {
+        if fits(0)? {
             return Ok(true);
         }
     }
@@ -1535,6 +1560,38 @@ fn seed_sources(repo: &Repo, slots: &[Slot]) -> Vec<(PathBuf, Option<String>)> {
     out
 }
 
+/// What a seed copies out of a target dir, relative to it: everything but the `incremental/`
+/// caches of its profile dirs (`target/<profile>` and `target/<triple>/<profile>`). Those are
+/// often most of the bytes and only speed up the first rebuild of a crate edited after seeding.
+fn seed_parts(target: &Path) -> Vec<PathBuf> {
+    fn walk(dir: &Path, rel: &Path, out: &mut Vec<PathBuf>) {
+        let profile = dir.join(".fingerprint").is_dir();
+        for entry in fs::read_dir(dir).into_iter().flatten().flatten() {
+            let (path, rel) = (entry.path(), rel.join(entry.file_name()));
+            let is_dir = entry.file_type().is_ok_and(|t| t.is_dir());
+            if profile && is_dir && entry.file_name() == "incremental" {
+                continue;
+            }
+            let holds_profile = || {
+                path.join(".fingerprint").is_dir()
+                    || fs::read_dir(&path)
+                        .into_iter()
+                        .flatten()
+                        .flatten()
+                        .any(|e| e.path().join(".fingerprint").is_dir())
+            };
+            if !profile && is_dir && holds_profile() {
+                walk(&path, &rel, out);
+            } else {
+                out.push(rel);
+            }
+        }
+    }
+    let mut out = vec![];
+    walk(target, Path::new(""), &mut out);
+    out
+}
+
 /// Copy the closest non-busy target dir into the slot. Returns the commit it was built for.
 fn seed(repo: &Repo, slot: &Slot, head: &str, sources: Vec<(PathBuf, Option<String>)>) -> Result<Option<String>> {
     let mut ranked: Vec<_> = sources
@@ -1545,9 +1602,16 @@ fn seed(repo: &Repo, slot: &Slot, head: &str, sources: Vec<(PathBuf, Option<Stri
     let begun = Instant::now();
 
     let max_disk = repo.max_disk_percent();
+    // What an interrupted seed left behind would count against the copy's room.
+    let tmp = slot.dir.join("target.seeding");
+    let _ = fs::remove_dir_all(&tmp);
     for (d, _, src, h) in ranked {
         // Make room for the copy first; never let seeding push the disk over the limit.
-        let size = dir_size(&src);
+        let parts = seed_parts(&src);
+        if parts.is_empty() {
+            continue; // evicted since it was listed
+        }
+        let size = dir_size(parts.iter().map(|p| src.join(p)));
         let protect: Vec<&Path> = [src.parent(), Some(slot.dir.as_path())].into_iter().flatten().collect();
         if !free_disk(repo.pool.parent().unwrap(), max_disk, size, &protect)? {
             eprintln!(
@@ -1557,18 +1621,29 @@ fn seed(repo: &Repo, slot: &Slot, head: &str, sources: Vec<(PathBuf, Option<Stri
             );
             continue;
         }
-        // Hold cargo's build locks so the source isn't modified mid-copy.
+        // Hold cargo's build locks so the source isn't modified mid-copy, and copy what's
+        // there now: a build may have run since it was sized.
         let Some(_locks) = lock_target(&src) else {
             eprintln!("cargo-pool: {} is busy building, trying next candidate", src.display());
             continue;
         };
+        let parts = seed_parts(&src);
+        if parts.is_empty() {
+            continue; // gone since it was sized
+        }
         let dist = if d == u64::MAX { "unrelated".into() } else { format!("{d} commits away") };
         eprintln!("cargo-pool: seeding slot {} from {} ({dist}), this can take a while...", slot.id, src.display());
-        let tmp = slot.dir.join("target.seeding");
-        let _ = fs::remove_dir_all(&tmp);
         let started = SystemTime::now();
-        let status = Command::new("cp").arg("-a").arg("--reflink=auto").arg(&src).arg(&tmp).status()?;
-        if !status.success() {
+        // One cp for all parts, so cargo's hard links (`<profile>/<bin>` to `deps/`) survive.
+        let copied = fs::create_dir(&tmp).is_ok()
+            && Command::new("cp")
+                .current_dir(&src)
+                .args(["-a", "--reflink=auto", "--parents", "--"])
+                .args(&parts)
+                .arg(&tmp)
+                .status()
+                .is_ok_and(|s| s.success());
+        if !copied {
             let _ = fs::remove_dir_all(&tmp);
             eprintln!("cargo-pool: copy failed, trying next candidate");
             continue;
@@ -1865,7 +1940,7 @@ fn gc(max_age_days: Option<u64>, dry_run: bool) -> Result<()> {
         for (id, dir) in &removed {
             println!("{} slot {id} ({})", if dry_run { "would remove" } else { "removing" }, dir.display());
             if !dry_run {
-                let size = dir_size(dir);
+                let size = dir_size([dir]);
                 fs::remove_dir_all(dir)?;
                 record(dir, Event::Evict { bytes: size });
             }
