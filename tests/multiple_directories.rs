@@ -134,10 +134,29 @@ fn seeds_from_another_directory_and_tracks_builds_there() {
     let b = f.worktree("b");
     f.pool(&a, &f.roots[..1], &["attach", "--no-seed"]);
     fs::write(a.join("target/cached-artifact"), "warm").unwrap();
+    let triple = "x86_64-unknown-linux-gnu/debug";
+    for dir in [
+        "debug/.fingerprint",
+        "debug/incremental/example-0123",
+        "debug/deps",
+        "wasm/debug/incremental",
+        &format!("{triple}/.fingerprint"),
+        &format!("{triple}/incremental"),
+    ] {
+        fs::create_dir_all(a.join("target").join(dir)).unwrap();
+    }
+    fs::write(a.join("target/debug/deps/example-0123"), "bin").unwrap();
+    fs::hard_link(a.join("target/debug/deps/example-0123"), a.join("target/debug/example")).unwrap();
     f.pool(&b, &f.roots[1..], &["attach"]);
     let target = fs::read_link(b.join("target")).unwrap();
     f.pool(&b, &f.roots, &["/bin/true", "-vV"]);
     assert_eq!(fs::read_to_string(target.join("cached-artifact")).unwrap(), "warm");
+    assert!(target.join("debug/.fingerprint").exists() && target.join(triple).join(".fingerprint").exists());
+    assert!(!target.join("debug/incremental").exists(), "incremental caches are not seeded");
+    assert!(!target.join(triple).join("incremental").exists(), "nor under a target triple");
+    assert!(target.join("wasm/debug/incremental").exists(), "a dir without fingerprints is copied whole");
+    let ino = |p: &str| fs::metadata(target.join(p)).unwrap().ino();
+    assert_eq!(ino("debug/example"), ino("debug/deps/example-0123"), "hard links survive the copy");
     let metadata: serde_json::Value =
         serde_json::from_slice(&fs::read(target.parent().unwrap().join("slot.json")).unwrap()).unwrap();
     assert_eq!(metadata["seed_pending"], false);

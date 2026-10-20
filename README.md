@@ -24,9 +24,10 @@ Share warm cargo `target/` directories between git worktrees, so a fresh worktre
 - If no slot is free, a new, empty one is created. It's **seeded** on the worktree's first
   cargo command, by copying the closest existing target dir (another slot or the main
   checkout's `target/`); that first command waits for the copy. The copy holds the source's
-  build lock, so it never copies a half-written build. Without the rustc wrapper installed,
-  new slots stay empty. There is no limit on the
-  number of slots: disk usage is the only limit.
+  build lock, so it never copies a half-written build. The `incremental/` caches are left
+  out: they're often most of the bytes, and only speed up the first rebuild of a crate
+  edited after seeding. Without the rustc wrapper installed, new slots stay empty. There is
+  no limit on the number of slots: disk usage is the only limit.
 - **Disk limit**: if the disk holding the pool is above `maxDiskPercent` (default 90%),
   pooled target dirs on that filesystem are deleted, across all repos' pools and configured
   directories, until usage is back under the limit. This happens on every attach, on every pooled build (with the rustc wrapper
@@ -34,7 +35,7 @@ Share warm cargo `target/` directories between git worktrees, so a fresh worktre
   not a worktree holds them. A worktree whose slot is deleted loses its `target` link and
   gets a new slot on its next cargo command. Slots with a build running or being seeded
   are never deleted, and neither is the main checkout's `target/`. A new slot is only seeded if the copy fits under the
-  limit; otherwise it starts empty.
+  limit; otherwise it starts empty, and no slot is deleted for a copy that wouldn't fit anyway.
 - Leases end on their own when the worktree is deleted (`git worktree remove`),
   or explicitly with `cargo-pool detach`.
 - `/target` is added to `.git/info/exclude`, because `target/` patterns in `.gitignore`
