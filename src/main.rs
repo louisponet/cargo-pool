@@ -26,7 +26,7 @@ use serde::{Deserialize, Serialize};
 const HOOK_BEGIN: &str = "# >>> cargo-pool >>>";
 const HOOK_END: &str = "# <<< cargo-pool <<<";
 const NULL_SHA: &str = "0000000000000000000000000000000000000000";
-/// A lease still being set up (slot seeding in progress) is honoured for this long.
+/// An unfinished lease whose worktree has disappeared is honoured for this long.
 const PENDING_TIMEOUT_SECS: u64 = 3 * 3600;
 
 #[derive(Parser)]
@@ -48,8 +48,8 @@ enum Cmd {
         /// Replace an existing non-empty `target` directory (its contents are deleted).
         #[arg(long)]
         force: bool,
-        /// Also pool the main worktree (by default only linked worktrees are pooled).
-        #[arg(long)]
+        /// Accepted for compatibility; the main worktree is pooled by default.
+        #[arg(long, hide = true)]
         allow_main: bool,
         /// Invoked from the git hook: never fail, only act on cargo workspaces.
         #[arg(long, hide = true)]
@@ -143,8 +143,8 @@ fn main() {
 
 fn run(cli: Cli) -> Result<()> {
     match cli.cmd {
-        Cmd::Attach { path, no_seed, force, allow_main, from_hook } => {
-            attach(&path_or_cwd(path)?, AttachOpts { seed: !no_seed, force, allow_main, from_hook })
+        Cmd::Attach { path, no_seed, force, allow_main: _, from_hook } => {
+            attach(&path_or_cwd(path)?, AttachOpts { seed: !no_seed, force, from_hook, wait_for_build: false })
         }
         Cmd::Detach { path } => detach(&path_or_cwd(path)?),
         Cmd::Status { size } => status(size),
@@ -177,7 +177,7 @@ fn run(cli: Cli) -> Result<()> {
             if prev != NULL_SHA {
                 return Ok(());
             }
-            let opts = AttachOpts { seed: true, force: false, allow_main: false, from_hook: true };
+            let opts = AttachOpts { seed: true, force: false, from_hook: true, wait_for_build: false };
             attach(&std::env::current_dir()?, opts)
         }
     }
@@ -262,10 +262,6 @@ impl Repo {
         Ok(Repo { worktree, common_dir, main_worktree, pool })
     }
 
-    fn is_main(&self) -> bool {
-        self.main_worktree.as_deref() == Some(&self.worktree)
-    }
-
     fn head(&self) -> Result<String> {
         git(&self.worktree, &["rev-parse", "HEAD"])
     }
@@ -342,6 +338,12 @@ fn select_pool(roots: &[PathBuf], key: &str, worktree: &Path, common_dir: &Path)
     for root in roots {
         let pool = fs::canonicalize(root)?.join(key);
         if attached.as_ref().is_some_and(|target| target.starts_with(pool.join("slots"))) {
+            return Ok(pool);
+        }
+        if load_slots(&pool.join("slots"))?
+            .iter()
+            .any(|s| s.meta.lease.as_ref().is_some_and(|l| l.pending && l.worktree == worktree))
+        {
             return Ok(pool);
         }
         capacity.push((available_bytes(root)?, pool.clone()));
@@ -441,10 +443,11 @@ fn cargo_locks(target: &Path) -> Vec<PathBuf> {
 }
 
 /// Try to take every cargo lock in `target` so no build runs while we copy it.
-fn lock_target(target: &Path) -> Option<Vec<FileLock>> {
+fn lock_target(target: &Path, blocking: bool) -> Option<Vec<FileLock>> {
     cargo_locks(target)
         .iter()
-        .map(|p| FileLock::acquire(p, false).ok().flatten())
+        .filter(|p| p.exists() || !fs::symlink_metadata(p).is_ok_and(|m| m.is_symlink()))
+        .map(|p| FileLock::acquire(p, blocking).ok().flatten())
         .collect()
 }
 
@@ -493,14 +496,23 @@ struct Lease {
     worktree: PathBuf,
     head: String,
     acquired_at: u64,
-    /// Slot is still being seeded; the symlink doesn't exist yet.
+    /// Attach has not finished; source cleanup may still be pending after linking.
     #[serde(default)]
     pending: bool,
+}
+
+#[derive(Serialize, Deserialize, Clone, Copy, PartialEq)]
+#[serde(rename_all = "snake_case")]
+enum Adoption {
+    Copying,
+    Ready { source: u64 },
 }
 
 #[derive(Serialize, Deserialize, Default)]
 struct SlotMeta {
     lease: Option<Lease>,
+    #[serde(default)]
+    adoption: Option<Adoption>,
     /// New slot that will be seeded on the first cargo command in its worktree.
     #[serde(default)]
     seed_pending: bool,
@@ -527,6 +539,18 @@ impl Slot {
         self.dir.join("target")
     }
 
+    fn saved_files(&self, worktree: &Path) -> PathBuf {
+        worktree.join("target.cargo-pool-files").join(format!("{:016x}", fnv1a(self.dir.as_os_str().as_encoded_bytes())))
+    }
+
+    fn discard_partial_copy(&self) -> Result<()> {
+        let tmp = self.dir.join("target.adopting");
+        if self.meta.adoption == Some(Adoption::Copying) && tmp.exists() {
+            fs::remove_dir_all(tmp)?;
+        }
+        Ok(())
+    }
+
     fn save(&self) -> Result<()> {
         let tmp = self.dir.join("slot.json.tmp");
         fs::write(&tmp, serde_json::to_vec_pretty(&self.meta)?)?;
@@ -536,7 +560,7 @@ impl Slot {
 
     fn state(&self) -> State {
         let Some(l) = &self.meta.lease else { return State::Free };
-        if l.pending && now().saturating_sub(l.acquired_at) < PENDING_TIMEOUT_SECS {
+        if l.pending && (l.worktree.join(".git").exists() || now().saturating_sub(l.acquired_at) < PENDING_TIMEOUT_SECS) {
             return State::Held;
         }
         if fs::read_link(l.worktree.join("target")).is_ok_and(|t| t == self.target()) {
@@ -547,11 +571,23 @@ impl Slot {
     }
 
     /// Turn a lease into a free slot, remembering what it was built for.
-    fn release(&mut self, head: Option<String>) {
+    fn release(&mut self, head: Option<String>) -> Result<()> {
+        self.discard_partial_copy()?;
+        if matches!(self.meta.adoption, Some(Adoption::Ready { .. })) {
+            merge_target(&self.dir.join("target.adopting"), &self.target(), Conflict::Source)?;
+        }
+        remove_saved_links(&self.target())?;
+        for lock in cargo_locks(&self.target()) {
+            if !lock.exists() && fs::symlink_metadata(&lock).is_ok_and(|m| m.is_symlink()) {
+                fs::remove_file(lock)?;
+            }
+        }
         if let Some(l) = self.meta.lease.take() {
+            self.meta.adoption = None;
             self.meta.last_head = head.or(Some(l.head));
             self.meta.last_used = now().max(last_activity(&self.target()));
         }
+        Ok(())
     }
 }
 
@@ -574,7 +610,8 @@ fn load_slots(slots_dir: &Path) -> Result<Vec<Slot>> {
 /// Free every lease whose worktree is gone or no longer links to its slot.
 fn reclaim_stale(slots: &mut [Slot]) -> Result<()> {
     for s in slots.iter_mut().filter(|s| s.state() == State::Stale) {
-        s.release(None);
+        let Some(_seed_lock) = FileLock::acquire(&s.dir.join("seed.lock"), false)? else { continue };
+        s.release(None)?;
         s.save()?;
     }
     Ok(())
@@ -598,11 +635,14 @@ fn disk_percent(path: &Path, extra: i64) -> Result<f64> {
 }
 
 /// Bytes allocated on disk by everything under `roots` (symlinks not followed, hard links once).
-fn dir_size(roots: impl IntoIterator<Item = impl AsRef<Path>>) -> u64 {
+fn dir_size(roots: impl IntoIterator<Item = impl AsRef<Path>>, excluded: &[PathBuf]) -> u64 {
     let mut total = 0;
     let mut linked = HashSet::new();
     let mut stack: Vec<PathBuf> = roots.into_iter().map(|r| r.as_ref().to_path_buf()).collect();
     while let Some(p) = stack.pop() {
+        if excluded.contains(&p) {
+            continue;
+        }
         let Ok(m) = fs::symlink_metadata(&p) else { continue };
         if !m.is_dir() && m.nlink() > 1 && !linked.insert((m.dev(), m.ino())) {
             continue;
@@ -649,6 +689,13 @@ fn free_disk(root: &Path, max_percent: f64, extra: u64, protect: &[&Path]) -> Re
                 if protect.contains(&s.dir.as_path()) {
                     continue;
                 }
+                if s.meta.adoption == Some(Adoption::Copying) && s.dir.join("target.adopting").exists()
+                    && let Some(_pool_lock) = FileLock::acquire(&pool.join(".lock"), false)?
+                    && let Some(_seed_lock) = FileLock::acquire(&s.dir.join("seed.lock"), false)?
+                    && let Some(current) = load_slots(&pool.join("slots"))?.into_iter().find(|slot| slot.id == s.id)
+                {
+                    current.discard_partial_copy()?;
+                }
                 let used = s.meta.last_used.max(last_activity(&s.target()));
                 match (s.state(), &s.meta.lease) {
                     (State::Held, Some(l)) if l.pending => {}
@@ -659,6 +706,9 @@ fn free_disk(root: &Path, max_percent: f64, extra: u64, protect: &[&Path]) -> Re
         }
     }
     candidates.sort_by_key(|(used, ..)| *used);
+    if fits(0)? {
+        return Ok(true);
+    }
     if extra > 0 {
         // Only count what the loop below could delete: probe its locks, and let them go again
         // before the walk, which would otherwise stall a build starting in that slot.
@@ -668,10 +718,10 @@ fn free_disk(root: &Path, max_percent: f64, extra: u64, protect: &[&Path]) -> Re
             let pool_lock = FileLock::acquire(&pool.join(".lock"), false)?;
             let evictable = pool_lock.is_some()
                 && FileLock::acquire(&s.dir.join("seed.lock"), false).ok().flatten().is_some()
-                && lock_target(&s.target()).is_some();
+                && lock_target(&s.target(), false).is_some();
             drop(pool_lock);
             if evictable {
-                freed += dir_size([&s.dir]);
+                freed += dir_size([&s.dir], &[]);
             }
         }
     }
@@ -680,20 +730,24 @@ fn free_disk(root: &Path, max_percent: f64, extra: u64, protect: &[&Path]) -> Re
         let Some(_pool_lock) = FileLock::acquire(&pool.join(".lock"), false)? else { continue };
         // Re-check under the lock, things may have changed since the scan.
         let Some(s) = load_slots(&pool.join("slots"))?.into_iter().find(|s| s.id == candidate.id) else { continue };
+        if s.state() == State::Held && s.meta.lease.as_ref().is_some_and(|l| l.pending) {
+            continue;
+        }
         let Some(_seed_lock) = FileLock::acquire(&s.dir.join("seed.lock"), false)? else { continue };
-        let Some(_build_locks) = lock_target(&s.target()) else { continue };
+        let Some(_build_locks) = lock_target(&s.target(), false) else { continue };
         let mut from = String::new();
         if let (State::Held, Some(l)) = (s.state(), &s.meta.lease) {
             let link = l.worktree.join("target");
             if fs::read_link(&link).is_ok_and(|t| t == s.target()) {
-                fs::remove_file(&link)?;
                 if let Some(marker) = attach_marker(&l.worktree) {
                     fs::write(marker, "")?;
                 }
+                fs::remove_file(&link)?;
+                fs::create_dir_all(&link)?;
             }
             from = format!(", taken from worktree {}", l.worktree.display());
         }
-        let size = dir_size([&s.dir]);
+        let size = dir_size([&s.dir], &[]);
         fs::remove_dir_all(&s.dir).with_context(|| format!("removing {}", s.dir.display()))?;
         record(&s.dir, Event::Evict { bytes: size });
         eprintln!(
@@ -728,7 +782,8 @@ fn is_rustc_wrapper(args: &[OsString]) -> bool {
 fn rustc_wrapper(args: Vec<OsString>) -> ! {
     if args[2..].iter().any(|a| a == "-vV") {
         if let Err(e) = attach_on_first_use() {
-            eprintln!("cargo-pool: warning: attaching to a pooled target dir failed: {e:#}");
+            eprintln!("cargo-pool: attaching to a pooled target dir failed: {e:#}");
+            std::process::exit(1);
         }
         if let Err(e) = seed_on_first_use() {
             eprintln!("cargo-pool: warning: seeding the slot failed, building from scratch: {e:#}");
@@ -1031,7 +1086,10 @@ fn backdate(wt: &Path, snap: &Snapshot) -> Result<(usize, usize)> {
             if hash_file(&p) != Some(hash) {
                 continue;
             }
-            File::open(&p)?.set_modified(UNIX_EPOCH + Duration::from_nanos(mtime))?;
+            if let Err(e) = File::open(&p).and_then(|f| f.set_modified(UNIX_EPOCH + Duration::from_nanos(mtime))) {
+                eprintln!("cargo-pool: warning: cannot backdate {}: {e}", p.display());
+                continue;
+            }
         }
         matched += 1;
     }
@@ -1039,8 +1097,11 @@ fn backdate(wt: &Path, snap: &Snapshot) -> Result<(usize, usize)> {
     // touch its parent's, so the order doesn't matter).
     for (rel, &(mtime, listing)) in &snap.dirs {
         let p = wt.join(rel);
-        if mtime_ns(&p) != mtime && dir_listing_hash(&p) == Some(listing) {
-            File::open(&p)?.set_modified(UNIX_EPOCH + Duration::from_nanos(mtime))?;
+        if mtime_ns(&p) != mtime
+            && dir_listing_hash(&p) == Some(listing)
+            && let Err(e) = File::open(&p).and_then(|f| f.set_modified(UNIX_EPOCH + Duration::from_nanos(mtime)))
+        {
+            eprintln!("cargo-pool: warning: cannot backdate {}: {e}", p.display());
         }
     }
     // Refresh git's cached stat info so `git status` doesn't rehash everything.
@@ -1055,12 +1116,16 @@ fn backdate(wt: &Path, snap: &Snapshot) -> Result<(usize, usize)> {
 fn invalidate_foreign_git_inputs(repo: &Repo, target: &Path) -> Result<usize> {
     let own_gitdir = git(&repo.worktree, &["rev-parse", "--path-format=absolute", "--git-dir"])?;
     let common = repo.common_dir.as_os_str().as_bytes();
+    let own_prefix = format!("{own_gitdir}/");
     let refers_elsewhere = |bytes: &[u8]| {
-        bytes
-            .windows(common.len())
-            .enumerate()
-            .filter(|(_, w)| *w == common)
-            .any(|(i, _)| !bytes[i..].starts_with(own_gitdir.as_bytes()))
+        bytes.windows(common.len()).enumerate().filter(|(_, w)| *w == common).any(|(i, _)| {
+            let input = &bytes[i..];
+            if own_gitdir.as_bytes() == common {
+                input[common.len()..].starts_with(b"/worktrees/")
+            } else {
+                !input.starts_with(own_prefix.as_bytes())
+            }
+        })
     };
     let mut fingerprint_dirs = vec![];
     let mut stack = vec![(target.to_path_buf(), 0)];
@@ -1226,26 +1291,23 @@ fn ms_since(t: Instant) -> u64 {
 struct AttachOpts {
     seed: bool,
     force: bool,
-    allow_main: bool,
     from_hook: bool,
+    wait_for_build: bool,
 }
 
 fn attach(path: &Path, opts: AttachOpts) -> Result<()> {
     let repo = Repo::discover(path)?;
+    let _attach_lock =
+        attach_marker(&repo.worktree).map(|m| FileLock::acquire(&m.with_extension("lock"), true)).transpose()?;
     if !repo.worktree.join("Cargo.toml").exists() {
         if !opts.from_hook {
             println!("{} is not a cargo workspace, nothing to do", repo.worktree.display());
         }
         return Ok(());
     }
-    if repo.is_main() && !opts.allow_main {
-        if !opts.from_hook {
-            println!("skipping main worktree (pass --allow-main to pool it too)");
-        }
-        return Ok(());
-    }
-
     let link = repo.worktree.join("target");
+    // A failed compiler probe leaves an empty directory here to prevent Cargo caching its failure.
+    let _ = fs::remove_dir(link.join(".rustc_info.json"));
     let slots_dir = repo.slots_dir();
     match fs::symlink_metadata(&link) {
         Err(_) => {}
@@ -1253,12 +1315,31 @@ fn attach(path: &Path, opts: AttachOpts) -> Result<()> {
             let dest = fs::read_link(&link)?;
             if dest.starts_with(&slots_dir) {
                 let _lock = repo.lock()?;
-                let held = load_slots(&repo.slots_dir())?.into_iter().any(|s| {
-                    s.target() == dest && s.meta.lease.as_ref().is_some_and(|l| l.worktree == repo.worktree)
-                });
-                if held {
+                let held = load_slots(&repo.slots_dir())?
+                    .into_iter()
+                    .find(|s| s.target() == dest && s.meta.lease.as_ref().is_some_and(|l| l.worktree == repo.worktree));
+                if let Some(mut slot) = held {
+                    if slot.meta.lease.as_ref().is_some_and(|l| l.pending) {
+                        drop(_lock);
+                        let _build_locks = lock_target(&slot.target(), opts.wait_for_build)
+                            .ok_or_else(|| anyhow!("{} is busy building", link.display()))?;
+                        let _lock = repo.lock()?;
+                        let old = slot.saved_files(&repo.worktree).with_extension("attaching");
+                        if old.exists() {
+                            fs::remove_dir_all(old)?;
+                        }
+                        if slot.meta.adoption.is_some() {
+                            save_snapshot(&slot.dir, &take_snapshot(&repo.worktree, None)?)?;
+                        }
+                        if !slot.meta.seed_pending {
+                            prepare_worktree(&repo, &slot.dir)?;
+                        }
+                        slot.meta.lease.as_mut().unwrap().pending = false;
+                        slot.meta.adoption = None;
+                        slot.save()?;
+                    }
                     if !opts.from_hook {
-                        println!("already attached: {} -> {}", link.display(), dest.display());
+                        eprintln!("already attached: {} -> {}", link.display(), dest.display());
                     }
                     return Ok(());
                 }
@@ -1271,12 +1352,15 @@ fn attach(path: &Path, opts: AttachOpts) -> Result<()> {
             }
         }
         Ok(m) if m.is_dir() => {
-            if fs::read_dir(&link)?.next().is_none() {
-                fs::remove_dir(&link)?;
-            } else if opts.force {
+            if opts.force {
+                let _pool = repo.lock()?;
+                if load_slots(&slots_dir)?.iter().any(|s| {
+                    s.meta.adoption.is_some()
+                        && s.meta.lease.as_ref().is_some_and(|l| l.pending && l.worktree == repo.worktree)
+                }) {
+                    bail!("unfinished adoption; rerun attach without --force before discarding its source");
+                }
                 fs::remove_dir_all(&link)?;
-            } else {
-                bail!("{} already exists and is not empty; use --force to discard it", link.display());
             }
         }
         Ok(_) => bail!("{} exists and is not a directory", link.display()),
@@ -1285,6 +1369,7 @@ fn attach(path: &Path, opts: AttachOpts) -> Result<()> {
     // Worktrees often never build: from the hook, only take a slot on the first cargo
     // command (see `attach_on_first_use`), which needs the rustc wrapper.
     if opts.from_hook
+        && !cargo_output(&link)
         && wrapper_installed()
         && let Some(marker) = attach_marker(&repo.worktree)
     {
@@ -1297,19 +1382,299 @@ fn attach(path: &Path, opts: AttachOpts) -> Result<()> {
         eprintln!("cargo-pool: {} gets a pooled target dir on the first cargo command", link.display());
         return Ok(());
     }
-    lease_slot(&repo, opts.seed)
+    lease_slot(&repo, opts.seed, opts.wait_for_build)
+}
+
+fn cargo_output(target: &Path) -> bool {
+    target.join("CACHEDIR.TAG").exists() || target.join(".rustc_info.json").exists() || !cargo_locks(target).is_empty()
+}
+
+#[derive(Clone, Copy)]
+enum Conflict {
+    Source,
+    Destination,
+}
+
+/// Move files without overwriting either side. Renames preserve open log descriptors.
+fn merge_target(src: &Path, dest: &Path, keep: Conflict) -> Result<()> {
+    if !src.exists() {
+        return Ok(());
+    }
+    if fs::read_dir(dest).is_ok_and(|mut d| d.next().is_none()) {
+        fs::remove_dir(dest)?;
+    }
+    if !dest.exists() {
+        fs::rename(src, dest)?;
+        return Ok(());
+    }
+    for entry in fs::read_dir(src)? {
+        let entry = entry?;
+        let to = dest.join(entry.file_name());
+        if entry.file_type()?.is_dir() && fs::symlink_metadata(&to).is_ok_and(|m| m.is_dir()) {
+            merge_target(&entry.path(), &to, keep)?;
+        } else {
+            if fs::symlink_metadata(&to).is_ok() {
+                if fs::read_link(entry.path()).ok().zip(fs::read_link(&to).ok()).is_some_and(|(a, b)| a == b) {
+                    fs::remove_file(entry.path())?;
+                    continue;
+                }
+                let saved = dest.join(format!("{}.cargo-pool-saved-{}", entry.file_name().to_string_lossy(), now_ns()));
+                match keep {
+                    Conflict::Source => fs::rename(&to, saved)?,
+                    Conflict::Destination => {
+                        fs::rename(entry.path(), saved)?;
+                        continue;
+                    }
+                }
+            }
+            fs::rename(entry.path(), to)?;
+        }
+    }
+    fs::remove_dir(src)?;
+    Ok(())
+}
+
+/// Make links into `root` relative and relative links out of it absolute, so both keep
+/// their referents when `root` moves.
+fn preserve_link_targets(root: &Path) -> Result<()> {
+    let real_root = fs::canonicalize(root.parent().unwrap())?.join(root.file_name().unwrap());
+    let mut paths = vec![root.to_path_buf()];
+    while let Some(from) = paths.pop() {
+        if let Ok(referent) = fs::read_link(&from) {
+            let dir = fs::canonicalize(from.parent().unwrap())?;
+            let joined = dir.join(&referent);
+            // Resolve the directories on the way, not the referent: it may be a link itself.
+            let resolved = match (joined.parent(), joined.file_name()) {
+                (Some(parent), Some(name)) => fs::canonicalize(parent).map(|p| p.join(name)),
+                _ => fs::canonicalize(&joined),
+            }
+            .unwrap_or_else(|_| {
+                let components: Vec<_> = joined.components().collect();
+                let mut absolute = PathBuf::new();
+                for (i, part) in components.iter().enumerate() {
+                    match part {
+                        std::path::Component::ParentDir => {
+                            absolute.pop();
+                        }
+                        std::path::Component::CurDir => {}
+                        _ => absolute.push(part),
+                    }
+                    if i + 1 < components.len()
+                        && let Ok(real) = fs::canonicalize(&absolute)
+                    {
+                        absolute = real;
+                    }
+                }
+                absolute
+            });
+            let preserved = if resolved.starts_with(&real_root) {
+                let common = dir.components().zip(resolved.components()).take_while(|(a, b)| a == b).count();
+                let up = std::iter::repeat_n(std::path::Component::ParentDir, dir.components().count() - common);
+                let relative: PathBuf = up.chain(resolved.components().skip(common)).collect();
+                if relative.as_os_str().is_empty() { PathBuf::from(".") } else { relative }
+            } else if referent.is_relative() {
+                resolved
+            } else {
+                continue;
+            };
+            if preserved != referent {
+                let tmp = from.with_file_name(format!(".cargo-pool-link-{}", now_ns()));
+                symlink(preserved, &tmp)?;
+                fs::rename(tmp, &from)?;
+            }
+        } else if from.is_dir() {
+            paths.extend(fs::read_dir(&from)?.map(|e| e.map(|e| e.path())).collect::<std::io::Result<Vec<_>>>()?);
+        }
+    }
+    Ok(())
+}
+
+fn saved_link(path: &Path) -> bool {
+    fs::read_link(path).is_ok_and(|p| p.components().any(|c| c.as_os_str() == "target.cargo-pool-files"))
+}
+
+fn remove_saved_links(target: &Path) -> Result<()> {
+    let mut dirs = vec![target.to_path_buf()];
+    while let Some(dir) = dirs.pop() {
+        let Ok(entries) = fs::read_dir(dir) else { continue };
+        for entry in entries {
+            let entry = entry?;
+            if saved_link(&entry.path()) {
+                fs::remove_file(entry.path())?;
+            } else if entry.file_type()?.is_dir() {
+                dirs.push(entry.path());
+            }
+        }
+    }
+    Ok(())
+}
+
+fn open_writers() -> HashSet<(u64, u64)> {
+    let mut files = HashSet::new();
+    for process in fs::read_dir("/proc").into_iter().flatten().flatten() {
+        if !process.file_name().as_encoded_bytes().iter().all(u8::is_ascii_digit)
+            || !process.metadata().is_ok_and(|m| m.uid() == unsafe { libc::geteuid() })
+        {
+            continue;
+        }
+        for entry in fs::read_dir(process.path().join("fdinfo")).into_iter().flatten().flatten() {
+            let flags = fs::read_to_string(entry.path()).ok().and_then(|s| {
+                s.lines().find_map(|l| l.strip_prefix("flags:").and_then(|n| i32::from_str_radix(n.trim(), 8).ok()))
+            });
+            if flags.is_some_and(|f| f & libc::O_ACCMODE != libc::O_RDONLY)
+                && let Ok(m) = fs::metadata(process.path().join("fd").join(entry.file_name()))
+            {
+                files.insert((m.dev(), m.ino()));
+            }
+        }
+    }
+    files
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum TargetContents {
+    Mixed,
+    Cargo,
+}
+
+fn stray_files(
+    target: &Path,
+    contents: TargetContents,
+    writers: &HashSet<(u64, u64)>,
+    paths: &mut Vec<PathBuf>,
+) -> Result<()> {
+    let profile = target.join(".cargo-lock").exists() || target.join(".fingerprint").is_dir();
+    let placeholder = contents == TargetContents::Mixed && !cargo_output(target) && !profile;
+    let Ok(entries) = fs::read_dir(target) else { return Ok(()) };
+    for entry in entries {
+        let entry = entry?;
+        let name = entry.file_name();
+        let path = entry.path();
+        if placeholder {
+            paths.push(path);
+            continue;
+        }
+        if name == "CACHEDIR.TAG"
+            || name == ".rustc_info.json"
+            || name == ".rustdoc_fingerprint.json"
+            || name == ".future-incompat-report.json"
+            || name == ".cargo-lock"
+        {
+            continue;
+        }
+        if saved_link(&path) || fs::metadata(&path).is_ok_and(|m| writers.contains(&(m.dev(), m.ino()))) {
+            paths.push(path);
+            continue;
+        }
+        let artifact = path
+            .extension()
+            .is_some_and(|e| ["d", "rlib", "rmeta", "so", "dylib", "dll", "exe", "a", "o"].iter().any(|ext| e == *ext))
+            || path.with_extension("d").is_file()
+            || target.join(format!("{}.d", name.to_string_lossy())).is_file();
+        let cargo = contents == TargetContents::Cargo
+            || (profile && !entry.file_type()?.is_dir() && artifact)
+            || name == "doc"
+            || name == "package"
+            || (profile && ["deps", ".fingerprint", "incremental", "build", "examples"].iter().any(|n| name == *n));
+        if entry.file_type()?.is_dir()
+            && (cargo || !cargo_locks(&path).is_empty() || path.join(".fingerprint").is_dir())
+        {
+            let contents = if cargo { TargetContents::Cargo } else { TargetContents::Mixed };
+            stray_files(&path, contents, writers, paths)?;
+        } else if !cargo {
+            paths.push(path);
+        }
+    }
+    Ok(())
+}
+
+fn adoption_source(target: &Path, strays: &[PathBuf]) -> Result<u64> {
+    let mut paths = vec![target.to_path_buf()];
+    let mut entries = BTreeMap::new();
+    while let Some(path) = paths.pop() {
+        if strays.contains(&path) {
+            continue;
+        }
+        let m = fs::symlink_metadata(&path)?;
+        let version = if m.is_dir() {
+            paths.extend(fs::read_dir(&path)?.map(|e| e.map(|e| e.path())).collect::<std::io::Result<Vec<_>>>()?);
+            [0; 6]
+        } else {
+            [m.ino(), m.len(), m.mtime() as u64, m.mtime_nsec() as u64, m.ctime() as u64, m.ctime_nsec() as u64]
+        };
+        entries.insert(path.strip_prefix(target)?.to_path_buf(), version);
+    }
+    Ok(entries.into_iter().fold(FNV_OFFSET, |h, (path, version)| {
+        let h = fnv1a_update(fnv1a_update(h, path.as_os_str().as_encoded_bytes()), b"\0");
+        version.into_iter().fold(h, |h, n| fnv1a_update(h, &n.to_le_bytes()))
+    }))
 }
 
 /// Lease the best free slot (or a new one) to the worktree and link its `target` to it.
-fn lease_slot(repo: &Repo, seed: bool) -> Result<()> {
+fn lease_slot(repo: &Repo, seed: bool, wait_for_build: bool) -> Result<()> {
     let started = Instant::now();
     let link = repo.worktree.join("target");
     let slots_dir = repo.slots_dir();
     let max_disk = repo.max_disk_percent();
-    if !free_disk(repo.pool.parent().unwrap(), max_disk, 0, &[])? {
+    let (mut recovery, _recovery_lock) = {
+        let _pool = repo.lock()?;
+        let slot = load_slots(&slots_dir)?
+            .into_iter()
+            .find(|s| s.meta.lease.as_ref().is_some_and(|l| l.pending && l.worktree == repo.worktree));
+        let lock = match &slot {
+            Some(s) => Some(
+                FileLock::acquire(&s.dir.join("seed.lock"), false)?
+                    .ok_or_else(|| anyhow!("slot {} is busy attaching", s.id))?,
+            ),
+            None => None,
+        };
+        (slot, lock)
+    };
+    let mut _build_locks =
+        lock_target(&link, wait_for_build).ok_or_else(|| anyhow!("{} is busy building", link.display()))?;
+    if let Some(slot) = &recovery {
+        let old = slot.saved_files(&repo.worktree).with_extension("attaching");
+        if fs::symlink_metadata(&old).is_ok_and(|m| m.is_dir()) {
+            _build_locks.extend(
+                lock_target(&old, wait_for_build).ok_or_else(|| anyhow!("{} is busy building", old.display()))?,
+            );
+            merge_target(&old, &link, Conflict::Destination)?;
+        }
+    }
+    let cross_device = fs::metadata(&link)
+        .is_ok_and(|m| fs::metadata(repo.pool.parent().unwrap()).is_ok_and(|root| root.dev() != m.dev()));
+    let mut strays = vec![];
+    stray_files(&link, TargetContents::Mixed, &open_writers(), &mut strays)?;
+    let mut ready = false;
+    if let Some(slot) = &mut recovery {
+        if let Some(Adoption::Ready { source }) = slot.meta.adoption {
+            ready = !link.exists() || adoption_source(&link, &strays)? == source;
+            if !ready {
+                slot.meta.adoption = Some(Adoption::Copying);
+                slot.save()?;
+            }
+        }
+        let tmp = slot.dir.join("target.adopting");
+        if !ready && tmp.exists() {
+            fs::remove_dir_all(tmp)?;
+        }
+        if slot.meta.adoption == Some(Adoption::Copying) && slot.target().exists() {
+            fs::remove_dir_all(slot.target())?;
+        }
+        if slot.meta.adoption == Some(Adoption::Copying) && !link.exists() {
+            slot.meta.adoption = None;
+            slot.meta.seed_pending = seed;
+            slot.save()?;
+        }
+    }
+    let adopting = recovery.as_ref().is_some_and(|s| s.meta.adoption.is_some()) || cargo_output(&link);
+    let extra = if cross_device && adopting && !ready { dir_size([&link], &strays) } else { 0 };
+    if !free_disk(repo.pool.parent().unwrap(), max_disk, extra, &[])? {
+        if extra > 0 {
+            bail!("not enough room below {max_disk}% to attach {}", link.display());
+        }
         eprintln!("cargo-pool: warning: disk is still above {max_disk}% after cleaning up all pools");
     }
-
     let head = repo.head()?;
     let lease = |pending| Lease { worktree: repo.worktree.clone(), head: head.clone(), acquired_at: now(), pending };
 
@@ -1318,19 +1683,32 @@ fn lease_slot(repo: &Repo, seed: bool) -> Result<()> {
     reclaim_stale(&mut slots)?;
 
     // Best free slot: closest commit, then most recently used.
+    let pending =
+        slots.iter().position(|s| s.meta.lease.as_ref().is_some_and(|l| l.pending && l.worktree == repo.worktree));
     let pick = slots
         .iter()
         .enumerate()
-        .filter(|(_, s)| s.state() == State::Free)
-        .min_by_key(|(_, s)| (distance(&repo.worktree, s.meta.last_head.as_deref(), &head), u64::MAX - s.meta.last_used))
+        .filter(|(_, s)| !adopting && s.state() == State::Free)
+        .min_by_key(|(_, s)| {
+            (distance(&repo.worktree, s.meta.last_head.as_deref(), &head), u64::MAX - s.meta.last_used)
+        })
         .map(|(i, _)| i);
 
-    let slot_idx = match pick {
+    let slot_idx = match pending.or(pick) {
         Some(i) => {
             let s = &mut slots[i];
             let d = distance(&repo.worktree, s.meta.last_head.as_deref(), &head);
-            s.meta.lease = Some(lease(false));
+            s.meta.lease = Some(lease(true));
+            if adopting {
+                s.meta.seed_pending = false;
+                if cross_device && s.meta.adoption.is_none() {
+                    s.meta.adoption = Some(Adoption::Copying);
+                }
+            }
             fs::create_dir_all(s.target())?;
+            if pending.is_none() && fs::read_dir(s.target())?.next().is_none() {
+                s.meta.seed_pending = seed;
+            }
             s.save()?;
             report_pick(s, d);
             drop(lock);
@@ -1342,27 +1720,125 @@ fn lease_slot(repo: &Repo, seed: bool) -> Result<()> {
             fs::create_dir_all(&dir)?;
             // Don't copy anything yet: many worktrees never build. The slot is seeded by the
             // rustc wrapper on the first cargo command (see `seed_on_first_use`).
-            let meta = SlotMeta { lease: Some(lease(false)), seed_pending: seed, ..Default::default() };
+            let meta = SlotMeta {
+                lease: Some(lease(true)),
+                seed_pending: seed && !adopting,
+                adoption: (cross_device && adopting).then_some(Adoption::Copying),
+                ..Default::default()
+            };
             let slot = Slot { id, dir, meta };
             fs::create_dir_all(slot.target())?;
             slot.save()?;
             drop(lock);
-            if seed {
-                eprintln!("cargo-pool: new slot {id}, filled from the closest warm target dir on the first cargo command");
+            if seed && !adopting {
+                eprintln!(
+                    "cargo-pool: new slot {id}, filled from the closest warm target dir on the first cargo command"
+                );
             }
             slots.push(slot);
             slots.len() - 1
         }
     };
 
-    let slot = &slots[slot_idx];
-    symlink(slot.target(), &link).with_context(|| format!("creating {}", link.display()))?;
+    let slot = &mut slots[slot_idx];
+    let _seed_lock = if recovery.is_none() { FileLock::acquire(&slot.dir.join("seed.lock"), true)? } else { None };
+    let saved = slot.saved_files(&repo.worktree);
+    preserve_link_targets(&link)?;
     exclude_target(repo)?;
+    if cross_device {
+        // Preserve lock inodes for Cargo commands already waiting, beyond this worktree's lifetime.
+        let anchors = repo.common_dir.join("cargo-pool-locks");
+        fs::create_dir_all(&anchors)?;
+        for path in cargo_locks(&link) {
+            let m = fs::metadata(&path)?;
+            let anchor = anchors.join(format!("{:x}-{:x}", m.dev(), m.ino()));
+            if !anchor.exists() {
+                fs::hard_link(fs::canonicalize(&path)?, &anchor)
+                    .context("retaining Cargo lock inode requires Git metadata on the target's filesystem")?;
+            }
+            if fs::read_link(&path).is_ok_and(|p| p == anchor) {
+                continue;
+            }
+            let tmp = path.with_file_name(format!(".cargo-pool-link-{}", now_ns()));
+            symlink(&anchor, &tmp)?;
+            fs::rename(tmp, path)?;
+        }
+    }
+    for path in &strays {
+        let to = saved.join(path.strip_prefix(&link)?);
+        if fs::read_link(path).is_ok_and(|p| p == to) {
+            continue;
+        }
+        fs::create_dir_all(to.parent().unwrap())?;
+        if fs::symlink_metadata(&to).is_ok() {
+            fs::rename(
+                &to,
+                to.with_file_name(format!(
+                    "{}.cargo-pool-saved-{}",
+                    to.file_name().unwrap().to_string_lossy(),
+                    now_ns()
+                )),
+            )?;
+        }
+        preserve_link_targets(path)?;
+        fs::rename(path, &to)?;
+        symlink(&to, path)?;
+    }
+    if slot.meta.adoption.is_some() {
+        let tmp = slot.dir.join("target.adopting");
+        if slot.meta.adoption == Some(Adoption::Copying) {
+            let source = adoption_source(&link, &strays)?;
+            let copied = Command::new("cp").args(["-a", "--reflink=auto", "--"]).arg(&link).arg(&tmp).status()?;
+            if !copied.success() || adoption_source(&link, &strays)? != source {
+                slot.discard_partial_copy()?;
+                bail!("copying {} failed or source changed; original target kept", link.display());
+            }
+            slot.meta.adoption = Some(Adoption::Ready { source });
+            slot.save()?;
+        }
+        if tmp.exists() {
+            merge_target(&tmp, &slot.target(), Conflict::Source)?;
+        }
+    } else if !cross_device && fs::symlink_metadata(&link).is_ok_and(|m| m.is_dir()) {
+        merge_target(&link, &slot.target(), Conflict::Source)?;
+    }
+    if saved.exists() {
+        let tmp = slot.dir.join("target.strays");
+        if tmp.exists() {
+            fs::remove_dir_all(&tmp)?;
+        }
+        let copied = Command::new("cp").args(["-as", "--"]).arg(&saved).arg(&tmp).status()?;
+        if !copied.success() {
+            bail!("linking stray files from {} failed", saved.display());
+        }
+        // Relocation carried a link per stray; a link to a saved directory would clash with its tree.
+        remove_saved_links(&slot.target())?;
+        merge_target(&tmp, &slot.target(), Conflict::Source)?;
+    }
+    if cross_device && link.exists() {
+        let old = saved.with_extension("attaching");
+        fs::create_dir_all(old.parent().unwrap())?;
+        if fs::symlink_metadata(&old).is_ok_and(|m| m.is_symlink()) {
+            fs::remove_file(&old)?;
+        }
+        // Retire the intact source before publishing the link; retries restore it if publication fails.
+        fs::rename(&link, &old)?;
+        symlink(slot.target(), &link).with_context(|| format!("creating {}", link.display()))?;
+        fs::remove_dir_all(old)?;
+    } else {
+        symlink(slot.target(), &link).with_context(|| format!("creating {}", link.display()))?;
+    }
+    if adopting {
+        save_snapshot(&slot.dir, &take_snapshot(&repo.worktree, None)?)?;
+    }
     warn_path_dependent_config(repo);
     record(&slot.dir, Event::Attach { reused: pick.is_some(), ms: ms_since(started) });
     if !slot.meta.seed_pending {
         prepare_worktree(repo, &slot.dir)?;
     }
+    slot.meta.lease.as_mut().unwrap().pending = false;
+    slot.meta.adoption = None;
+    slot.save()?;
     eprintln!("cargo-pool: {} -> slot {}", link.display(), slot.id);
     Ok(())
 }
@@ -1391,12 +1867,15 @@ fn attach_on_first_use() -> Result<()> {
     if !marker.exists() {
         return Ok(());
     }
-    let link = worktree.join("target");
-    // Only fails if cargo already wrote into the placeholder dir.
-    let unclaimed = fs::symlink_metadata(&link).map_or(true, |m| m.is_dir() && fs::remove_dir(&link).is_ok());
-    let result = if unclaimed { Repo::discover(worktree).and_then(|repo| lease_slot(&repo, true)) } else { Ok(()) };
+    if let Err(e) = attach(worktree, AttachOpts { seed: true, force: false, from_hook: false, wait_for_build: true }) {
+        // Cargo caches failed probes too. A directory prevents that write while keeping logs accessible.
+        let cache = worktree.join("target/.rustc_info.json");
+        let _ = fs::remove_file(&cache);
+        fs::create_dir_all(&cache).context("preventing Cargo from caching a failed attach probe")?;
+        return Err(e);
+    }
     fs::remove_file(&marker)?;
-    result
+    Ok(())
 }
 
 fn wrapper_installed() -> bool {
@@ -1542,6 +2021,7 @@ fn report_pick(s: &Slot, d: u64) {
 fn seed_sources(repo: &Repo, slots: &[Slot]) -> Vec<(PathBuf, Option<String>)> {
     let mut out: Vec<_> = slots
         .iter()
+        .filter(|s| !s.meta.lease.as_ref().is_some_and(|l| l.pending))
         .map(|s| {
             let head = match &s.meta.lease {
                 Some(l) => git(&l.worktree, &["rev-parse", "HEAD"]).ok().or(Some(l.head.clone())),
@@ -1569,6 +2049,9 @@ fn seed_parts(target: &Path) -> Vec<PathBuf> {
         for entry in fs::read_dir(dir).into_iter().flatten().flatten() {
             let (path, rel) = (entry.path(), rel.join(entry.file_name()));
             let is_dir = entry.file_type().is_ok_and(|t| t.is_dir());
+            if is_dir && entry.file_name() == ".rustc_info.json" {
+                continue;
+            }
             if profile && is_dir && entry.file_name() == "incremental" {
                 continue;
             }
@@ -1611,7 +2094,7 @@ fn seed(repo: &Repo, slot: &Slot, head: &str, sources: Vec<(PathBuf, Option<Stri
         if parts.is_empty() {
             continue; // evicted since it was listed
         }
-        let size = dir_size(parts.iter().map(|p| src.join(p)));
+        let size = dir_size(parts.iter().map(|p| src.join(p)), &[]);
         let protect: Vec<&Path> = [src.parent(), Some(slot.dir.as_path())].into_iter().flatten().collect();
         if !free_disk(repo.pool.parent().unwrap(), max_disk, size, &protect)? {
             eprintln!(
@@ -1623,7 +2106,7 @@ fn seed(repo: &Repo, slot: &Slot, head: &str, sources: Vec<(PathBuf, Option<Stri
         }
         // Hold cargo's build locks so the source isn't modified mid-copy, and copy what's
         // there now: a build may have run since it was sized.
-        let Some(_locks) = lock_target(&src) else {
+        let Some(_locks) = lock_target(&src, false) else {
             eprintln!("cargo-pool: {} is busy building, trying next candidate", src.display());
             continue;
         };
@@ -1648,8 +2131,11 @@ fn seed(repo: &Repo, slot: &Slot, head: &str, sources: Vec<(PathBuf, Option<Stri
             eprintln!("cargo-pool: copy failed, trying next candidate");
             continue;
         }
-        let _ = fs::remove_dir_all(slot.target());
-        fs::rename(&tmp, slot.target())?;
+        remove_saved_links(&tmp)?;
+        for lock in cargo_locks(&tmp) {
+            fs::remove_file(lock)?;
+        }
+        merge_target(&tmp, &slot.target(), Conflict::Destination)?;
         // Carry over the file snapshot that matches this target, so the new worktree can
         // be backdated: the source slot's (if still valid), or one of the main checkout.
         let snap = match (&repo.main_worktree, src.parent()) {
@@ -1675,7 +2161,8 @@ fn exclude_target(repo: &Repo) -> Result<()> {
     let info = repo.common_dir.join("info");
     let exclude = info.join("exclude");
     let current = fs::read_to_string(&exclude).unwrap_or_default();
-    if current.lines().any(|l| l.trim() == "/target") {
+    let patterns = ["/target", "/target.cargo-pool-files/"];
+    if patterns.iter().all(|pattern| current.lines().any(|l| l.trim() == *pattern)) {
         return Ok(());
     }
     fs::create_dir_all(&info)?;
@@ -1683,13 +2170,42 @@ fn exclude_target(repo: &Repo) -> Result<()> {
     if !current.is_empty() && !current.ends_with('\n') {
         writeln!(f)?;
     }
-    writeln!(f, "# cargo-pool: worktree target symlinks\n/target")?;
+    for pattern in patterns {
+        if !current.lines().any(|l| l.trim() == pattern) {
+            writeln!(f, "{pattern}")?;
+        }
+    }
     Ok(())
 }
 
 fn detach(path: &Path) -> Result<()> {
     let repo = Repo::discover(path)?;
+    let _attach_lock =
+        attach_marker(&repo.worktree).map(|m| FileLock::acquire(&m.with_extension("lock"), true)).transpose()?;
     let link = repo.worktree.join("target");
+    let _ = fs::remove_dir(link.join(".rustc_info.json"));
+    {
+        let _pool = repo.lock()?;
+        if let Some(mut slot) = load_slots(&repo.slots_dir())?
+            .into_iter()
+            .find(|s| s.meta.lease.as_ref().is_some_and(|l| l.pending && l.worktree == repo.worktree))
+        {
+            if slot.meta.adoption == Some(Adoption::Copying)
+                && !fs::symlink_metadata(&link).is_ok_and(|m| m.is_symlink())
+            {
+                let _seed_lock = FileLock::acquire(&slot.dir.join("seed.lock"), false)?
+                    .ok_or_else(|| anyhow!("slot {} is busy attaching", slot.id))?;
+                slot.release(None)?;
+                slot.save()?;
+                if let Some(marker) = attach_marker(&repo.worktree).filter(|m| m.exists()) {
+                    fs::remove_file(marker)?;
+                }
+                println!("cargo-pool: cancelled adoption; original target kept at {}", link.display());
+                return Ok(());
+            }
+            bail!("{} has an unfinished attach; rerun attach before detaching", repo.worktree.display());
+        }
+    }
     if let Some(marker) = attach_marker(&repo.worktree).filter(|m| m.exists()) {
         fs::remove_file(marker)?;
         if !fs::symlink_metadata(&link).is_ok_and(|m| m.is_symlink()) {
@@ -1707,7 +2223,7 @@ fn detach(path: &Path) -> Result<()> {
         .ok_or_else(|| anyhow!("{} points to {}, which is not a slot of this pool", link.display(), dest.display()))?;
     fs::remove_file(&link)?;
     if slot.meta.lease.as_ref().is_some_and(|l| l.worktree == repo.worktree) {
-        slot.release(repo.head().ok());
+        slot.release(repo.head().ok())?;
         slot.save()?;
     }
     println!("cargo-pool: released slot {}", slot.id);
@@ -1938,11 +2454,15 @@ fn gc(max_age_days: Option<u64>, dry_run: bool) -> Result<()> {
             .map(|s| (s.id, s.dir.clone()))
             .collect();
         for (id, dir) in &removed {
-            println!("{} slot {id} ({})", if dry_run { "would remove" } else { "removing" }, dir.display());
             if !dry_run {
-                let size = dir_size([dir]);
+                let Some(_seed_lock) = FileLock::acquire(&dir.join("seed.lock"), false)? else { continue };
+                let Some(_build_locks) = lock_target(&dir.join("target"), false) else { continue };
+                println!("removing slot {id} ({})", dir.display());
+                let size = dir_size([dir], &[]);
                 fs::remove_dir_all(dir)?;
                 record(dir, Event::Evict { bytes: size });
+            } else {
+                println!("would remove slot {id} ({})", dir.display());
             }
         }
         if let (Some(d), true) = (max_age_days, removed.is_empty()) {
