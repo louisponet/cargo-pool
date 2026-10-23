@@ -12,7 +12,10 @@ Share warm cargo `target/` directories between git worktrees, so a fresh worktre
   `~/.cache/cargo-pool`.
 - `cargo-pool attach` replaces a worktree's `target` with a symlink to a slot. Each slot
   is leased to one worktree at a time, so parallel agents never block on each other's
-  cargo build lock.
+  cargo build lock. The main checkout uses the same rules. Existing build artifacts are
+  moved into a new slot, with a copy across filesystems only if it fits below the disk
+  limit. Explicit `attach` refuses while a build is running. A deferred worktree's first
+  cargo command waits for it. Detach to make the slot available for reuse.
 - Worktrees created through the hook take a slot only on their first cargo command, so
   worktrees that never build hold none. Cargo asks the compiler for its version
   (`rustc -vV`, through the rustc wrapper) before it touches the target dir, and the slot is
@@ -34,8 +37,9 @@ Share warm cargo `target/` directories between git worktrees, so a fresh worktre
   installed, see below) and on `gc`. The least recently used slots go first, whether or
   not a worktree holds them. A worktree whose slot is deleted loses its `target` link and
   gets a new slot on its next cargo command. Slots with a build running or being seeded
-  are never deleted, and neither is the main checkout's `target/`. A new slot is only seeded if the copy fits under the
-  limit; otherwise it starts empty, and no slot is deleted for a copy that wouldn't fit anyway.
+  are never deleted. Once attached, the main checkout's slot follows the same eviction rules.
+  A new slot is only seeded if the copy fits under the limit; otherwise it starts empty,
+  and no slot is deleted for a copy that wouldn't fit anyway.
 - Leases end on their own when the worktree is deleted (`git worktree remove`),
   or explicitly with `cargo-pool detach`.
 - `/target` is added to `.git/info/exclude`, because `target/` patterns in `.gitignore`
@@ -105,7 +109,21 @@ A `RUSTC_WRAPPER` env var overrides the config entry. To keep using sccache, set
 `CARGO_POOL_RUSTC_WRAPPER=sccache` instead and `cargo-pool` runs the compiler through it.
 
 Worktrees that already exist aren't attached by the hook; run `cargo pool attach` inside
-them. Linux only for now.
+them, including the main checkout. Stray files such as logs and rust-analyzer output are
+preserved when attaching and seeding. If a name conflicts, the old slot file is kept beside
+it with a `.cargo-pool-saved-<timestamp>` suffix. Stray files stay in the ignored
+`target.cargo-pool-files/` directory and the slot links to them, so open log
+handles keep working. These retained files stay with their original worktree when a slot
+is released or seeded. A failed deferred attach keeps its marker and stops the compiler
+probe, so the next build can retry. An interrupted attach retains its lease while the
+worktree exists. `detach` can cancel an unfinished copy while keeping its source target.
+Once the copy is complete, rerun `attach` before detaching it. Linux only for now.
+
+Cross-filesystem adoption keeps Cargo's lock inodes in the repository's Git metadata,
+so commands already waiting for a build lock still use the same lock after adoption.
+The Git metadata must share the original target's filesystem. Seeds get independent locks.
+After moving the whole repository, run `cargo pool attach --force` to reset its pool
+association and lock paths. The previous artifacts remain in the old pool.
 
 To remove it, run `cargo pool uninstall`, then `cargo uninstall cargo-pool`. Skipping the
 first step leaves nothing broken: cargo's config points at a small script
@@ -160,8 +178,8 @@ with nothing to compile don't show up, and without the wrapper no builds are rec
 
 | command | |
 |---|---|
-| `cargo pool attach [path] [--force] [--no-seed] [--allow-main]` | attach a worktree (idempotent) |
-| `cargo pool detach [path]` | release the slot and remove the symlink (or cancel a pending attach) |
+| `cargo pool attach [path] [--force] [--no-seed]` | attach a worktree and preserve its target (idempotent); `--force` discards it |
+| `cargo pool detach [path]` | release the slot and remove the symlink, or cancel a deferred attach or unfinished copy |
 | `cargo pool status [--size]` | show slots for this repo (all pools outside a repo) |
 | `cargo pool stats [--days D]` | show recorded metrics for this repo (all pools outside a repo) |
 | `cargo pool gc [--max-age-days D] [--dry-run]` | free disk space if over the limit; optionally delete free slots older than D days |
