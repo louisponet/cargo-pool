@@ -1572,3 +1572,61 @@ fn reused_and_seeded_slots_do_not_inherit_another_worktrees_log_links() {
         }
     }
 }
+
+#[test]
+fn job_slots_cap_concurrent_compilers_across_cargo_invocations() {
+    let f = Fixture::new();
+    let compiler = f.dir.join("fake-rustc");
+    // Leaves a daemon behind, like an sccache client starting its server: it mustn't keep the slot.
+    let script = "#!/bin/sh\nsleep 10 >/dev/null 2>&1 &\necho \"start $(date +%s%N)\" >> \"$1\"\nsleep 0.3\necho \"end $(date +%s%N)\" >> \"$1\"\n";
+    fs::write(&compiler, script).unwrap();
+    fs::set_permissions(&compiler, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+    let log = f.dir.join("compiles");
+    let started = std::time::Instant::now();
+    let compiles: Vec<_> = (0..3)
+        .map(|_| {
+            f.command(env!("CARGO_BIN_EXE_cargo-pool"), &f.repo)
+                .env("CARGO_POOL_JOBS", "1")
+                .arg(&compiler)
+                .arg(&log)
+                .args(["--out-dir", "."])
+                .spawn()
+                .unwrap()
+        })
+        .collect();
+    for mut c in compiles {
+        assert!(c.wait().unwrap().success());
+    }
+    assert!(started.elapsed().as_secs() < 5, "a daemon kept the slot");
+    let log = fs::read_to_string(&log).unwrap();
+    let events: Vec<_> = log.lines().map(|l| l.split(' ').next().unwrap()).collect();
+    assert_eq!(events, ["start", "end", "start", "end", "start", "end"]);
+}
+
+#[test]
+fn compiles_nested_in_a_slot_holder_do_not_wait_for_a_slot() {
+    let f = Fixture::new();
+    let compiler = f.dir.join("fake-rustc");
+    // Like a proc macro building a crate: compiles again through the wrapper before exiting.
+    let script = format!(
+        "#!/bin/sh\nif [ \"$1\" = outer ]; then \"{}\" \"$0\" inner --out-dir . || exit 1; fi\nexit 0\n",
+        env!("CARGO_BIN_EXE_cargo-pool")
+    );
+    fs::write(&compiler, script).unwrap();
+    fs::set_permissions(&compiler, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+    let mut outer = f
+        .command(env!("CARGO_BIN_EXE_cargo-pool"), &f.repo)
+        .env("CARGO_POOL_JOBS", "1")
+        .args([compiler.as_os_str(), "outer".as_ref(), "--out-dir".as_ref(), ".".as_ref()])
+        .spawn()
+        .unwrap();
+    let started = std::time::Instant::now();
+    while outer.try_wait().unwrap().is_none() {
+        if started.elapsed().as_secs() >= 5 {
+            outer.kill().unwrap();
+            panic!("the nested compile waited for the slot its parent holds");
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    assert!(outer.wait().unwrap().success());
+}
