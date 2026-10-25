@@ -105,6 +105,17 @@ That runs `cargo install --git https://github.com/louisponet/cargo-pool` followe
   built is never deleted, because cargo holds its build lock. Skip it with
   `| sh -s -- --no-wrapper`.
 
+The wrapper also caps compilers machine-wide. Each cargo invocation runs up to one compiler
+per CPU, so two concurrent builds oversubscribe the CPUs twice over. Every compile first
+takes one of `cargo-pool.jobs` slots (default: the CPU count) and holds it until the compiler
+exits, so concurrent builds share the CPUs instead. A killed build releases its slots, and a
+daemon the compiler starts, such as an sccache server, doesn't keep one. A compile nested in
+another, such as a proc macro building a crate, uses its parent's slot. The cap counts
+compiler processes, not the codegen threads inside them or C compilers run by build scripts.
+The slots are lock files in `~/.cache/cargo-pool-jobs`. After waiting 30 seconds, a compiler
+says so on the terminal, and `lslocks` shows who holds them. Set `cargo-pool.jobs` to 0 to
+turn the cap off.
+
 A `RUSTC_WRAPPER` env var overrides the config entry. To keep using sccache, set
 `CARGO_POOL_RUSTC_WRAPPER=sccache` instead and `cargo-pool` runs the compiler through it.
 
@@ -197,6 +208,7 @@ Each setting comes from an environment variable or git config, with the env var 
 | `CARGO_POOL_DIR` | – | `$XDG_CACHE_HOME/cargo-pool` or `~/.cache/cargo-pool` |
 | `CARGO_POOL_MAX_DISK_PERCENT` | `cargo-pool.maxDiskPercent` | 90 |
 | `CARGO_POOL_BACKDATE` | `cargo-pool.backdate` | true |
+| `CARGO_POOL_JOBS` | global `cargo-pool.jobs` | number of CPUs (0 turns the cap off) |
 | `CARGO_POOL_RUSTC_WRAPPER` | – | none (e.g. `sccache`) |
 
 ### Use multiple pool directories

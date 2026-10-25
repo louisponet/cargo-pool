@@ -25,6 +25,9 @@ use serde::{Deserialize, Serialize};
 
 const HOOK_BEGIN: &str = "# >>> cargo-pool >>>";
 const HOOK_END: &str = "# <<< cargo-pool <<<";
+/// Set for a compiler holding a job slot, so compiles nested in it don't wait for one. Not
+/// `CARGO_*`: sccache hashes those into its cache keys.
+const IN_JOB_SLOT: &str = "CARGOPOOL_IN_JOB_SLOT";
 const NULL_SHA: &str = "0000000000000000000000000000000000000000";
 /// An unfinished lease whose worktree has disappeared is honoured for this long.
 const PENDING_TIMEOUT_SECS: u64 = 3 * 3600;
@@ -104,7 +107,8 @@ enum Cmd {
         path: Option<PathBuf>,
     },
     /// Make cargo run every compiler call through cargo-pool (`build.rustc-wrapper` in
-    /// `$CARGO_HOME/config.toml`), so disk usage is checked during every pooled build.
+    /// `$CARGO_HOME/config.toml`), so disk usage is checked during every pooled build and
+    /// all cargo invocations share `cargo-pool.jobs` compiler slots.
     InstallWrapper,
     /// Remove the `build.rustc-wrapper` entry added by `install-wrapper`.
     UninstallWrapper,
@@ -792,13 +796,84 @@ fn rustc_wrapper(args: Vec<OsString>) -> ! {
     if let Err(e) = check_disk_during_build(&args[2..]) {
         eprintln!("cargo-pool: warning: disk check failed: {e:#}");
     }
+    let held = hold_job_slot(&args[2..]).unwrap_or_else(|e| {
+        eprintln!("cargo-pool: warning: compiling without a job slot: {e:#}");
+        false
+    });
     let (program, rest) = match std::env::var_os("CARGO_POOL_RUSTC_WRAPPER").filter(|w| !w.is_empty()) {
         Some(inner) => (inner, &args[1..]),
         None => (args[1].clone(), &args[2..]),
     };
-    let err = Command::new(&program).args(rest).exec();
+    let mut cmd = Command::new(&program);
+    cmd.args(rest);
+    if held {
+        cmd.env(IN_JOB_SLOT, "1");
+    }
+    let err = cmd.exec();
     eprintln!("cargo-pool: failed to run {}: {err}", program.to_string_lossy());
     std::process::exit(1);
+}
+
+/// Take one of `cargo-pool.jobs` machine-wide slots for a compile (cargo passes `--out-dir`
+/// to every compile and to none of its probes), so concurrent cargo invocations, each running
+/// up to nproc compilers, share the CPUs. The slot is a POSIX record lock: it survives the
+/// exec but isn't inherited by forks, so it's released when the compiler exits, however it
+/// exits, and never kept by a daemon it starts (an sccache server). Returns whether it took one.
+fn hold_job_slot(rustc_args: &[OsString]) -> Result<bool> {
+    // A compile nested in one holding a slot (a proc macro building a crate) would deadlock
+    // waiting for the slot its parent holds.
+    if !rustc_args.iter().any(|a| a == "--out-dir") || std::env::var_os(IN_JOB_SLOT).is_some() {
+        return Ok(false);
+    }
+    let nproc = std::thread::available_parallelism().map_or(1, |n| n.get());
+    // From `/` git reads no repository config: a repo's setting would cap just its crates.
+    let jobs: usize = setting(Path::new("/"), "CARGO_POOL_JOBS", "cargo-pool.jobs", nproc);
+    if jobs == 0 {
+        return Ok(false);
+    }
+    // Not under `CARGO_HOME` or `TMPDIR`: environments that set those differently must share it.
+    let home = std::env::var_os("HOME").ok_or_else(|| anyhow!("HOME not set"))?;
+    let dir = PathBuf::from(home).join(".cache/cargo-pool-jobs");
+    fs::create_dir_all(&dir)?;
+    // Waiters poll; opening the slots once keeps a poll to one fcntl per slot.
+    let first = std::process::id() as usize;
+    let slots = (0..jobs)
+        .map(|i| OpenOptions::new().create(true).truncate(false).write(true).open(dir.join(((first + i) % jobs).to_string())))
+        .collect::<std::io::Result<Vec<_>>>()?;
+    let since = Instant::now();
+    let mut notified = false;
+    loop {
+        for slot in &slots {
+            let lock = libc::flock { l_type: libc::F_WRLCK as _, l_whence: libc::SEEK_SET as _, l_start: 0, l_len: 0, l_pid: 0 };
+            if unsafe { libc::fcntl(slot.as_raw_fd(), libc::F_SETLK, &lock) } != 0 {
+                let err = std::io::Error::last_os_error();
+                if matches!(err.raw_os_error(), Some(libc::EAGAIN | libc::EACCES)) {
+                    continue;
+                }
+                return Err(err).context("lock a job slot");
+            }
+            // Closing any fd to the slot would drop the lock, so the compiler inherits this one.
+            if unsafe { libc::fcntl(slot.as_raw_fd(), libc::F_SETFD, 0) } != 0 {
+                return Err(std::io::Error::last_os_error()).context("clear FD_CLOEXEC on the job slot");
+            }
+            std::mem::forget(slots);
+            return Ok(true);
+        }
+        // To the terminal: cargo caches a compiler's stderr and replays it on every later build.
+        // Once a minute machine-wide: a stalled build has up to nproc compilers waiting.
+        if !notified && since.elapsed() > Duration::from_secs(30) {
+            notified = true;
+            let marker = dir.join("notice");
+            let last = fs::metadata(&marker).and_then(|m| m.modified()).ok();
+            if last.is_none_or(|t| t.elapsed().unwrap_or_default() > Duration::from_secs(60))
+                && let Ok(mut tty) = OpenOptions::new().write(true).open("/dev/tty")
+            {
+                let _ = OpenOptions::new().create(true).truncate(false).write(true).open(&marker).and_then(|m| m.set_modified(SystemTime::now()));
+                let _ = writeln!(tty, "cargo-pool: waited 30s for one of {jobs} compiler job slots (`lslocks | grep cargo-pool-jobs` lists their holders)");
+            }
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
 }
 
 fn check_disk_during_build(rustc_args: &[OsString]) -> Result<()> {
