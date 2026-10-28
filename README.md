@@ -33,11 +33,13 @@ Share warm cargo `target/` directories between git worktrees, so a fresh worktre
   no limit on the number of slots: disk usage is the only limit.
 - **Pruning by Cargo.lock**: cargo never deletes artifacts of dependency versions it no longer
   uses, so slots only grow. cargo-pool drops every build unit that the slot's worktree can't
-  use at its current `Cargo.lock`: units built from a crate version or git revision the lock
-  doesn't contain, unfinished units, and everything depending on them. A seed copies only the
-  units the new worktree can use. A slot is pruned in place when a worktree takes it over, and
-  after each build once its worktree's `Cargo.lock` has changed. It never runs during a build.
-  If a deleted unit was needed after all, cargo rebuilds it.
+  use at its current `Cargo.lock` and toolchain: units built from a crate version or git
+  revision the lock doesn't contain, units built by another toolchain, unfinished units, and
+  everything depending on them. It handles both cargo's classic target layout and the new
+  build-dir layout. A seed copies only the units the new worktree can use. A slot is pruned in
+  place when a worktree takes it over, and after each build once its worktree's `Cargo.lock` or
+  toolchain has changed. It never runs during a build. If a deleted unit was needed after all,
+  cargo rebuilds it.
 - **Disk limit**: if the disk holding the pool is above `maxDiskPercent` (default 90%),
   pooled target dirs on that filesystem are deleted, across all repos' pools and configured
   directories, until usage is back under the limit. This happens on every attach, on every pooled build (with the rustc wrapper
