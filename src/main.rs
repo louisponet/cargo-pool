@@ -689,9 +689,14 @@ struct Reclaim {
 }
 
 /// The `incremental/` caches of a target dir's profiles: they only speed up rebuilding a crate
-/// after an edit, and rustc starts one over if it's gone.
+/// after an edit, and rustc starts one over if it's gone. Not through a symlink: what it points
+/// to isn't the slot's.
 fn incremental_caches(target: &Path) -> Vec<PathBuf> {
-    profile_dirs(target).into_iter().map(|p| p.join("incremental")).filter(|p| p.is_dir()).collect()
+    profile_dirs(target)
+        .into_iter()
+        .map(|p| p.join("incremental"))
+        .filter(|p| fs::symlink_metadata(p).is_ok_and(|m| m.is_dir()))
+        .collect()
 }
 
 /// What's in the `incremental_caches` of a target dir, one entry per crate.

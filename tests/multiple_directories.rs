@@ -1060,6 +1060,28 @@ fn pressure_trims_incremental_caches_before_deleting_slots() {
 }
 
 #[test]
+fn pressure_never_empties_a_cache_outside_the_slot() {
+    let f = Fixture::exclusive();
+    let a = f.worktree("a");
+    f.pool(&a, &f.roots[..1], &["attach", "--no-seed"]);
+    let shared = f.dir.join("shared-cache");
+    fs::create_dir_all(shared.join("example-0123")).unwrap();
+    fs::write(shared.join("example-0123/cache"), vec![2; 4 << 20]).unwrap();
+    fs::create_dir_all(a.join("target/debug/.fingerprint")).unwrap();
+    std::os::unix::fs::symlink(&shared, a.join("target/debug/incremental")).unwrap();
+    fs::write(a.join("target/artifact"), vec![1; 4 << 20]).unwrap();
+    success(
+        f.command(env!("CARGO_BIN_EXE_cargo-pool"), &a)
+            .env("CARGO_POOL_DIR", &f.roots[0])
+            .env("CARGO_POOL_MAX_DISK_PERCENT", limit_with_room(&f.roots[0], -(2 << 20)).to_string())
+            .arg("gc")
+            .output()
+            .unwrap(),
+    );
+    assert!(shared.join("example-0123/cache").exists(), "a symlinked cache isn't the slot's to empty");
+}
+
+#[test]
 fn eviction_dates_slots_by_their_last_compile() {
     let f = Fixture::exclusive();
     let roots = &f.roots[..1];
