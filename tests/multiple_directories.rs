@@ -3,21 +3,45 @@ use std::os::fd::AsRawFd;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{RwLock, RwLockReadGuard, RwLockWriteGuard};
 use std::time::{SystemTime, UNIX_EPOCH};
+
+/// Tests that set the disk limit just above or below current usage hold this exclusively, so no
+/// other test writes to the disk in between.
+static DISK: RwLock<()> = RwLock::new(());
+
+enum DiskGuard {
+    Shared(#[allow(dead_code)] RwLockReadGuard<'static, ()>),
+    Exclusive(#[allow(dead_code)] RwLockWriteGuard<'static, ()>),
+}
 
 struct Fixture {
     dir: PathBuf,
     repo: PathBuf,
     roots: [PathBuf; 2],
+    _disk: DiskGuard,
 }
 
 impl Fixture {
     fn new() -> Self {
+        Self::with(DiskGuard::Shared(DISK.read().unwrap_or_else(|e| e.into_inner())))
+    }
+
+    /// For tests that set the disk limit relative to current usage.
+    fn exclusive() -> Self {
+        Self::with(DiskGuard::Exclusive(DISK.write().unwrap_or_else(|e| e.into_inner())))
+    }
+
+    fn with(disk: DiskGuard) -> Self {
+        // Tests released together by `DISK` can read the same clock tick.
+        static NEXT: AtomicUsize = AtomicUsize::new(0);
         let stamp = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
-        let dir = std::env::temp_dir().join(format!("cargo-pool-test-{}-{stamp}", std::process::id()));
+        let n = NEXT.fetch_add(1, Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!("cargo-pool-test-{}-{stamp}-{n}", std::process::id()));
         let repo = dir.join("repo");
         fs::create_dir_all(repo.join("src")).unwrap();
-        let fixture = Self { roots: [dir.join("pool one"), dir.join("pool two")], dir, repo };
+        let fixture = Self { roots: [dir.join("pool one"), dir.join("pool two")], dir, repo, _disk: disk };
         fs::write(fixture.repo.join("Cargo.toml"), "[package]\nname = \"example\"\nversion = \"0.1.0\"\n").unwrap();
         fs::write(fixture.repo.join("src/main.rs"), "fn main() {}\n").unwrap();
         fixture.git(&fixture.repo, &["init", "-q"]);
@@ -79,6 +103,23 @@ impl Drop for Fixture {
         }
         fs::remove_dir_all(&self.dir).unwrap();
     }
+}
+
+/// The disk limit, in percent, that leaves `room` bytes to write on `root`'s filesystem (or
+/// needs that many freed, if negative).
+fn limit_with_room(root: &Path, room: i64) -> f64 {
+    let path = std::ffi::CString::new(root.as_os_str().as_encoded_bytes()).unwrap();
+    let mut st: libc::statvfs = unsafe { std::mem::zeroed() };
+    assert_eq!(unsafe { libc::statvfs(path.as_ptr(), &mut st) }, 0);
+    let used = ((st.f_blocks - st.f_bfree) * st.f_frsize) as i64;
+    let avail = (st.f_bavail * st.f_frsize) as i64;
+    100.0 * (used + room) as f64 / (used + avail) as f64
+}
+
+/// The events a pool recorded, given the target dir of one of its slots.
+fn events(target: &Path) -> Vec<serde_json::Value> {
+    let log = target.parent().unwrap().parent().unwrap().parent().unwrap().join("events.jsonl");
+    fs::read_to_string(log).unwrap().lines().map(|l| serde_json::from_str(l).unwrap()).collect()
 }
 
 fn success(output: Output) -> String {
@@ -330,6 +371,8 @@ fn records_metrics() {
         "prepared   3 slots",
         "built      1 cargo commands, 2 units compiled",
         "snapshots  1 in the background",
+        "skipped    0 seed sources",
+        "trimmed    0 incremental caches",
     ] {
         assert!(stats.contains(expected), "missing {expected:?} in:\n{stats}");
     }
@@ -877,7 +920,7 @@ fn attach_preserves_open_logs_and_relative_links() {
 #[test]
 fn disk_pressure_can_evict_the_slot_that_attach_would_reuse() {
     for abandoned in [false, true] {
-        let f = Fixture::new();
+        let f = Fixture::exclusive();
         let a = f.worktree("a");
         f.pool(&a, &f.roots[..1], &["attach", "--no-seed"]);
         fs::write(a.join("target/artifact"), vec![1; 4 << 20]).unwrap();
@@ -917,7 +960,7 @@ fn disk_pressure_can_evict_the_slot_that_attach_would_reuse() {
 
 #[test]
 fn seeding_never_evicts_a_held_slot() {
-    let f = Fixture::new();
+    let f = Fixture::exclusive();
     let a = f.worktree("a");
     let b = f.worktree("b");
     let c = f.worktree("c");
@@ -946,11 +989,117 @@ fn seeding_never_evicts_a_held_slot() {
     assert!(held.join("artifact").exists());
     let target = fs::read_link(b.join("target")).unwrap();
     assert!(target.is_dir() && !target.join("artifact").exists(), "the slot starts empty");
+    let seed = events(&target).into_iter().find(|e| e["event"] == "seed").unwrap();
+    assert_eq!(seed["bytes"], serde_json::Value::Null);
+    assert_eq!(seed["no_room"], 2, "both candidates were passed over for room: {seed}");
+}
+
+#[test]
+fn seeding_trims_incremental_caches_of_held_slots() {
+    let f = Fixture::exclusive();
+    let roots = &f.roots[..1];
+    let a = f.worktree("a");
+    let b = f.worktree("b");
+    let c = f.worktree("c");
+    for wt in [&a, &c] {
+        f.pool(wt, roots, &["attach", "--no-seed"]);
+        fs::write(wt.join("target/artifact"), vec![1; 8 << 20]).unwrap();
+    }
+    fs::create_dir_all(c.join("target/debug/.fingerprint")).unwrap();
+    fs::create_dir_all(c.join("target/debug/incremental/example-0123")).unwrap();
+    fs::write(c.join("target/debug/incremental/example-0123/cache"), vec![2; 16 << 20]).unwrap();
+    let held = fs::read_link(c.join("target")).unwrap();
+    f.pool(&b, roots, &["attach"]);
+    // Room for half a copy: it fits once c's incremental caches are gone, whichever slot is copied.
+    success(
+        f.command(env!("CARGO_BIN_EXE_cargo-pool"), &b)
+            .env("CARGO_POOL_DIRS", &f.roots[0])
+            .env("CARGO_POOL_MAX_DISK_PERCENT", limit_with_room(&f.roots[0], 4 << 20).to_string())
+            .args(["/bin/true", "-vV"])
+            .output()
+            .unwrap(),
+    );
+    assert_eq!(fs::read_link(c.join("target")).unwrap(), held);
+    assert!(held.join("artifact").exists() && held.join("debug/.fingerprint").exists());
+    assert_eq!(fs::read_dir(held.join("debug/incremental")).unwrap().count(), 0, "the held slot's caches made room");
+    let target = fs::read_link(b.join("target")).unwrap();
+    assert!(target.join("artifact").exists(), "the slot is seeded");
+    let trim = events(&target).into_iter().find(|e| e["event"] == "trim").unwrap();
+    assert!(trim["bytes"].as_u64().unwrap() >= 16 << 20);
+}
+
+#[test]
+fn pressure_trims_incremental_caches_before_deleting_slots() {
+    let f = Fixture::exclusive();
+    let roots = &f.roots[..1];
+    let a = f.worktree("a");
+    let b = f.worktree("b");
+    f.pool(&a, roots, &["attach", "--no-seed"]);
+    f.pool(&b, roots, &["attach", "--no-seed"]);
+    fs::create_dir_all(a.join("target/debug/.fingerprint")).unwrap();
+    fs::create_dir_all(a.join("target/debug/incremental/example-0123")).unwrap();
+    fs::write(a.join("target/debug/incremental/example-0123/cache"), vec![2; 16 << 20]).unwrap();
+    let held = fs::read_link(a.join("target")).unwrap();
+    let cache = held.join("debug/incremental");
+    let dated = fs::metadata(&cache).unwrap().modified().unwrap();
+    let free = fs::read_link(b.join("target")).unwrap();
+    fs::write(free.join("artifact"), vec![1; 4 << 20]).unwrap();
+    f.pool(&b, roots, &["detach"]);
+    success(
+        f.command(env!("CARGO_BIN_EXE_cargo-pool"), &a)
+            .env("CARGO_POOL_DIR", &f.roots[0])
+            .env("CARGO_POOL_MAX_DISK_PERCENT", limit_with_room(&f.roots[0], -(8 << 20)).to_string())
+            .arg("gc")
+            .output()
+            .unwrap(),
+    );
+    assert_eq!(fs::read_dir(&cache).unwrap().count(), 0, "incremental caches go first");
+    assert_eq!(fs::metadata(&cache).unwrap().modified().unwrap(), dated, "the cache still dates the last compile");
+    assert!(held.join("debug/.fingerprint").exists() && fs::read_link(a.join("target")).unwrap() == held);
+    assert!(free.join("artifact").exists(), "no slot is deleted while caches can make room");
+}
+
+#[test]
+fn eviction_dates_slots_by_their_last_compile() {
+    let f = Fixture::exclusive();
+    let roots = &f.roots[..1];
+    let now = SystemTime::now();
+    let ago = |secs| now - std::time::Duration::from_secs(secs);
+    let worktrees = [f.worktree("x"), f.worktree("y")];
+    for wt in &worktrees {
+        f.pool(wt, roots, &["attach", "--no-seed"]);
+    }
+    let mut targets = vec![];
+    for (wt, deps_age) in worktrees.iter().zip([100, 1000]) {
+        let target = fs::read_link(wt.join("target")).unwrap();
+        fs::write(target.join("artifact"), vec![1; 4 << 20]).unwrap();
+        f.pool(wt, roots, &["detach"]);
+        fs::create_dir_all(target.join("debug/deps")).unwrap();
+        fs::File::open(target.join("debug/deps")).unwrap().set_modified(ago(deps_age)).unwrap();
+        let meta = target.parent().unwrap().join("slot.json");
+        let mut json: serde_json::Value = serde_json::from_slice(&fs::read(&meta).unwrap()).unwrap();
+        json["last_used"] = 0.into();
+        fs::write(meta, serde_json::to_vec(&json).unwrap()).unwrap();
+        targets.push(target);
+    }
+    // y's output dirs look older, but the rustc wrapper last compiled into it after x.
+    let marker = fs::File::create(targets[1].parent().unwrap().join("last-compile")).unwrap();
+    marker.set_modified(ago(10)).unwrap();
+    success(
+        f.command(env!("CARGO_BIN_EXE_cargo-pool"), &f.repo)
+            .env("CARGO_POOL_DIR", &f.roots[0])
+            .env("CARGO_POOL_MAX_DISK_PERCENT", limit_with_room(&f.roots[0], -(2 << 20)).to_string())
+            .arg("gc")
+            .output()
+            .unwrap(),
+    );
+    assert!(!targets[0].exists(), "x was compiled into longest ago");
+    assert!(targets[1].exists());
 }
 
 #[test]
 fn adoption_capacity_excludes_strays_kept_on_the_source_filesystem() {
-    let mut f = Fixture::new();
+    let mut f = Fixture::exclusive();
     if !fs::metadata("/dev/shm").is_ok_and(|m| m.dev() != fs::metadata(&f.dir).unwrap().dev()) {
         return;
     }
@@ -1016,7 +1165,7 @@ fn adoption_retry_removes_abandoned_copy_before_checking_capacity() {
     for (ready, staged, removed) in
         [(false, true, false), (true, true, false), (true, false, false), (false, true, true)]
     {
-        let mut f = Fixture::new();
+        let mut f = Fixture::exclusive();
         if !fs::metadata("/dev/shm").is_ok_and(|m| m.dev() != fs::metadata(&f.dir).unwrap().dev()) {
             return;
         }
@@ -1508,7 +1657,7 @@ fn pressure_can_evict_adopted_slots_after_the_repository_disappears() {
 
 #[test]
 fn pressure_discards_abandoned_partial_copies_before_warm_slots() {
-    let f = Fixture::new();
+    let f = Fixture::exclusive();
     let a = f.worktree("a");
     let b = f.worktree("b");
     f.pool(&a, &f.roots[..1], &["attach", "--no-seed"]);
