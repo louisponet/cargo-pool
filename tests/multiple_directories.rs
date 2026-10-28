@@ -883,6 +883,39 @@ fn disk_pressure_can_evict_the_slot_that_attach_would_reuse() {
 }
 
 #[test]
+fn seeding_never_evicts_a_held_slot() {
+    let f = Fixture::new();
+    let a = f.worktree("a");
+    let b = f.worktree("b");
+    let c = f.worktree("c");
+    for wt in [&a, &c] {
+        f.pool(wt, &f.roots[..1], &["attach", "--no-seed"]);
+        fs::write(wt.join("target/artifact"), vec![1; 8 << 20]).unwrap();
+    }
+    let held = fs::read_link(c.join("target")).unwrap();
+    f.pool(&b, &f.roots[..1], &["attach"]);
+    let path = std::ffi::CString::new(f.roots[0].as_os_str().as_encoded_bytes()).unwrap();
+    let mut st: libc::statvfs = unsafe { std::mem::zeroed() };
+    assert_eq!(unsafe { libc::statvfs(path.as_ptr(), &mut st) }, 0);
+    let used = (st.f_blocks - st.f_bfree) * st.f_frsize;
+    let avail = st.f_bavail * st.f_frsize;
+    // Room for half a copy: it would fit only by deleting another worktree's slot.
+    let limit = 100.0 * (used + (4 << 20)) as f64 / (used + avail) as f64;
+    success(
+        f.command(env!("CARGO_BIN_EXE_cargo-pool"), &b)
+            .env("CARGO_POOL_DIRS", &f.roots[0])
+            .env("CARGO_POOL_MAX_DISK_PERCENT", limit.to_string())
+            .args(["/bin/true", "-vV"])
+            .output()
+            .unwrap(),
+    );
+    assert_eq!(fs::read_link(c.join("target")).unwrap(), held);
+    assert!(held.join("artifact").exists());
+    let target = fs::read_link(b.join("target")).unwrap();
+    assert!(target.is_dir() && !target.join("artifact").exists(), "the slot starts empty");
+}
+
+#[test]
 fn adoption_capacity_excludes_strays_kept_on_the_source_filesystem() {
     let mut f = Fixture::new();
     if !fs::metadata("/dev/shm").is_ok_and(|m| m.dev() != fs::metadata(&f.dir).unwrap().dev()) {

@@ -664,17 +664,25 @@ fn human(bytes: u64) -> String {
     if gb >= 1.0 { format!("{gb:.1}G") } else { format!("{:.0}M", bytes as f64 / (1u64 << 20) as f64) }
 }
 
+/// Which slots `free_disk` may delete.
+#[derive(PartialEq, Clone, Copy)]
+enum Evict {
+    Any,
+    /// Only slots no worktree holds: a warm slot is worth more than a copy of one.
+    Unheld,
+}
+
 /// Delete pooled target dirs on `root`'s filesystem, across configured directories, until disk usage
 /// (plus `extra` bytes about to be written) is below `max_percent`.
 ///
-/// Least recently used slots go first, held or not. A deleted held slot's worktree is
-/// re-attached on its next build. Slots in `protect`, slots being seeded or with a cargo
-/// build running and pools locked by another cargo-pool process are never touched.
+/// Least recently used slots go first; `evict` says whether held ones may go too. A deleted
+/// held slot's worktree is re-attached on its next build. Slots in `protect`, slots being seeded
+/// or with a cargo build running and pools locked by another cargo-pool process are never touched.
 /// Must be called without holding any pool lock. Returns whether the goal was met.
 ///
 /// With `extra` bytes to make room for, nothing is deleted unless they fit once everything
 /// eligible is gone: a copy that can't fit anyway isn't worth a single warm slot.
-fn free_disk(root: &Path, max_percent: f64, extra: u64, protect: &[&Path]) -> Result<bool> {
+fn free_disk(root: &Path, max_percent: f64, extra: u64, protect: &[&Path], evict: Evict) -> Result<bool> {
     fs::create_dir_all(root)?;
     let fits = |freed: u64| disk_percent(root, extra as i64 - freed as i64).map(|p| p < max_percent);
     if fits(0)? {
@@ -702,7 +710,7 @@ fn free_disk(root: &Path, max_percent: f64, extra: u64, protect: &[&Path]) -> Re
                 }
                 let used = s.meta.last_used.max(last_activity(&s.target()));
                 match (s.state(), &s.meta.lease) {
-                    (State::Held, Some(l)) if l.pending => {}
+                    (State::Held, Some(l)) if l.pending || evict == Evict::Unheld => {}
                     (State::Held, Some(l)) => candidates.push((used.max(l.acquired_at), pool.clone(), s)),
                     _ => candidates.push((used, pool.clone(), s)),
                 }
@@ -734,7 +742,7 @@ fn free_disk(root: &Path, max_percent: f64, extra: u64, protect: &[&Path]) -> Re
         let Some(_pool_lock) = FileLock::acquire(&pool.join(".lock"), false)? else { continue };
         // Re-check under the lock, things may have changed since the scan.
         let Some(s) = load_slots(&pool.join("slots"))?.into_iter().find(|s| s.id == candidate.id) else { continue };
-        if s.state() == State::Held && s.meta.lease.as_ref().is_some_and(|l| l.pending) {
+        if s.state() == State::Held && (evict == Evict::Unheld || s.meta.lease.as_ref().is_some_and(|l| l.pending)) {
             continue;
         }
         let Some(_seed_lock) = FileLock::acquire(&s.dir.join("seed.lock"), false)? else { continue };
@@ -915,7 +923,7 @@ fn check_disk_during_build(rustc_args: &[OsString]) -> Result<()> {
     if recent() {
         return Ok(());
     }
-    let ok = free_disk(&root, max_disk, 0, slot_dir.as_deref().as_slice());
+    let ok = free_disk(&root, max_disk, 0, slot_dir.as_deref().as_slice(), Evict::Any);
     fs::write(&marker, now().to_string())?;
     if !ok? {
         eprintln!("cargo-pool: warning: disk is still above {max_disk}% after cleaning up all pools");
@@ -1744,7 +1752,7 @@ fn lease_slot(repo: &Repo, seed: bool, wait_for_build: bool) -> Result<()> {
     }
     let adopting = recovery.as_ref().is_some_and(|s| s.meta.adoption.is_some()) || cargo_output(&link);
     let extra = if cross_device && adopting && !ready { dir_size([&link], &strays) } else { 0 };
-    if !free_disk(repo.pool.parent().unwrap(), max_disk, extra, &[])? {
+    if !free_disk(repo.pool.parent().unwrap(), max_disk, extra, &[], Evict::Any)? {
         if extra > 0 {
             bail!("not enough room below {max_disk}% to attach {}", link.display());
         }
@@ -2171,7 +2179,7 @@ fn seed(repo: &Repo, slot: &Slot, head: &str, sources: Vec<(PathBuf, Option<Stri
         }
         let size = dir_size(parts.iter().map(|p| src.join(p)), &[]);
         let protect: Vec<&Path> = [src.parent(), Some(slot.dir.as_path())].into_iter().flatten().collect();
-        if !free_disk(repo.pool.parent().unwrap(), max_disk, size, &protect)? {
+        if !free_disk(repo.pool.parent().unwrap(), max_disk, size, &protect, Evict::Unheld)? {
             eprintln!(
                 "cargo-pool: copying {} ({}) would push the disk above {max_disk}%, skipping it",
                 src.display(),
@@ -2549,7 +2557,7 @@ fn gc(max_age_days: Option<u64>, dry_run: bool) -> Result<()> {
         let pct = disk_percent(&repo.pool, 0)?;
         if dry_run {
             println!("disk at {pct:.1}% (limit {max_disk}%)");
-        } else if !free_disk(repo.pool.parent().unwrap(), max_disk, 0, &[])? {
+        } else if !free_disk(repo.pool.parent().unwrap(), max_disk, 0, &[], Evict::Any)? {
             eprintln!("cargo-pool: warning: disk is still above {max_disk}% after cleaning up all pools");
         }
     }
