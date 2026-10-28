@@ -38,8 +38,9 @@ Share warm cargo `target/` directories between git worktrees, so a fresh worktre
   not a worktree holds them. A worktree whose slot is deleted loses its `target` link and
   gets a new slot on its next cargo command. Slots with a build running or being seeded
   are never deleted. Once attached, the main checkout's slot follows the same eviction rules.
-  A new slot is only seeded if the copy fits under the limit; otherwise it starts empty,
-  and no slot is deleted for a copy that wouldn't fit anyway.
+  A new slot is only seeded if the copy fits under the limit. Making room for it only
+  deletes slots no worktree holds; if that isn't enough, nothing is deleted and the slot
+  starts empty.
 - Leases end on their own when the worktree is deleted (`git worktree remove`),
   or explicitly with `cargo-pool detach`.
 - `/target` is added to `.git/info/exclude`, because `target/` patterns in `.gitignore`
