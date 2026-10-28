@@ -41,15 +41,17 @@ Share warm cargo `target/` directories between git worktrees, so a fresh worktre
   toolchain has changed. It never runs during a build. If a deleted unit was needed after all,
   cargo rebuilds it.
 - **Disk limit**: if the disk holding the pool is above `maxDiskPercent` (default 90%),
-  pooled target dirs on that filesystem are deleted, across all repos' pools and configured
+  cargo-pool frees space on that filesystem, across all repos' pools and configured
   directories, until usage is back under the limit. This happens on every attach, on every pooled build (with the rustc wrapper
-  installed, see below) and on `gc`. The least recently used slots go first, whether or
-  not a worktree holds them. A worktree whose slot is deleted loses its `target` link and
+  installed, see below) and on `gc`. First it deletes the `incremental/` caches of the least
+  recently used slots: they only speed up rebuilding a crate after an edit, and rustc starts
+  them over. Then it deletes the least recently used slots, whether or not a worktree holds
+  them. A slot counts as used when something is compiled into it or it is released. A worktree whose slot is deleted loses its `target` link and
   gets a new slot on its next cargo command. Slots with a build running or being seeded
-  are never deleted. Once attached, the main checkout's slot follows the same eviction rules.
-  A new slot is only seeded if the copy fits under the limit. Making room for it only
-  deletes slots no worktree holds; if that isn't enough, nothing is deleted and the slot
-  starts empty.
+  are never touched. Once attached, the main checkout's slot follows the same eviction rules.
+  A new slot is only seeded if the copy fits under the limit. Making room for it deletes
+  incremental caches of any slot, then only slots no worktree holds; if that isn't enough,
+  nothing is deleted and the slot starts empty.
 - Leases end on their own when the worktree is deleted (`git worktree remove`),
   or explicitly with `cargo-pool detach`.
 - `/target` is added to `.git/info/exclude`, because `target/` patterns in `.gitignore`
@@ -177,18 +179,21 @@ export CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER=/path/to/main/checkout/scrip
 ## Metrics
 
 Every pool keeps an append-only log, `<pool-directory>/<repo>-<hash>/events.jsonl`, with one
-JSON line per attach, slot preparation (backdating), seed, build, snapshot, prune and evicted slot,
-including how long it took. `cargo pool stats` sums it up:
+JSON line per attach, slot preparation (backdating), seed, build, snapshot, prune, trimmed
+incremental cache and evicted slot, including how long it took. A seed also counts the candidates
+it passed over and why. `cargo pool stats` sums it up:
 
 ```
 cargo-pool-ac7e5f46c861e3b5 (/home/you/cargo-pool/.git): 4 slots, 2 in use, all time
   attached   42 worktrees: 35 to a warm slot, 7 to a new one; 3.1s
   seeded     6 of 7 new slots, 45.2G copied, 80.1G left out; 3m12s
+  skipped    9 seed sources: 7 without room below the disk limit, 2 busy building, 0 failed to copy
   prepared   41 slots: 98112 of 99840 files backdated, 12 units reset; 8.4s
   setup      3m24s in total (attach + seed + prepare)
   built      120 cargo commands, 3412 units compiled; 1h02m
   snapshots  118 in the background; 1m03s
   pruned     2870 units in 52 passes, 61.0G freed; 9.6s
+  trimmed    14 incremental caches, 180.3G freed
   evicted    5 slots, 23.1G freed
 ```
 

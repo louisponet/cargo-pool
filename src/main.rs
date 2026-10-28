@@ -543,6 +543,11 @@ impl Slot {
         self.dir.join("target")
     }
 
+    /// When the slot was last used: released, or compiled into.
+    fn last_used(&self) -> u64 {
+        self.meta.last_used.max(last_compile_ns(&self.dir) / 1_000_000_000)
+    }
+
     fn saved_files(&self, worktree: &Path) -> PathBuf {
         worktree.join("target.cargo-pool-files").join(format!("{:016x}", fnv1a(self.dir.as_os_str().as_encoded_bytes())))
     }
@@ -624,18 +629,22 @@ fn reclaim_stale(slots: &mut [Slot]) -> Result<()> {
 // ---------------------------------------------------------------------------
 // disk pressure
 
-/// Disk usage (in percent, as `df` reports it) of the filesystem holding `path`,
-/// pretending `extra` more bytes had already been written (or freed, if negative).
-fn disk_percent(path: &Path, extra: i64) -> Result<f64> {
+/// Bytes used and bytes available to us on the filesystem holding `path`, as `df` counts them.
+fn disk_usage(path: &Path) -> Result<(i64, i64)> {
     let c = CString::new(path.as_os_str().as_bytes())?;
     let mut st: libc::statvfs = unsafe { std::mem::zeroed() };
     if unsafe { libc::statvfs(c.as_ptr(), &mut st) } != 0 {
         return Err(std::io::Error::last_os_error()).with_context(|| format!("statvfs {}", path.display()));
     }
     let bs = st.f_frsize as i64;
-    let used = (st.f_blocks - st.f_bfree) as i64 * bs + extra;
-    let avail = st.f_bavail as i64 * bs - extra;
-    Ok(100.0 * used as f64 / (used + avail).max(1) as f64)
+    Ok(((st.f_blocks - st.f_bfree) as i64 * bs, st.f_bavail as i64 * bs))
+}
+
+/// Disk usage (in percent, as `df` reports it) of the filesystem holding `path`,
+/// pretending `extra` more bytes had already been written (or freed, if negative).
+fn disk_percent(path: &Path, extra: i64) -> Result<f64> {
+    let (used, avail) = disk_usage(path)?;
+    Ok(100.0 * (used + extra) as f64 / (used + avail).max(1) as f64)
 }
 
 /// Bytes allocated on disk by everything under `roots` (symlinks not followed, hard links once).
@@ -664,7 +673,7 @@ fn human(bytes: u64) -> String {
     if gb >= 1.0 { format!("{gb:.1}G") } else { format!("{:.0}M", bytes as f64 / (1u64 << 20) as f64) }
 }
 
-/// Which slots `free_disk` may delete.
+/// Which slots `free_disk` may delete. Any slot's incremental caches may go first.
 #[derive(PartialEq, Clone, Copy)]
 enum Evict {
     Any,
@@ -672,24 +681,33 @@ enum Evict {
     Unheld,
 }
 
-/// Delete pooled target dirs on `root`'s filesystem, across configured directories, until disk usage
-/// (plus `extra` bytes about to be written) is below `max_percent`.
-///
-/// Least recently used slots go first; `evict` says whether held ones may go too. A deleted
-/// held slot's worktree is re-attached on its next build. Slots in `protect`, slots being seeded
-/// or with a cargo build running and pools locked by another cargo-pool process are never touched.
-/// Must be called without holding any pool lock. Returns whether the goal was met.
-///
-/// With `extra` bytes to make room for, nothing is deleted unless they fit once everything
-/// eligible is gone: a copy that can't fit anyway isn't worth a single warm slot.
-fn free_disk(root: &Path, max_percent: f64, extra: u64, protect: &[&Path], evict: Evict) -> Result<bool> {
-    fs::create_dir_all(root)?;
-    let fits = |freed: u64| disk_percent(root, extra as i64 - freed as i64).map(|p| p < max_percent);
-    if fits(0)? {
-        return Ok(true);
-    }
+/// A slot `free_disk` may take space from: its incremental caches, and the whole slot if `deletable`.
+struct Reclaim {
+    pool: PathBuf,
+    slot: Slot,
+    deletable: bool,
+}
 
-    // (last used, pool, slot)
+/// The `incremental/` caches of a target dir's profiles: they only speed up rebuilding a crate
+/// after an edit, and rustc starts one over if it's gone. Not through a symlink: what it points
+/// to isn't the slot's.
+fn incremental_caches(target: &Path) -> Vec<PathBuf> {
+    profile_dirs(target)
+        .into_iter()
+        .map(|p| p.join("incremental"))
+        .filter(|p| fs::symlink_metadata(p).is_ok_and(|m| m.is_dir()))
+        .collect()
+}
+
+/// What's in the `incremental_caches` of a target dir, one entry per crate.
+fn incremental_entries(target: &Path) -> Vec<PathBuf> {
+    incremental_caches(target).iter().flat_map(fs::read_dir).flatten().flatten().map(|e| e.path()).collect()
+}
+
+/// Slots on `root`'s filesystem, across configured directories, that `free_disk` may take space
+/// from, least recently used first. Discards abandoned partial copies on the way.
+fn reclaim_candidates(root: &Path, protect: &[&Path], evict: Evict) -> Result<Vec<Reclaim>> {
+    // (last used, candidate)
     let mut candidates = vec![];
     let device = fs::metadata(root)?.dev();
     for directory in pool_roots()? {
@@ -708,45 +726,123 @@ fn free_disk(root: &Path, max_percent: f64, extra: u64, protect: &[&Path], evict
                 {
                     current.discard_partial_copy()?;
                 }
-                let used = s.meta.last_used.max(last_activity(&s.target()));
-                match (s.state(), &s.meta.lease) {
-                    (State::Held, Some(l)) if l.pending || evict == Evict::Unheld => {}
-                    (State::Held, Some(l)) => candidates.push((used.max(l.acquired_at), pool.clone(), s)),
-                    _ => candidates.push((used, pool.clone(), s)),
-                }
+                let used = s.last_used();
+                let (used, deletable) = match (s.state(), &s.meta.lease) {
+                    (State::Held, Some(l)) if l.pending => continue,
+                    (State::Held, Some(l)) => (used.max(l.acquired_at), evict == Evict::Any),
+                    _ => (used, true),
+                };
+                candidates.push((used, Reclaim { pool: pool.clone(), slot: s, deletable }));
             }
         }
     }
-    candidates.sort_by_key(|(used, ..)| *used);
+    candidates.sort_by_key(|(used, _)| *used);
+    Ok(candidates.into_iter().map(|(_, c)| c).collect())
+}
+
+/// Lock a candidate against attaches, seeds and builds, and reload it: things may have changed
+/// since the scan. None if one of those holds it, or it's gone or attaching.
+fn lock_candidate(c: &Reclaim) -> Result<Option<(Slot, Vec<FileLock>)>> {
+    let Some(pool_lock) = FileLock::acquire(&c.pool.join(".lock"), false)? else { return Ok(None) };
+    let Some(s) = load_slots(&c.pool.join("slots"))?.into_iter().find(|s| s.id == c.slot.id) else { return Ok(None) };
+    if s.state() == State::Held && s.meta.lease.as_ref().is_some_and(|l| l.pending) {
+        return Ok(None);
+    }
+    let Some(seed_lock) = FileLock::acquire(&s.dir.join("seed.lock"), false).ok().flatten() else { return Ok(None) };
+    let Some(mut locks) = lock_target(&s.target(), false) else { return Ok(None) };
+    locks.extend([seed_lock, pool_lock]);
+    Ok(Some((s, locks)))
+}
+
+/// Bytes `free_disk` could take from `candidates` right now, in its order, counted until `enough`
+/// says so: every incremental cache, then every deletable slot.
+fn reclaimable(candidates: &[Reclaim], mut enough: impl FnMut(u64) -> Result<bool>) -> Result<u64> {
+    let mut freed = 0;
+    let mut caches = vec![0; candidates.len()];
+    // The probe lets its locks go before the walk, which would otherwise stall a build starting
+    // in the slot.
+    for (c, cache) in candidates.iter().zip(&mut caches) {
+        if enough(freed)? {
+            return Ok(freed);
+        }
+        if lock_candidate(c)?.is_some() {
+            *cache = dir_size(incremental_entries(&c.slot.target()), &[]);
+            freed += *cache;
+        }
+    }
+    for (c, cache) in candidates.iter().zip(caches).filter(|(c, _)| c.deletable) {
+        if enough(freed)? {
+            return Ok(freed);
+        }
+        if lock_candidate(c)?.is_some() {
+            freed += dir_size([&c.slot.dir], &[]).saturating_sub(cache);
+        }
+    }
+    Ok(freed)
+}
+
+/// Free space on `root`'s filesystem, across configured directories, until disk usage (plus
+/// `extra` bytes about to be written) is below `max_percent`.
+///
+/// The incremental caches of the least recently used slots go first: losing one costs a worktree
+/// a slower rebuild of the next crate it edits, while losing a slot costs a reseed or a full
+/// build. Then whole slots go, least recently used first; `evict` says whether held ones may go
+/// too. A deleted held slot's worktree is re-attached on its next build. Slots in `protect`,
+/// slots being attached, seeded or built and pools locked by another cargo-pool process are
+/// never touched. Must be called without holding any pool lock. Returns whether the goal was met.
+///
+/// With `extra` bytes to make room for, nothing is deleted unless they fit once everything
+/// eligible is gone: a copy that can't fit anyway isn't worth a single warm slot.
+fn free_disk(root: &Path, max_percent: f64, extra: u64, protect: &[&Path], evict: Evict) -> Result<bool> {
+    fs::create_dir_all(root)?;
+    let fits = |freed: u64| disk_percent(root, extra as i64 - freed as i64).map(|p| p < max_percent);
     if fits(0)? {
         return Ok(true);
     }
-    if extra > 0 {
-        // Only count what the loop below could delete: probe its locks, and let them go again
-        // before the walk, which would otherwise stall a build starting in that slot.
-        let (mut freed, mut rest) = (0, candidates.iter());
-        while !fits(freed)? {
-            let Some((_, pool, s)) = rest.next() else { return Ok(false) };
-            let pool_lock = FileLock::acquire(&pool.join(".lock"), false)?;
-            let evictable = pool_lock.is_some()
-                && FileLock::acquire(&s.dir.join("seed.lock"), false).ok().flatten().is_some()
-                && lock_target(&s.target(), false).is_some();
-            drop(pool_lock);
-            if evictable {
-                freed += dir_size([&s.dir], &[]);
+    let candidates = reclaim_candidates(root, protect, evict)?;
+    if fits(0)? {
+        return Ok(true);
+    }
+    if extra > 0 && !fits(reclaimable(&candidates, &fits)?)? {
+        return Ok(false);
+    }
+
+    for c in &candidates {
+        let Some((s, _locks)) = lock_candidate(c)? else { continue };
+        let size = dir_size(incremental_entries(&s.target()), &[]);
+        if size == 0 {
+            continue;
+        }
+        // Empty each cache but keep it with its mtime: it dates the slot's last compile, and
+        // cargo would recreate a missing one on its next command, compiling or not.
+        for cache in incremental_caches(&s.target()) {
+            let mtime = fs::metadata(&cache)?.modified()?;
+            for e in fs::read_dir(&cache)?.flatten() {
+                if e.file_type()?.is_dir() {
+                    fs::remove_dir_all(e.path())?;
+                } else {
+                    fs::remove_file(e.path())?;
+                }
             }
+            File::open(&cache)?.set_modified(mtime)?;
+        }
+        record(&s.dir, Event::Trim { bytes: size });
+        eprintln!(
+            "cargo-pool: disk above {max_percent}%: deleted the incremental caches of slot {} of {} ({})",
+            s.id,
+            c.pool.file_name().unwrap_or_default().to_string_lossy(),
+            human(size)
+        );
+        if fits(0)? {
+            return Ok(true);
         }
     }
 
-    for (_, pool, candidate) in candidates {
-        let Some(_pool_lock) = FileLock::acquire(&pool.join(".lock"), false)? else { continue };
-        // Re-check under the lock, things may have changed since the scan.
-        let Some(s) = load_slots(&pool.join("slots"))?.into_iter().find(|s| s.id == candidate.id) else { continue };
-        if s.state() == State::Held && (evict == Evict::Unheld || s.meta.lease.as_ref().is_some_and(|l| l.pending)) {
+    for c in candidates.iter().filter(|c| c.deletable) {
+        let Some((s, _locks)) = lock_candidate(c)? else { continue };
+        if s.state() == State::Held && evict == Evict::Unheld {
             continue;
         }
-        let Some(_seed_lock) = FileLock::acquire(&s.dir.join("seed.lock"), false)? else { continue };
-        let Some(_build_locks) = lock_target(&s.target(), false) else { continue };
         let mut from = String::new();
         if let (State::Held, Some(l)) = (s.state(), &s.meta.lease) {
             let link = l.worktree.join("target");
@@ -765,7 +861,7 @@ fn free_disk(root: &Path, max_percent: f64, extra: u64, protect: &[&Path], evict
         eprintln!(
             "cargo-pool: disk above {max_percent}%: deleted slot {} of {} ({}{from})",
             s.id,
-            pool.file_name().unwrap_or_default().to_string_lossy(),
+            c.pool.file_name().unwrap_or_default().to_string_lossy(),
             human(size)
         );
         if fits(0)? {
@@ -1632,11 +1728,19 @@ enum Event {
     /// A warm slot was fitted to its new worktree: backdating and fingerprint resets.
     Prepare { backdated: u64, files: u64, reset: u64, ms: u64 },
     /// A new slot was filled on its first cargo command; `bytes` is None if nothing was copied.
-    /// `left_out` is the size of the units its worktree can't use at its Cargo.lock.
+    /// `left_out` is the size of the units its worktree can't use at its Cargo.lock. The counts are
+    /// the candidates passed over: a build was running in them, their copy wouldn't fit below the
+    /// disk limit, or it failed.
     Seed {
         bytes: Option<u64>,
         #[serde(default)]
         left_out: u64,
+        #[serde(default)]
+        busy: u64,
+        #[serde(default)]
+        no_room: u64,
+        #[serde(default)]
+        failed: u64,
         ms: u64,
     },
     /// A cargo command compiled into the slot: from its first compile until it released the build lock.
@@ -1645,6 +1749,8 @@ enum Event {
     Snapshot { files: u64, ms: u64 },
     /// Slot deleted to free disk space, or by `gc --max-age-days`.
     Evict { bytes: u64 },
+    /// The slot's incremental caches were deleted to free disk space.
+    Trim { bytes: u64 },
     /// Build units the slot's worktree can't use at its Cargo.lock and toolchain were deleted, freeing `bytes`.
     Prune { units: u64, bytes: u64, ms: u64 },
 }
@@ -2512,7 +2618,7 @@ fn seed_plan(src: &Path, lock: Option<&Lockfile>, rustc: Option<u64>) -> SeedPla
 fn seed(repo: &Repo, slot: &Slot, head: &str, sources: Vec<(PathBuf, Option<String>)>) -> Result<Option<String>> {
     let mut ranked: Vec<_> = sources
         .into_iter()
-        .map(|(t, h)| (distance(&repo.worktree, h.as_deref(), head), last_activity(&t), t, h))
+        .map(|(t, h)| (distance(&repo.worktree, h.as_deref(), head), t.parent().map_or(0, last_compile_ns), t, h))
         .collect();
     ranked.sort_by_key(|(d, act, ..)| (*d, u64::MAX - act));
     let begun = Instant::now();
@@ -2523,7 +2629,17 @@ fn seed(repo: &Repo, slot: &Slot, head: &str, sources: Vec<(PathBuf, Option<Stri
     let _ = fs::remove_dir_all(&tmp);
     let lock = Lockfile::read(&repo.worktree);
     let toolchain = toolchain_hash(&repo.worktree);
+    let root = repo.pool.parent().unwrap();
+    // What a copy may take below the limit once free_disk has freed all it may for a seed, worked
+    // out when the first copy doesn't fit: bigger candidates aren't worth another scan, and none
+    // is worth sizing if there's no room at all.
+    let mut disk_room: Option<i64> = None;
+    let (mut busy, mut no_room, mut failed) = (0, 0, 0);
     for (d, _, src, h) in ranked {
+        if disk_room.is_some_and(|r| r <= 0) {
+            no_room += 1;
+            continue;
+        }
         // The receiver hasn't built yet: its compiler is the source slot's if their toolchain
         // files match. The main checkout's target has no stamp.
         let from_main = repo.main_worktree.as_ref().is_some_and(|m| src == m.join("target"));
@@ -2540,18 +2656,26 @@ fn seed(repo: &Repo, slot: &Slot, head: &str, sources: Vec<(PathBuf, Option<Stri
         }
         let size = dir_size(plan.parts.iter().map(|p| src.join(p)), &[]);
         let protect: Vec<&Path> = [src.parent(), Some(slot.dir.as_path())].into_iter().flatten().collect();
-        if !free_disk(repo.pool.parent().unwrap(), max_disk, size, &protect, Evict::Unheld)? {
+        if disk_room.is_some_and(|r| size as i64 > r) || !free_disk(root, max_disk, size, &protect, Evict::Unheld)? {
             eprintln!(
                 "cargo-pool: copying {} ({}) would push the disk above {max_disk}%, skipping it",
                 src.display(),
                 human(size)
             );
+            if disk_room.is_none() {
+                let (used, avail) = disk_usage(root)?;
+                let below_limit = ((used + avail) as f64 * max_disk / 100.0) as i64 - used;
+                let candidates = reclaim_candidates(root, &[&slot.dir], Evict::Unheld)?;
+                disk_room = Some(below_limit + reclaimable(&candidates, |_| Ok(false))? as i64);
+            }
+            no_room += 1;
             continue;
         }
         // Hold cargo's build locks so the source isn't modified mid-copy, and copy what's
         // there now: a build may have run since it was sized.
         let Some(_locks) = lock_target(&src, false) else {
             eprintln!("cargo-pool: {} is busy building, trying next candidate", src.display());
+            busy += 1;
             continue;
         };
         let plan = seed_plan(&src, lock.as_ref(), rustc);
@@ -2590,6 +2714,7 @@ fn seed(repo: &Repo, slot: &Slot, head: &str, sources: Vec<(PathBuf, Option<Stri
         if !copied {
             let _ = fs::remove_dir_all(&tmp);
             eprintln!("cargo-pool: copy failed, trying next candidate");
+            failed += 1;
             continue;
         }
         // Filling a directory entry by entry gives it a new mtime, which would count as a
@@ -2627,11 +2752,11 @@ fn seed(repo: &Repo, slot: &Slot, head: &str, sources: Vec<(PathBuf, Option<Stri
                 human(left_out)
             );
         }
-        record(&slot.dir, Event::Seed { bytes: Some(size), left_out, ms: ms_since(begun) });
+        record(&slot.dir, Event::Seed { bytes: Some(size), left_out, busy, no_room, failed, ms: ms_since(begun) });
         return Ok(h);
     }
     eprintln!("cargo-pool: no seed available, slot {} starts empty", slot.id);
-    record(&slot.dir, Event::Seed { bytes: None, left_out: 0, ms: ms_since(begun) });
+    record(&slot.dir, Event::Seed { bytes: None, left_out: 0, busy, no_room, failed, ms: ms_since(begun) });
     Ok(None)
 }
 
@@ -2787,7 +2912,7 @@ fn status(size: bool) -> Result<()> {
                 "  slot {:<3} {state}\n           commit {} {dist}, last build {}{size}",
                 s.id,
                 built.map_or("?", short),
-                ago(last_activity(&s.target()).max(s.meta.last_used)),
+                ago(s.last_used()),
             );
         }
     }
@@ -2811,12 +2936,17 @@ struct Totals {
     seeded: u64,
     seed_bytes: u64,
     seed_left_out: u64,
+    seed_busy: u64,
+    seed_no_room: u64,
+    seed_failed: u64,
     seed_ms: u64,
     builds: u64,
     units: u64,
     build_ms: u64,
     snapshots: u64,
     snapshot_ms: u64,
+    trims: u64,
+    trimmed_bytes: u64,
     evictions: u64,
     evicted_bytes: u64,
     prunes: u64,
@@ -2860,11 +2990,14 @@ fn stats(days: Option<u64>) -> Result<()> {
                         t.reset += reset;
                         t.prepare_ms += ms;
                     }
-                    Event::Seed { bytes, left_out, ms } => {
+                    Event::Seed { bytes, left_out, busy, no_room, failed, ms } => {
                         t.seeds += 1;
                         t.seeded += bytes.is_some() as u64;
                         t.seed_bytes += bytes.unwrap_or(0);
                         t.seed_left_out += left_out;
+                        t.seed_busy += busy;
+                        t.seed_no_room += no_room;
+                        t.seed_failed += failed;
                         t.seed_ms += ms;
                     }
                     Event::Build { units, ms } => {
@@ -2875,6 +3008,10 @@ fn stats(days: Option<u64>) -> Result<()> {
                     Event::Snapshot { ms, .. } => {
                         t.snapshots += 1;
                         t.snapshot_ms += ms;
+                    }
+                    Event::Trim { bytes } => {
+                        t.trims += 1;
+                        t.trimmed_bytes += bytes;
                     }
                     Event::Evict { bytes } => {
                         t.evictions += 1;
@@ -2912,6 +3049,13 @@ fn stats(days: Option<u64>) -> Result<()> {
             dur(t.seed_ms)
         );
         println!(
+            "  skipped    {} seed sources: {} without room below the disk limit, {} busy building, {} failed to copy",
+            t.seed_no_room + t.seed_busy + t.seed_failed,
+            t.seed_no_room,
+            t.seed_busy,
+            t.seed_failed
+        );
+        println!(
             "  prepared   {} slots: {} of {} files backdated, {} units reset; {}",
             t.prepares,
             t.backdated,
@@ -2929,6 +3073,7 @@ fn stats(days: Option<u64>) -> Result<()> {
             human(t.pruned_bytes),
             dur(t.prune_ms)
         );
+        println!("  trimmed    {} incremental caches, {} freed", t.trims, human(t.trimmed_bytes));
         println!("  evicted    {} slots, {} freed", t.evictions, human(t.evicted_bytes));
     }
     Ok(())
@@ -2955,7 +3100,7 @@ fn gc(max_age_days: Option<u64>, dry_run: bool) -> Result<()> {
         let cutoff = max_age_days.map_or(0, |d| now().saturating_sub(d * 86400));
         let removed: BTreeMap<_, _> = slots
             .iter()
-            .filter(|s| s.state() != State::Held && s.meta.last_used.max(last_activity(&s.target())) < cutoff)
+            .filter(|s| s.state() != State::Held && s.last_used() < cutoff)
             .map(|s| (s.id, s.dir.clone()))
             .collect();
         for (id, dir) in &removed {
