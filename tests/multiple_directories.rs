@@ -171,6 +171,39 @@ fn seeds_from_another_directory_and_tracks_builds_there() {
 }
 
 #[test]
+fn seeds_only_units_the_receiving_lockfile_can_use() {
+    let f = Fixture::new();
+    let roots = &f.roots[..1];
+    let a = f.worktree("a");
+    let b = f.worktree("b");
+    f.pool(&a, roots, &["attach", "--no-seed"]);
+    let lock = |version: &str| format!("version = 4\n\n[[package]]\nname = \"serde\"\nversion = \"{version}\"\n");
+    fs::write(a.join("Cargo.lock"), lock("1.0.1")).unwrap();
+    fs::write(b.join("Cargo.lock"), lock("1.0.2")).unwrap();
+    let debug = a.join("target/debug");
+    for (hash, version) in [("1111111111111111", "1.0.1"), ("2222222222222222", "1.0.2")] {
+        let fingerprint = debug.join(format!(".fingerprint/serde-{hash}"));
+        fs::create_dir_all(&fingerprint).unwrap();
+        fs::create_dir_all(debug.join("deps")).unwrap();
+        fs::write(fingerprint.join("lib-serde.json"), "{\"deps\":[]}").unwrap();
+        fs::write(debug.join(format!("deps/libserde-{hash}.rlib")), "").unwrap();
+        fs::write(
+            debug.join(format!("deps/serde-{hash}.d")),
+            format!("/t/libserde-{hash}.rmeta: /c/registry/src/index.crates.io-0123/serde-{version}/src/lib.rs\n"),
+        )
+        .unwrap();
+    }
+    f.pool(&b, roots, &["attach"]);
+    f.pool(&b, roots, &["/bin/true", "-vV"]);
+    let target = fs::read_link(b.join("target")).unwrap();
+    assert!(target.join("debug/.fingerprint/serde-2222222222222222").exists());
+    assert!(target.join("debug/deps/libserde-2222222222222222.rlib").exists());
+    assert!(!target.join("debug/.fingerprint/serde-1111111111111111").exists());
+    assert!(!target.join("debug/deps/libserde-1111111111111111.rlib").exists());
+    assert!(debug.join("deps/libserde-1111111111111111.rlib").exists(), "the source keeps its units");
+}
+
+#[test]
 fn global_directories_and_legacy_environment_override() {
     let f = Fixture::new();
     let a = f.worktree("a");

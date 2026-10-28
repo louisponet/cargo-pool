@@ -7,10 +7,10 @@
 //! same cargo build lock. Leases are released explicitly with `detach`, or
 //! implicitly when the worktree disappears (e.g. `git worktree remove`).
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::ffi::{CString, OsString};
 use std::fs::{self, File, OpenOptions};
-use std::io::{Read, Write};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::os::fd::AsRawFd;
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{MetadataExt, symlink};
@@ -1210,33 +1210,345 @@ fn invalidate_foreign_git_inputs(repo: &Repo, target: &Path) -> Result<usize> {
             }
         })
     };
-    let mut fingerprint_dirs = vec![];
-    let mut stack = vec![(target.to_path_buf(), 0)];
-    while let Some((dir, depth)) = stack.pop() {
-        for e in fs::read_dir(&dir).into_iter().flatten().flatten() {
-            if !e.file_type().is_ok_and(|t| t.is_dir()) {
-                continue;
-            }
-            if e.file_name() == ".fingerprint" {
-                fingerprint_dirs.push(e.path());
-            } else if depth < 2 {
-                stack.push((e.path(), depth + 1));
-            }
-        }
-    }
     let mut reset = 0;
-    for unit in fingerprint_dirs.iter().flat_map(|d| fs::read_dir(d).into_iter().flatten().flatten()) {
-        let foreign = fs::read_dir(unit.path())
+    for (_, fingerprint, _) in profile_dirs(target).iter().flat_map(|d| profile_units(d)) {
+        let foreign = fs::read_dir(&fingerprint)
             .into_iter()
             .flatten()
             .flatten()
             .any(|f| fs::read(f.path()).is_ok_and(|b| refers_elsewhere(&b)));
         if foreign {
-            fs::remove_dir_all(unit.path())?;
+            fs::remove_dir_all(&fingerprint)?;
             reset += 1;
         }
     }
     Ok(reset)
+}
+
+/// A cargo profile dir: one with a `.fingerprint` (classic layout) or `build` (both layouts).
+fn is_profile(dir: &Path) -> bool {
+    dir.join(".fingerprint").is_dir() || dir.join("build").is_dir()
+}
+
+/// Cargo's profile dirs in a target dir (`<profile>` and `<triple>/<profile>`).
+fn profile_dirs(target: &Path) -> Vec<PathBuf> {
+    let mut out = vec![];
+    let mut stack = vec![(target.to_path_buf(), 0)];
+    while let Some((dir, depth)) = stack.pop() {
+        if is_profile(&dir) {
+            out.push(dir);
+            continue;
+        }
+        if depth < 2 {
+            for e in fs::read_dir(&dir).into_iter().flatten().flatten() {
+                if e.file_type().is_ok_and(|t| t.is_dir()) {
+                    stack.push((e.path(), depth + 1));
+                }
+            }
+        }
+    }
+    out
+}
+
+/// A profile dir's build units as (hash, fingerprint dir, unit dir in the new layout): classic
+/// `.fingerprint/<pkg>-<h>/`, and `build/<pkg>/<h>/fingerprint/` in cargo's new build-dir layout,
+/// where `build/<pkg>/<h>/` holds all of the unit.
+fn profile_units(profile: &Path) -> Vec<(Option<String>, PathBuf, Option<PathBuf>)> {
+    let mut out = vec![];
+    for e in fs::read_dir(profile.join(".fingerprint")).into_iter().flatten().flatten() {
+        out.push((e.file_name().to_str().and_then(unit_hash).map(str::to_string), e.path(), None));
+    }
+    for pkg in fs::read_dir(profile.join("build")).into_iter().flatten().flatten() {
+        // Classic `build/<pkg>-<h>/` dirs belong to units in `.fingerprint/`.
+        if pkg.file_name().to_str().is_none_or(|n| unit_hash(n).is_some()) {
+            continue;
+        }
+        for e in fs::read_dir(pkg.path()).into_iter().flatten().flatten() {
+            if let Some(hash) = e.file_name().to_str().filter(|n| is_hash(n)) {
+                out.push((Some(hash.to_string()), e.path().join("fingerprint"), Some(e.path())));
+            }
+        }
+    }
+    out
+}
+
+/// What a worktree's Cargo.lock pins, and a hash of it to tell whether a slot was pruned for it.
+struct Lockfile {
+    hash: String,
+    /// `<name>-<version>` of every package: a registry package's source dir name.
+    packages: HashSet<String>,
+    /// Commits of git packages.
+    commits: Vec<String>,
+}
+
+/// Where a build unit's crate came from.
+enum Origin {
+    /// `<name>-<version>`.
+    Registry(String),
+    /// Abbreviated commit.
+    Git(String),
+}
+
+impl Lockfile {
+    /// None without a readable Cargo.lock: then nothing is pruned.
+    fn read(worktree: &Path) -> Option<Lockfile> {
+        #[derive(Deserialize)]
+        struct Raw {
+            #[serde(default)]
+            package: Vec<Package>,
+        }
+        #[derive(Deserialize)]
+        struct Package {
+            name: String,
+            version: String,
+            source: Option<String>,
+        }
+        let bytes = fs::read(worktree.join("Cargo.lock")).ok()?;
+        let raw: Raw = toml::from_str(std::str::from_utf8(&bytes).ok()?).ok()?;
+        Some(Lockfile {
+            hash: format!("{:016x}", fnv1a(&bytes)),
+            commits: raw
+                .package
+                .iter()
+                .filter_map(|p| Some(p.source.as_ref()?.strip_prefix("git+")?.rsplit_once('#')?.1.to_string()))
+                .collect(),
+            packages: raw.package.into_iter().map(|p| format!("{}-{}", p.name, p.version)).collect(),
+        })
+    }
+
+    fn pins(&self, origin: &Origin) -> bool {
+        match origin {
+            Origin::Registry(package) => self.packages.contains(package),
+            Origin::Git(rev) => self.commits.iter().any(|c| c.starts_with(rev.as_str())),
+        }
+    }
+}
+
+/// A hash of the worktree's toolchain file: worktrees with the same one build with the same compiler.
+fn toolchain_hash(worktree: &Path) -> String {
+    let bytes = ["rust-toolchain.toml", "rust-toolchain"].iter().find_map(|f| fs::read(worktree.join(f)).ok());
+    format!("{:016x}", fnv1a(&bytes.unwrap_or_default()))
+}
+
+/// What a slot was last pruned for, in `<slot>/pruned-for` as `<lock hash> <toolchain hash> <rustc>`:
+/// the hashes of its worktree's Cargo.lock and toolchain file, and the `rustc` fingerprint of the
+/// compiler whose units were kept, or `-` if units of every compiler were kept.
+#[derive(PartialEq)]
+struct Stamp {
+    lock: String,
+    toolchain: String,
+    rustc: Option<u64>,
+}
+
+impl Stamp {
+    fn read(slot_dir: &Path) -> Option<Stamp> {
+        let text = fs::read_to_string(slot_dir.join("pruned-for")).ok()?;
+        let mut words = text.split_whitespace();
+        let (lock, toolchain, rustc) = (words.next()?, words.next()?, words.next()?);
+        Some(Stamp { lock: lock.to_string(), toolchain: toolchain.to_string(), rustc: rustc.parse().ok() })
+    }
+
+    fn write(&self, slot_dir: &Path) -> Result<()> {
+        let rustc = self.rustc.map_or("-".to_string(), |r| r.to_string());
+        fs::write(slot_dir.join("pruned-for"), format!("{} {} {rustc}\n", self.lock, self.toolchain))?;
+        Ok(())
+    }
+}
+
+/// The origin of a compiled unit, from the first source in its dep-info (`<output>: <src> ...`):
+/// `/registry/src/<index>/<name>-<version>/...` or `/git/checkouts/<repo>/<rev>/...`.
+fn origin(dep_info: &Path) -> Option<Origin> {
+    let mut line = vec![];
+    BufReader::new(File::open(dep_info).ok()?).read_until(b'\n', &mut line).ok()?;
+    let line = String::from_utf8_lossy(&line);
+    let (_, sources) = line.split_once(": ")?;
+    // Spaces inside paths are escaped.
+    let end = sources.as_bytes().windows(2).position(|w| w[0] != b'\\' && w[1] == b' ').map_or(sources.len(), |i| i + 1);
+    let first = &sources[..end];
+    if let Some((_, rest)) = first.split_once("/registry/src/") {
+        return Some(Origin::Registry(rest.split('/').nth(1)?.to_string()));
+    }
+    let (_, rest) = first.split_once("/git/checkouts/")?;
+    Some(Origin::Git(rest.split('/').nth(1)?.to_string()))
+}
+
+fn is_hash(s: &str) -> bool {
+    s.len() == 16 && s.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+}
+
+/// The `<h>` of a unit's entry, named `<name>-<h>` or `<name>-<h>.<ext>` with 16 hex digits.
+fn unit_hash(name: &str) -> Option<&str> {
+    name.match_indices('-').rev().find_map(|(i, _)| {
+        let h = name.get(i + 1..i + 17)?;
+        let rest = &name[i + 17..];
+        (is_hash(h) && (rest.is_empty() || rest.starts_with('.'))).then_some(h)
+    })
+}
+
+/// What pruning reads from a unit's fingerprint JSON (`<kind>-<target>.json`).
+#[derive(Deserialize)]
+struct Fingerprint {
+    /// Hash of the compiler that built the unit.
+    rustc: Option<u64>,
+    /// (package id, name, public, fingerprint)
+    deps: Vec<(u64, String, bool, u64)>,
+}
+
+/// Build units in `target` that a worktree at `lock` can't use: built from a crate version or git
+/// revision it doesn't pin, by another compiler than `rustc` (if known), never finished (no
+/// fingerprint JSON), or depending on such a unit. Returns their number and the paths to delete:
+/// classic units' entries in `.fingerprint/`, `deps/`, `build/` and `examples/`, and new-layout
+/// units' `build/<pkg>/<h>/` dirs, or `build/<pkg>/` if none of its units stay.
+fn unusable_units(target: &Path, lock: &Lockfile, rustc: Option<u64>) -> (usize, Vec<PathBuf>) {
+    struct Unit {
+        profile: usize,
+        hash: String,
+        dir: Option<PathBuf>,
+        deps: Vec<u64>,
+        dead: bool,
+    }
+    let profiles = profile_dirs(target);
+    let mut units = vec![];
+    // Units depend on each other by fingerprint, across profile dirs (build scripts and proc
+    // macros are built for the host) and layouts.
+    let mut by_fingerprint = HashMap::new();
+    for (p, profile) in profiles.iter().enumerate() {
+        let mut origins = HashMap::new();
+        let build_dirs = fs::read_dir(profile.join("build"))
+            .into_iter()
+            .flatten()
+            .flatten()
+            .filter(|e| e.file_name().to_str().and_then(unit_hash).is_some())
+            .map(|e| e.path());
+        for dir in std::iter::once(profile.join("deps")).chain(build_dirs) {
+            for e in fs::read_dir(&dir).into_iter().flatten().flatten() {
+                let name = e.file_name();
+                if let Some(hash) = name.to_str().filter(|n| n.ends_with(".d")).and_then(unit_hash)
+                    && let Some(origin) = origin(&e.path())
+                {
+                    origins.insert(hash.to_string(), origin);
+                }
+            }
+        }
+        for (hash, fingerprint, dir) in profile_units(profile) {
+            let Some(hash) = hash else { continue };
+            let (mut deps, mut finished, mut foreign) = (vec![], false, false);
+            for f in fs::read_dir(&fingerprint).into_iter().flatten().flatten() {
+                let path = f.path();
+                if path.extension().is_none_or(|x| x != "json") {
+                    continue;
+                }
+                finished = true;
+                if let Some(json) = fs::read(&path).ok().and_then(|b| serde_json::from_slice::<Fingerprint>(&b).ok()) {
+                    deps.extend(json.deps.iter().map(|d| d.3));
+                    foreign |= rustc.is_some() && json.rustc.is_some() && json.rustc != rustc;
+                }
+                // The unit's own fingerprint: the u64's little-endian bytes in hex.
+                if let Some(fp) = fs::read_to_string(path.with_extension("")).ok().and_then(|s| u64::from_str_radix(s.trim(), 16).ok()) {
+                    by_fingerprint.insert(fp.swap_bytes(), units.len());
+                }
+            }
+            // A new-layout unit's `out/` is a build script's OUT_DIR for run units: only its own
+            // dep-info counts.
+            let source = match &dir {
+                None => origins.remove(&hash),
+                Some(dir) => fs::read_dir(dir.join("out")).into_iter().flatten().flatten().find_map(|e| {
+                    let name = e.file_name();
+                    let own = name.to_str().filter(|n| n.ends_with(".d")).and_then(unit_hash) == Some(hash.as_str());
+                    own.then(|| origin(&e.path())).flatten()
+                }),
+            };
+            let dead = !finished || foreign || source.is_some_and(|o| !lock.pins(&o));
+            units.push(Unit { profile: p, hash, dir, deps, dead });
+        }
+    }
+    let mut changed = true;
+    while changed {
+        changed = false;
+        for i in 0..units.len() {
+            if !units[i].dead && units[i].deps.iter().any(|f| by_fingerprint.get(f).is_some_and(|&j| units[j].dead)) {
+                units[i].dead = true;
+                changed = true;
+            }
+        }
+    }
+    let mut dead = vec![HashSet::new(); profiles.len()];
+    let mut dead_in_pkg: HashMap<&Path, Vec<&Path>> = HashMap::new();
+    for u in units.iter().filter(|u| u.dead) {
+        match &u.dir {
+            None => {
+                dead[u.profile].insert(u.hash.as_str());
+            }
+            Some(dir) => dead_in_pkg.entry(dir.parent().unwrap()).or_default().push(dir),
+        }
+    }
+    let mut entries = vec![];
+    for (profile, dead) in profiles.iter().zip(&dead).filter(|(_, d)| !d.is_empty()) {
+        for sub in [".fingerprint", "deps", "build", "examples"] {
+            for e in fs::read_dir(profile.join(sub)).into_iter().flatten().flatten() {
+                if e.file_name().to_str().and_then(unit_hash).is_some_and(|h| dead.contains(h)) {
+                    entries.push(e.path());
+                }
+            }
+        }
+    }
+    for (pkg, dirs) in dead_in_pkg {
+        if fs::read_dir(pkg).is_ok_and(|d| d.count() == dirs.len()) {
+            entries.push(pkg.to_path_buf());
+        } else {
+            entries.extend(dirs.into_iter().map(Path::to_path_buf));
+        }
+    }
+    (units.iter().filter(|u| u.dead).count(), entries)
+}
+
+/// The `rustc` of the newest fingerprint JSON in `target`: the compiler that last built into it.
+fn last_rustc(target: &Path) -> Option<u64> {
+    let newest = profile_dirs(target)
+        .iter()
+        .flat_map(|p| profile_units(p))
+        .flat_map(|(_, fingerprint, _)| fs::read_dir(fingerprint).into_iter().flatten().flatten())
+        .filter(|f| f.path().extension().is_some_and(|x| x == "json"))
+        .max_by_key(|f| f.metadata().map_or(0, |m| modified_ns(&m)))?;
+    serde_json::from_slice::<Fingerprint>(&fs::read(newest.path()).ok()?).ok()?.rustc
+}
+
+/// Delete the slot's build units that `worktree` can't use: see `unusable_units`. If the worktree
+/// `just_built` into the slot, its compiler is the one of the newest fingerprint. Before its first
+/// build, it's the one in the slot's stamp if that is for the same toolchain file, and unknown
+/// otherwise. Skipped while a build runs, and if the slot was already pruned for the same
+/// Cargo.lock, toolchain file and compiler: everything built since then was built for them.
+fn prune(worktree: &Path, slot_dir: &Path, just_built: bool) -> Result<()> {
+    let Some(lock) = Lockfile::read(worktree) else { return Ok(()) };
+    let target = slot_dir.join("target");
+    let old = Stamp::read(slot_dir);
+    let toolchain = toolchain_hash(worktree);
+    let rustc = match &old {
+        _ if just_built => last_rustc(&target),
+        Some(s) if s.toolchain == toolchain => s.rustc,
+        _ => None,
+    };
+    let stamp = Stamp { lock: lock.hash.clone(), toolchain, rustc };
+    if old.as_ref() == Some(&stamp) {
+        return Ok(());
+    }
+    let Some(_build_locks) = lock_target(&target, false) else { return Ok(()) };
+    let started = Instant::now();
+    let (units, entries) = unusable_units(&target, &lock, rustc);
+    let bytes = dir_size(&entries, &[]);
+    for p in &entries {
+        if fs::symlink_metadata(p)?.is_dir() {
+            fs::remove_dir_all(p)?;
+        } else {
+            fs::remove_file(p)?;
+        }
+    }
+    stamp.write(slot_dir)?;
+    record(slot_dir, Event::Prune { units: units as u64, bytes, ms: ms_since(started) });
+    if units > 0 {
+        eprintln!("cargo-pool: deleted {units} build units ({}) this worktree can't use at its Cargo.lock and toolchain", human(bytes));
+    }
+    Ok(())
 }
 
 fn backdate_enabled(repo: &Repo) -> bool {
@@ -1291,6 +1603,8 @@ fn snapshot_after_build(slot_dir: &Path) -> Result<()> {
             if fs::read_link(lease.worktree.join("target")).ok().as_deref() != Some(target.as_path()) {
                 return Ok(());
             }
+            // Before the snapshot: deleting units touches the dirs that date the last compile.
+            prune(&lease.worktree, slot_dir, true)?;
             let started = Instant::now();
             let snap = take_snapshot(&lease.worktree, load_snapshot(slot_dir).as_ref())?;
             if last_compile_ns(slot_dir) < snap.taken_at {
@@ -1318,13 +1632,21 @@ enum Event {
     /// A warm slot was fitted to its new worktree: backdating and fingerprint resets.
     Prepare { backdated: u64, files: u64, reset: u64, ms: u64 },
     /// A new slot was filled on its first cargo command; `bytes` is None if nothing was copied.
-    Seed { bytes: Option<u64>, ms: u64 },
+    /// `left_out` is the size of the units its worktree can't use at its Cargo.lock.
+    Seed {
+        bytes: Option<u64>,
+        #[serde(default)]
+        left_out: u64,
+        ms: u64,
+    },
     /// A cargo command compiled into the slot: from its first compile until it released the build lock.
     Build { units: u64, ms: u64 },
     /// Background snapshot of the worktree after a build.
     Snapshot { files: u64, ms: u64 },
     /// Slot deleted to free disk space, or by `gc --max-age-days`.
     Evict { bytes: u64 },
+    /// Build units the slot's worktree can't use at its Cargo.lock and toolchain were deleted, freeing `bytes`.
+    Prune { units: u64, bytes: u64, ms: u64 },
 }
 
 #[derive(Serialize, Deserialize)]
@@ -1983,6 +2305,7 @@ fn prepare_worktree(repo: &Repo, slot_dir: &Path) -> Result<()> {
     if reset > 0 {
         eprintln!("cargo-pool: {reset} build units recorded another checkout's git state (e.g. git_version!); they'll rebuild here");
     }
+    prune(&repo.worktree, slot_dir, false)?;
     record(
         slot_dir,
         Event::Prepare { backdated: matched as u64, files: total as u64, reset: reset as u64, ms: ms_since(started) },
@@ -2128,7 +2451,7 @@ fn seed_sources(repo: &Repo, slots: &[Slot]) -> Vec<(PathBuf, Option<String>)> {
 /// often most of the bytes and only speed up the first rebuild of a crate edited after seeding.
 fn seed_parts(target: &Path) -> Vec<PathBuf> {
     fn walk(dir: &Path, rel: &Path, out: &mut Vec<PathBuf>) {
-        let profile = dir.join(".fingerprint").is_dir();
+        let profile = is_profile(dir);
         for entry in fs::read_dir(dir).into_iter().flatten().flatten() {
             let (path, rel) = (entry.path(), rel.join(entry.file_name()));
             let is_dir = entry.file_type().is_ok_and(|t| t.is_dir());
@@ -2138,14 +2461,8 @@ fn seed_parts(target: &Path) -> Vec<PathBuf> {
             if profile && is_dir && entry.file_name() == "incremental" {
                 continue;
             }
-            let holds_profile = || {
-                path.join(".fingerprint").is_dir()
-                    || fs::read_dir(&path)
-                        .into_iter()
-                        .flatten()
-                        .flatten()
-                        .any(|e| e.path().join(".fingerprint").is_dir())
-            };
+            let holds_profile =
+                || is_profile(&path) || fs::read_dir(&path).into_iter().flatten().flatten().any(|e| is_profile(&e.path()));
             if !profile && is_dir && holds_profile() {
                 walk(&path, &rel, out);
             } else {
@@ -2156,6 +2473,39 @@ fn seed_parts(target: &Path) -> Vec<PathBuf> {
     let mut out = vec![];
     walk(target, Path::new(""), &mut out);
     out
+}
+
+/// What a seed copies out of `src` for a worktree pinned to `lock` and built by `rustc`:
+/// `seed_parts`, with each directory holding units the worktree can't use replaced by its other
+/// entries (recursively: `build/` and new-layout `build/<pkg>/`).
+struct SeedPlan {
+    parts: Vec<PathBuf>,
+    /// Directories replaced by their entries, relative to `src`.
+    split: Vec<PathBuf>,
+    units: usize,
+    left_out: Vec<PathBuf>,
+}
+
+fn seed_plan(src: &Path, lock: Option<&Lockfile>, rustc: Option<u64>) -> SeedPlan {
+    let (units, left_out) = lock.map_or((0, vec![]), |l| unusable_units(src, l, rustc));
+    let dropped: HashSet<&Path> = left_out.iter().map(PathBuf::as_path).collect();
+    let holding: HashSet<&Path> = left_out.iter().flat_map(|p| p.ancestors().skip(1)).collect();
+    let (mut parts, mut split) = (vec![], vec![]);
+    let mut stack: Vec<PathBuf> = seed_parts(src).into_iter().rev().collect();
+    while let Some(part) = stack.pop() {
+        let dir = src.join(&part);
+        if dropped.contains(dir.as_path()) {
+            continue;
+        }
+        if !holding.contains(dir.as_path()) {
+            parts.push(part);
+            continue;
+        }
+        let entries: Vec<_> = fs::read_dir(&dir).into_iter().flatten().flatten().map(|e| part.join(e.file_name())).collect();
+        stack.extend(entries.into_iter().rev());
+        split.push(part);
+    }
+    SeedPlan { parts, split, units, left_out }
 }
 
 /// Copy the closest non-busy target dir into the slot. Returns the commit it was built for.
@@ -2171,13 +2521,24 @@ fn seed(repo: &Repo, slot: &Slot, head: &str, sources: Vec<(PathBuf, Option<Stri
     // What an interrupted seed left behind would count against the copy's room.
     let tmp = slot.dir.join("target.seeding");
     let _ = fs::remove_dir_all(&tmp);
+    let lock = Lockfile::read(&repo.worktree);
+    let toolchain = toolchain_hash(&repo.worktree);
     for (d, _, src, h) in ranked {
+        // The receiver hasn't built yet: its compiler is the source slot's if their toolchain
+        // files match. The main checkout's target has no stamp.
+        let from_main = repo.main_worktree.as_ref().is_some_and(|m| src == m.join("target"));
+        let rustc = src
+            .parent()
+            .filter(|_| !from_main)
+            .and_then(Stamp::read)
+            .filter(|s| s.toolchain == toolchain)
+            .and_then(|s| s.rustc);
         // Make room for the copy first; never let seeding push the disk over the limit.
-        let parts = seed_parts(&src);
-        if parts.is_empty() {
+        let plan = seed_plan(&src, lock.as_ref(), rustc);
+        if plan.parts.is_empty() {
             continue; // evicted since it was listed
         }
-        let size = dir_size(parts.iter().map(|p| src.join(p)), &[]);
+        let size = dir_size(plan.parts.iter().map(|p| src.join(p)), &[]);
         let protect: Vec<&Path> = [src.parent(), Some(slot.dir.as_path())].into_iter().flatten().collect();
         if !free_disk(repo.pool.parent().unwrap(), max_disk, size, &protect, Evict::Unheld)? {
             eprintln!(
@@ -2193,27 +2554,52 @@ fn seed(repo: &Repo, slot: &Slot, head: &str, sources: Vec<(PathBuf, Option<Stri
             eprintln!("cargo-pool: {} is busy building, trying next candidate", src.display());
             continue;
         };
-        let parts = seed_parts(&src);
-        if parts.is_empty() {
+        let plan = seed_plan(&src, lock.as_ref(), rustc);
+        if plan.parts.is_empty() {
             continue; // gone since it was sized
         }
         let dist = if d == u64::MAX { "unrelated".into() } else { format!("{d} commits away") };
         eprintln!("cargo-pool: seeding slot {} from {} ({dist}), this can take a while...", slot.id, src.display());
         let started = SystemTime::now();
-        // One cp for all parts, so cargo's hard links (`<profile>/<bin>` to `deps/`) survive.
+        // As few cp runs as the kernel's argument limit (which counts the environment too)
+        // allows: cargo's hard links (`<profile>/<bin>` to `deps/`) only survive within one.
+        let env: usize = std::env::vars_os().map(|(k, v)| k.len() + v.len() + 2 + size_of::<usize>()).sum();
+        let room = (unsafe { libc::sysconf(libc::_SC_ARG_MAX) } as usize)
+            .saturating_sub(env + tmp.as_os_str().len() + (64 << 10));
+        let mut runs = vec![];
+        let (mut start, mut used) = (0, 0);
+        for (i, part) in plan.parts.iter().enumerate() {
+            let cost = part.as_os_str().len() + 1 + size_of::<usize>();
+            if used + cost > room && i > start {
+                runs.push(&plan.parts[start..i]);
+                (start, used) = (i, 0);
+            }
+            used += cost;
+        }
+        runs.push(&plan.parts[start..]);
         let copied = fs::create_dir(&tmp).is_ok()
-            && Command::new("cp")
-                .current_dir(&src)
-                .args(["-a", "--reflink=auto", "--parents", "--"])
-                .args(&parts)
-                .arg(&tmp)
-                .status()
-                .is_ok_and(|s| s.success());
+            && runs.iter().all(|run| {
+                Command::new("cp")
+                    .current_dir(&src)
+                    .args(["-a", "--reflink=auto", "--parents", "--"])
+                    .args(*run)
+                    .arg(&tmp)
+                    .status()
+                    .is_ok_and(|s| s.success())
+            });
         if !copied {
             let _ = fs::remove_dir_all(&tmp);
             eprintln!("cargo-pool: copy failed, trying next candidate");
             continue;
         }
+        // Filling a directory entry by entry gives it a new mtime, which would count as a
+        // compile and invalidate the snapshot carried over below.
+        for dir in &plan.split {
+            if let (Ok(t), Ok(f)) = (fs::metadata(src.join(dir)).and_then(|m| m.modified()), File::open(tmp.join(dir))) {
+                f.set_modified(t)?;
+            }
+        }
+        let left_out = dir_size(&plan.left_out, &[]);
         remove_saved_links(&tmp)?;
         for lock in cargo_locks(&tmp) {
             fs::remove_file(lock)?;
@@ -2229,13 +2615,23 @@ fn seed(repo: &Repo, slot: &Slot, head: &str, sources: Vec<(PathBuf, Option<Stri
         if let Some(snap) = snap {
             save_snapshot(&slot.dir, &snap)?;
         }
+        if let Some(lock) = &lock {
+            Stamp { lock: lock.hash.clone(), toolchain: toolchain.clone(), rustc }.write(&slot.dir)?;
+        }
         let secs = started.elapsed().unwrap_or(Duration::ZERO).as_secs();
         eprintln!("cargo-pool: seeded in {secs}s");
-        record(&slot.dir, Event::Seed { bytes: Some(size), ms: ms_since(begun) });
+        if plan.units > 0 {
+            eprintln!(
+                "cargo-pool: left out {} build units ({}) this worktree can't use at its Cargo.lock and toolchain",
+                plan.units,
+                human(left_out)
+            );
+        }
+        record(&slot.dir, Event::Seed { bytes: Some(size), left_out, ms: ms_since(begun) });
         return Ok(h);
     }
     eprintln!("cargo-pool: no seed available, slot {} starts empty", slot.id);
-    record(&slot.dir, Event::Seed { bytes: None, ms: ms_since(begun) });
+    record(&slot.dir, Event::Seed { bytes: None, left_out: 0, ms: ms_since(begun) });
     Ok(None)
 }
 
@@ -2414,6 +2810,7 @@ struct Totals {
     seeds: u64,
     seeded: u64,
     seed_bytes: u64,
+    seed_left_out: u64,
     seed_ms: u64,
     builds: u64,
     units: u64,
@@ -2422,6 +2819,10 @@ struct Totals {
     snapshot_ms: u64,
     evictions: u64,
     evicted_bytes: u64,
+    prunes: u64,
+    pruned_units: u64,
+    pruned_bytes: u64,
+    prune_ms: u64,
 }
 
 fn stats(days: Option<u64>) -> Result<()> {
@@ -2459,10 +2860,11 @@ fn stats(days: Option<u64>) -> Result<()> {
                         t.reset += reset;
                         t.prepare_ms += ms;
                     }
-                    Event::Seed { bytes, ms } => {
+                    Event::Seed { bytes, left_out, ms } => {
                         t.seeds += 1;
                         t.seeded += bytes.is_some() as u64;
                         t.seed_bytes += bytes.unwrap_or(0);
+                        t.seed_left_out += left_out;
                         t.seed_ms += ms;
                     }
                     Event::Build { units, ms } => {
@@ -2477,6 +2879,12 @@ fn stats(days: Option<u64>) -> Result<()> {
                     Event::Evict { bytes } => {
                         t.evictions += 1;
                         t.evicted_bytes += bytes;
+                    }
+                    Event::Prune { units, bytes, ms } => {
+                        t.prunes += 1;
+                        t.pruned_units += units;
+                        t.pruned_bytes += bytes;
+                        t.prune_ms += ms;
                     }
                 }
             }
@@ -2495,7 +2903,14 @@ fn stats(days: Option<u64>) -> Result<()> {
             t.attaches - t.reused,
             dur(t.attach_ms)
         );
-        println!("  seeded     {} of {} new slots, {} copied; {}", t.seeded, t.seeds, human(t.seed_bytes), dur(t.seed_ms));
+        println!(
+            "  seeded     {} of {} new slots, {} copied, {} left out; {}",
+            t.seeded,
+            t.seeds,
+            human(t.seed_bytes),
+            human(t.seed_left_out),
+            dur(t.seed_ms)
+        );
         println!(
             "  prepared   {} slots: {} of {} files backdated, {} units reset; {}",
             t.prepares,
@@ -2507,6 +2922,13 @@ fn stats(days: Option<u64>) -> Result<()> {
         println!("  setup      {} in total (attach + seed + prepare)", dur(t.attach_ms + t.seed_ms + t.prepare_ms));
         println!("  built      {} cargo commands, {} units compiled; {}", t.builds, t.units, dur(t.build_ms));
         println!("  snapshots  {} in the background; {}", t.snapshots, dur(t.snapshot_ms));
+        println!(
+            "  pruned     {} units in {} passes, {} freed; {}",
+            t.pruned_units,
+            t.prunes,
+            human(t.pruned_bytes),
+            dur(t.prune_ms)
+        );
         println!("  evicted    {} slots, {} freed", t.evictions, human(t.evicted_bytes));
     }
     Ok(())
@@ -2768,6 +3190,158 @@ mod tests {
         assert!(mtime("added.rs") > old);
         // Unchanged directory (rerun-if-changed=<dir>) gets its old mtime back too.
         assert_eq!(mtime("proto"), old);
+        fs::remove_dir_all(&base).unwrap();
+    }
+
+    #[test]
+    fn prunes_units_the_lockfile_cannot_use() {
+        let base = std::env::temp_dir().join(format!("cargo-pool-prune-{}", std::process::id()));
+        let (wt, slot) = (base.join("wt"), base.join("slot"));
+        let debug = slot.join("target/debug");
+        for d in ["deps", "build", ".fingerprint"] {
+            fs::create_dir_all(debug.join(d)).unwrap();
+        }
+        fs::create_dir_all(&wt).unwrap();
+        fs::write(
+            wt.join("Cargo.lock"),
+            "version = 4\n\n[[package]]\nname = \"serde\"\nversion = \"1.0.2\"\nsource = \"registry+https://github.com/rust-lang/crates.io-index\"\n\n\
+             [[package]]\nname = \"gitdep\"\nversion = \"0.1.0\"\nsource = \"git+https://example.com/gitdep?branch=main#abcdef0123456789abcdef0123456789abcdef01\"\n\n\
+             [[package]]\nname = \"app\"\nversion = \"0.1.0\"\n",
+        )
+        .unwrap();
+        fs::write(debug.join(".cargo-lock"), "").unwrap();
+        // (name, hash, own fingerprint, fingerprints of its deps, first source)
+        let units: [(&str, &str, u64, &[u64], &str); 6] = [
+            ("serde", "1111111111111111", 1, &[], "/c/registry/src/index.crates.io-0123/serde-1.0.1/src/lib.rs"),
+            ("serde", "2222222222222222", 2, &[], "/c/registry/src/index.crates.io-0123/serde-1.0.2/src/lib.rs"),
+            ("uses_old", "3333333333333333", 3, &[1], "/work/my\\ app/uses_old/src/lib.rs"),
+            ("app", "4444444444444444", 4, &[2, 6, 99], "/work/my\\ app/src/lib.rs"),
+            ("gitdep", "5555555555555555", 5, &[], "/c/git/checkouts/gitdep-0123/1234567/src/lib.rs"),
+            ("gitdep", "6666666666666666", 6, &[], "/c/git/checkouts/gitdep-0123/abcdef0/src/lib.rs"),
+        ];
+        for (name, hash, fp, deps, src) in units {
+            let dir = debug.join(format!(".fingerprint/{name}-{hash}"));
+            fs::create_dir(&dir).unwrap();
+            let deps: Vec<String> = deps.iter().map(|d| format!("[1,\"dep\",false,{d}]")).collect();
+            fs::write(dir.join(format!("lib-{name}.json")), format!("{{\"rustc\":1,\"deps\":[{}]}}", deps.join(","))).unwrap();
+            fs::write(dir.join(format!("lib-{name}")), format!("{:016x}", fp.swap_bytes())).unwrap();
+            fs::write(debug.join(format!("deps/lib{name}-{hash}.rlib")), "").unwrap();
+            fs::write(debug.join(format!("deps/{name}-{hash}.d")), format!("/t/deps/lib{name}-{hash}.rmeta: {src} /x.rs\n\n{src}:\n")).unwrap();
+        }
+        // Old serde's build script, an interrupted compile and an uplifted binary.
+        fs::create_dir_all(debug.join("build/serde-1111111111111111/out")).unwrap();
+        fs::create_dir(debug.join(".fingerprint/broken-7777777777777777")).unwrap();
+        fs::write(debug.join(".fingerprint/broken-7777777777777777/invoked.timestamp"), "").unwrap();
+        fs::write(debug.join("deps/broken-7777777777777777"), "").unwrap();
+        fs::write(debug.join("uses_old"), "").unwrap();
+
+        prune(&wt, &slot, false).unwrap();
+        let exists = |p: &str| debug.join(p).exists();
+        for dead in ["1111111111111111", "3333333333333333", "5555555555555555", "7777777777777777"] {
+            for e in fs::read_dir(debug.join("deps")).unwrap().chain(fs::read_dir(debug.join(".fingerprint")).unwrap()) {
+                assert!(!e.unwrap().file_name().to_string_lossy().contains(dead), "unit {dead} must be deleted");
+            }
+        }
+        assert!(!exists("build/serde-1111111111111111"));
+        for live in ["serde-2222222222222222", "app-4444444444444444", "gitdep-6666666666666666"] {
+            assert!(exists(&format!(".fingerprint/{live}")) && exists(&format!("deps/{live}.d")), "{live} must stay");
+        }
+        assert!(exists("deps/libserde-2222222222222222.rlib"));
+        assert!(exists("uses_old"), "uplifted files without a hash stay");
+        assert!(slot.join("pruned-for").exists());
+        fs::remove_dir_all(&base).unwrap();
+    }
+
+    #[test]
+    fn prunes_new_layout_units_and_other_compilers() {
+        let base = std::env::temp_dir().join(format!("cargo-pool-prune-layout-{}", std::process::id()));
+        let (wt, slot) = (base.join("wt"), base.join("slot"));
+        let debug = slot.join("target/debug");
+        fs::create_dir_all(debug.join("deps")).unwrap();
+        fs::create_dir_all(&wt).unwrap();
+        fs::write(
+            wt.join("Cargo.lock"),
+            "version = 4\n\n[[package]]\nname = \"serde_json\"\nversion = \"1.0.149\"\nsource = \"registry+https://github.com/rust-lang/crates.io-index\"\n\n\
+             [[package]]\nname = \"oldtool\"\nversion = \"0.1.0\"\nsource = \"registry+https://github.com/rust-lang/crates.io-index\"\n\n\
+             [[package]]\nname = \"app\"\nversion = \"0.1.0\"\n",
+        )
+        .unwrap();
+        fs::write(debug.join(".cargo-lock"), "").unwrap();
+        let fingerprint = |dir: &Path, kind: &str, rustc: u64, fp: u64, deps: &[u64]| {
+            fs::create_dir_all(dir).unwrap();
+            let deps: Vec<String> = deps.iter().map(|d| format!("[1,\"dep\",false,{d}]")).collect();
+            fs::write(dir.join(format!("{kind}.json")), format!("{{\"rustc\":{rustc},\"deps\":[{}]}}", deps.join(","))).unwrap();
+            fs::write(dir.join(kind), format!("{:016x}", fp.swap_bytes())).unwrap();
+        };
+        let src = |package: &str| format!("/c/registry/src/index.crates.io-0123/{package}/src/lib.rs");
+        // New layout: (pkg, hash, kind, rustc, own fingerprint, fingerprints of its deps, files in `out/`)
+        let units: [(&str, &str, &str, u64, u64, &[u64], Vec<(String, String)>); 6] = [
+            ("serde_json", "aaaaaaaaaaaaaaaa", "lib-serde_json", 2, 10, &[], vec![
+                ("serde_json-aaaaaaaaaaaaaaaa.d".into(), format!("/t/libserde_json-aaaaaaaaaaaaaaaa.rmeta: {}\n", src("serde_json-1.0.149"))),
+                ("libserde_json-aaaaaaaaaaaaaaaa.rlib".into(), String::new()),
+            ]),
+            ("serde_json", "bbbbbbbbbbbbbbbb", "lib-serde_json", 2, 11, &[], vec![
+                ("serde_json-bbbbbbbbbbbbbbbb.d".into(), format!("/t/libserde_json-bbbbbbbbbbbbbbbb.rmeta: {}\n", src("serde_json-1.0.100"))),
+            ]),
+            // A build script build-depending on the old serde_json, and its run with only an OUT_DIR.
+            ("oldtool", "cccccccccccccccc", "build-script-build-script-build", 2, 12, &[11], vec![
+                ("build_script_build.d".into(), format!("/t/build_script_build: {}\n", src("oldtool-0.1.0"))),
+            ]),
+            ("oldtool", "dddddddddddddddd", "run-build-script-build-script-build", 2, 13, &[12], vec![("generated.rs".into(), String::new())]),
+            // A build script's output that happens to be dep-info of a crate the lock doesn't pin.
+            ("livetool", "eeeeeeeeeeeeeeee", "run-build-script-build-script-build", 2, 14, &[], vec![
+                ("junk-0123456789abcdef.d".into(), format!("/t/junk: {}\n", src("junk-9.9.9"))),
+            ]),
+            ("tool", "ffffffffffffffff", "lib-tool", 1, 15, &[], vec![]),
+        ];
+        for (pkg, hash, kind, rustc, fp, deps, out) in &units {
+            let dir = debug.join(format!("build/{pkg}/{hash}"));
+            fingerprint(&dir.join("fingerprint"), kind, *rustc, *fp, deps);
+            fs::create_dir_all(dir.join("out")).unwrap();
+            for (name, content) in out {
+                fs::write(dir.join("out").join(name), content).unwrap();
+            }
+        }
+        fs::create_dir(debug.join("build/oldtool/dddddddddddddddd/run")).unwrap();
+        // The other compiler's unit was built before the last build.
+        File::options()
+            .write(true)
+            .open(debug.join("build/tool/ffffffffffffffff/fingerprint/lib-tool.json"))
+            .unwrap()
+            .set_modified(UNIX_EPOCH + Duration::from_secs(1_000_000))
+            .unwrap();
+        // An unfinished new-layout unit.
+        fs::create_dir_all(debug.join("build/half/1212121212121212/fingerprint")).unwrap();
+        fs::write(debug.join("build/half/1212121212121212/fingerprint/invoked.timestamp"), "").unwrap();
+        // Classic units depending on a live and a dead new-layout unit.
+        for (name, hash, fp, dep) in [("app", "4444444444444444", 20, 10), ("uses_old", "5555555555555555", 21, 11)] {
+            fingerprint(&debug.join(format!(".fingerprint/{name}-{hash}")), &format!("lib-{name}"), 2, fp, &[dep]);
+            fs::write(debug.join(format!("deps/lib{name}-{hash}.rlib")), "").unwrap();
+        }
+
+        let exists = |p: &str| debug.join(p).exists();
+        // The compiler is unknown before the worktree's first build: only the lock rule applies.
+        prune(&wt, &slot, false).unwrap();
+        for dead in ["build/serde_json/bbbbbbbbbbbbbbbb", "build/oldtool", "build/half", ".fingerprint/uses_old-5555555555555555", "deps/libuses_old-5555555555555555.rlib"] {
+            assert!(!exists(dead), "{dead} must be deleted");
+        }
+        for live in [
+            "build/serde_json/aaaaaaaaaaaaaaaa/out/libserde_json-aaaaaaaaaaaaaaaa.rlib",
+            "build/livetool/eeeeeeeeeeeeeeee",
+            "build/tool/ffffffffffffffff",
+            ".fingerprint/app-4444444444444444",
+            "deps/libapp-4444444444444444.rlib",
+        ] {
+            assert!(exists(live), "{live} must stay");
+        }
+        let stamp = Stamp::read(&slot).unwrap();
+        assert_eq!((stamp.lock, stamp.toolchain, stamp.rustc), (Lockfile::read(&wt).unwrap().hash, toolchain_hash(&wt), None));
+
+        // After a build, the compiler that wrote the newest fingerprint is the worktree's.
+        prune(&wt, &slot, true).unwrap();
+        assert!(!exists("build/tool"), "a unit of another compiler must be deleted with its empty package dir");
+        assert!(exists("build/serde_json/aaaaaaaaaaaaaaaa") && exists(".fingerprint/app-4444444444444444"));
+        assert_eq!(Stamp::read(&slot).unwrap().rustc, Some(2));
         fs::remove_dir_all(&base).unwrap();
     }
 }

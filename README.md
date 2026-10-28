@@ -31,6 +31,15 @@ Share warm cargo `target/` directories between git worktrees, so a fresh worktre
   out: they're often most of the bytes, and only speed up the first rebuild of a crate
   edited after seeding. Without the rustc wrapper installed, new slots stay empty. There is
   no limit on the number of slots: disk usage is the only limit.
+- **Pruning by Cargo.lock**: cargo never deletes artifacts of dependency versions it no longer
+  uses, so slots only grow. cargo-pool drops every build unit that the slot's worktree can't
+  use at its current `Cargo.lock` and toolchain: units built from a crate version or git
+  revision the lock doesn't contain, units built by another toolchain, unfinished units, and
+  everything depending on them. It handles both cargo's classic target layout and the new
+  build-dir layout. A seed copies only the units the new worktree can use. A slot is pruned in
+  place when a worktree takes it over, and after each build once its worktree's `Cargo.lock` or
+  toolchain has changed. It never runs during a build. If a deleted unit was needed after all,
+  cargo rebuilds it.
 - **Disk limit**: if the disk holding the pool is above `maxDiskPercent` (default 90%),
   pooled target dirs on that filesystem are deleted, across all repos' pools and configured
   directories, until usage is back under the limit. This happens on every attach, on every pooled build (with the rustc wrapper
@@ -168,17 +177,18 @@ export CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER=/path/to/main/checkout/scrip
 ## Metrics
 
 Every pool keeps an append-only log, `<pool-directory>/<repo>-<hash>/events.jsonl`, with one
-JSON line per attach, slot preparation (backdating), seed, build, snapshot and evicted slot,
+JSON line per attach, slot preparation (backdating), seed, build, snapshot, prune and evicted slot,
 including how long it took. `cargo pool stats` sums it up:
 
 ```
 cargo-pool-ac7e5f46c861e3b5 (/home/you/cargo-pool/.git): 4 slots, 2 in use, all time
   attached   42 worktrees: 35 to a warm slot, 7 to a new one; 3.1s
-  seeded     6 of 7 new slots, 45.2G copied; 3m12s
+  seeded     6 of 7 new slots, 45.2G copied, 80.1G left out; 3m12s
   prepared   41 slots: 98112 of 99840 files backdated, 12 units reset; 8.4s
   setup      3m24s in total (attach + seed + prepare)
   built      120 cargo commands, 3412 units compiled; 1h02m
   snapshots  118 in the background; 1m03s
+  pruned     2870 units in 52 passes, 61.0G freed; 9.6s
   evicted    5 slots, 23.1G freed
 ```
 
