@@ -283,7 +283,7 @@ fn global_directories_and_legacy_environment_override() {
 }
 
 #[test]
-fn allocates_by_available_space_and_cleans_only_the_target_filesystem() {
+fn allocates_new_slots_by_available_space() {
     let mut f = Fixture::new();
     if !fs::metadata("/dev/shm").is_ok_and(|m| m.dev() != fs::metadata(&f.dir).unwrap().dev()) {
         eprintln!("requires /dev/shm on a separate filesystem");
@@ -304,14 +304,36 @@ fn allocates_by_available_space_and_cleans_only_the_target_filesystem() {
     f.pool(&a, &f.roots, &["attach", "--no-seed"]);
     let a_target = fs::read_link(a.join("target")).unwrap();
     assert!(a_target.starts_with(&f.roots[1]), "new slot should use the filesystem with more free space");
-    let b = f.worktree("b");
-    f.pool(&b, &f.roots[..1], &["attach", "--no-seed"]);
-    let b_target = fs::read_link(b.join("target")).unwrap();
-    f.pool(&b, &f.roots, &["detach"]);
-    let c = f.worktree("c");
-    f.pool(&c, &f.roots[1..], &["attach", "--no-seed"]);
-    let c_target = fs::read_link(c.join("target")).unwrap();
-    f.pool(&c, &f.roots, &["detach"]);
+}
+
+#[test]
+fn builds_clean_every_filesystem_over_the_limit() {
+    let mut f = Fixture::exclusive();
+    if !fs::metadata("/dev/shm").is_ok_and(|m| m.dev() != fs::metadata(&f.dir).unwrap().dev()) {
+        eprintln!("requires /dev/shm on a separate filesystem");
+        return;
+    }
+    f.roots[1] = Path::new("/dev/shm").join(f.dir.file_name().unwrap());
+    for root in &f.roots {
+        fs::create_dir_all(root).unwrap();
+    }
+    // Only the filesystem the build doesn't write to is over the limit.
+    let used = |root: &Path| limit_with_room(root, 0);
+    if used(&f.roots[0]) < used(&f.roots[1]) {
+        f.roots.reverse();
+    }
+    let limit = (used(&f.roots[0]) + used(&f.roots[1])) / 2.0;
+    let (full, roomy) = (&f.roots[..1], &f.roots[1..]);
+    let a = f.worktree("a");
+    f.pool(&a, roomy, &["attach", "--no-seed"]);
+    let a_target = fs::read_link(a.join("target")).unwrap();
+    let mut free = vec![];
+    for (name, roots) in [("b", full), ("c", roomy)] {
+        let wt = f.worktree(name);
+        f.pool(&wt, roots, &["attach", "--no-seed"]);
+        free.push(fs::read_link(wt.join("target")).unwrap());
+        f.pool(&wt, &f.roots, &["detach"]);
+    }
     let out = a_target.join("debug/deps");
     fs::create_dir_all(&out).unwrap();
     let lock = fs::File::create(a_target.parent().unwrap().join("snapshot.lock")).unwrap();
@@ -319,13 +341,13 @@ fn allocates_by_available_space_and_cleans_only_the_target_filesystem() {
     success(
         f.command(env!("CARGO_BIN_EXE_cargo-pool"), &a)
             .env("CARGO_POOL_DIRS", std::env::join_paths(&f.roots).unwrap())
-            .env("CARGO_POOL_MAX_DISK_PERCENT", "0")
+            .env("CARGO_POOL_MAX_DISK_PERCENT", limit.to_string())
             .args(["/bin/true", "--out-dir", out.to_str().unwrap()])
             .output()
             .unwrap(),
     );
-    assert!(!c_target.exists(), "cleanup should remove the free slot on the target filesystem");
-    assert!(b_target.exists(), "cleanup should preserve slots on another filesystem");
+    assert!(!free[0].exists(), "cleanup should free the full filesystem, though the build writes elsewhere");
+    assert!(free[1].exists(), "cleanup should leave a filesystem under the limit alone");
     assert!(a_target.exists(), "cleanup should preserve the active slot");
 }
 

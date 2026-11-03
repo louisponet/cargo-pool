@@ -378,13 +378,23 @@ fn available_bytes(path: &Path) -> Result<u64> {
     Ok((st.f_bavail as u64).saturating_mul(st.f_frsize as u64))
 }
 
-fn containing_pool_root(path: &Path) -> Result<Option<PathBuf>> {
+fn containing_pool_root(roots: &[PathBuf], path: &Path) -> Result<Option<PathBuf>> {
     let path = fs::canonicalize(path)?;
-    Ok(pool_roots()?
-        .into_iter()
+    Ok(roots
+        .iter()
         .filter_map(|root| fs::canonicalize(root).ok())
         .filter(|root| path.starts_with(root))
         .max_by_key(|root| root.components().count()))
+}
+
+/// The first of `roots` on each filesystem: `free_disk` on it covers every pool on that filesystem.
+fn pool_filesystems(roots: &[PathBuf]) -> Vec<(u64, &Path)> {
+    let mut devices = HashSet::new();
+    roots
+        .iter()
+        .filter_map(|root| Some((fs::metadata(root).ok()?.dev(), root.as_path())))
+        .filter(|(dev, _)| devices.insert(*dev))
+        .collect()
 }
 
 const FNV_OFFSET: u64 = 0xcbf29ce484222325;
@@ -985,7 +995,8 @@ fn check_disk_during_build(rustc_args: &[OsString]) -> Result<()> {
         return Ok(());
     };
     let Ok(out_dir) = fs::canonicalize(out_dir) else { return Ok(()) };
-    let Some(root) = containing_pool_root(&out_dir)? else { return Ok(()) };
+    let roots = pool_roots()?;
+    let Some(root) = containing_pool_root(&roots, &out_dir)? else { return Ok(()) };
     let Ok(rel) = out_dir.strip_prefix(&root) else { return Ok(()) };
     let mut parts = rel.components().map(|c| c.as_os_str());
     let Some(pool) = parts.next() else { return Ok(()) };
@@ -1001,28 +1012,35 @@ fn check_disk_during_build(rustc_args: &[OsString]) -> Result<()> {
     }
     let git_dir = PathBuf::from(fs::read_to_string(root.join(pool).join("repo")).unwrap_or_default());
     let max_disk = setting(&git_dir, "CARGO_POOL_MAX_DISK_PERCENT", "cargo-pool.maxDiskPercent", 90.0);
-    if disk_percent(&root, 0)? < max_disk {
-        return Ok(());
-    }
-    // Over the limit. Many rustc processes run in parallel: let one of them clean up,
-    // and don't rescan more than once a minute if the disk can't be brought under.
-    // The marker holds the time of the last cleanup (its mtime changes when locking it).
-    let marker = root.join(".disk-cleanup");
-    let recent = || {
-        let last: u64 = fs::read_to_string(&marker).ok().and_then(|s| s.trim().parse().ok()).unwrap_or(0);
-        now().saturating_sub(last) < 60
-    };
-    if recent() {
-        return Ok(());
-    }
-    let Some(_lock) = FileLock::acquire(&marker, false)? else { return Ok(()) };
-    if recent() {
-        return Ok(());
-    }
-    let ok = free_disk(&root, max_disk, 0, slot_dir.as_deref().as_slice(), Evict::Any);
-    fs::write(&marker, now().to_string())?;
-    if !ok? {
-        eprintln!("cargo-pool: warning: disk is still above {max_disk}% after cleaning up all pools");
+    // Every filesystem, not just this build's: new slots go where there's room, so a full one
+    // might otherwise never see another build.
+    for (_, root) in pool_filesystems(&roots) {
+        if disk_percent(root, 0)? < max_disk {
+            continue;
+        }
+        // Over the limit. Many rustc processes run in parallel: let one of them clean up,
+        // and don't rescan more than once a minute if the disk can't be brought under.
+        // The marker holds the time of the last cleanup (its mtime changes when locking it).
+        let marker = root.join(".disk-cleanup");
+        let recent = || {
+            let last: u64 = fs::read_to_string(&marker).ok().and_then(|s| s.trim().parse().ok()).unwrap_or(0);
+            now().saturating_sub(last) < 60
+        };
+        if recent() {
+            continue;
+        }
+        let Some(_lock) = FileLock::acquire(&marker, false)? else { continue };
+        if recent() {
+            continue;
+        }
+        let ok = free_disk(root, max_disk, 0, slot_dir.as_deref().as_slice(), Evict::Any);
+        fs::write(&marker, now().to_string())?;
+        if !ok? {
+            eprintln!(
+                "cargo-pool: warning: the disk holding {} is still above {max_disk}% after cleaning up all pools",
+                root.display()
+            );
+        }
     }
     Ok(())
 }
@@ -2180,11 +2198,18 @@ fn lease_slot(repo: &Repo, seed: bool, wait_for_build: bool) -> Result<()> {
     }
     let adopting = recovery.as_ref().is_some_and(|s| s.meta.adoption.is_some()) || cargo_output(&link);
     let extra = if cross_device && adopting && !ready { dir_size([&link], &strays) } else { 0 };
-    if !free_disk(repo.pool.parent().unwrap(), max_disk, extra, &[], Evict::Any)? {
-        if extra > 0 {
-            bail!("not enough room below {max_disk}% to attach {}", link.display());
+    let device = fs::metadata(repo.pool.parent().unwrap())?.dev();
+    for (dev, root) in pool_filesystems(&pool_roots()?) {
+        let extra = if dev == device { extra } else { 0 };
+        if !free_disk(root, max_disk, extra, &[], Evict::Any)? {
+            if extra > 0 {
+                bail!("not enough room below {max_disk}% to attach {}", link.display());
+            }
+            eprintln!(
+                "cargo-pool: warning: the disk holding {} is still above {max_disk}% after cleaning up all pools",
+                root.display()
+            );
         }
-        eprintln!("cargo-pool: warning: disk is still above {max_disk}% after cleaning up all pools");
     }
     let head = repo.head()?;
     let lease = |pending| Lease { worktree: repo.worktree.clone(), head: head.clone(), acquired_at: now(), pending };
@@ -2424,10 +2449,11 @@ fn prepare_worktree(repo: &Repo, slot_dir: &Path) -> Result<()> {
 /// empty slot has no cached probe, so the first cargo command always comes through here.
 fn seed_on_first_use() -> Result<()> {
     let cwd = std::env::current_dir()?;
+    let roots = pool_roots()?;
     let Some(target) = cwd
         .ancestors()
         .filter_map(|a| fs::read_link(a.join("target")).ok())
-        .find(|t| containing_pool_root(t).ok().flatten().is_some())
+        .find(|t| containing_pool_root(&roots, t).ok().flatten().is_some())
     else {
         return Ok(());
     };

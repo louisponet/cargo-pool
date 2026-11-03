@@ -40,10 +40,12 @@ Share warm cargo `target/` directories between git worktrees, so a fresh worktre
   place when a worktree takes it over, and after each build once its worktree's `Cargo.lock` or
   toolchain has changed. It never runs during a build. If a deleted unit was needed after all,
   cargo rebuilds it.
-- **Disk limit**: if the disk holding the pool is above `maxDiskPercent` (default 90%),
+- **Disk limit**: if a disk holding a pool directory is above `maxDiskPercent` (default 90%),
   cargo-pool frees space on that filesystem, across all repos' pools and configured
   directories, until usage is back under the limit. This happens on every attach, on every pooled build (with the rustc wrapper
-  installed, see below) and on `gc`. First it deletes the `incremental/` caches of the least
+  installed, see below) and on `gc`, for the disks of all configured directories, not only the
+  one being written to: new slots go to the disk with the most room, so a full disk might
+  otherwise never see another build. First it deletes the `incremental/` caches of the least
   recently used slots: they only speed up rebuilding a crate after an edit, and rustc starts
   them over. Then it deletes the least recently used slots, whether or not a worktree holds
   them. A slot counts as used when something is compiled into it or it is released. A worktree whose slot is deleted loses its `target` link and
@@ -248,7 +250,7 @@ created when a repository is opened by cargo-pool. All configured paths must be 
 
 Include the old pool directory in the list to keep reusing its slots. Existing slots are
 not moved. `status` and `gc` cover every configured directory, and new slots can be seeded
-from any of them. Cleanup affects only the filesystem that needs space.
+from any of them. Cleanup affects only filesystems above the limit.
 
 Seeding uses reflinks where supported on the same filesystem, such as btrfs or XFS.
 Copies between filesystems, or on ext4, require a full copy.
