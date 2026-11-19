@@ -1889,3 +1889,54 @@ fn compiles_nested_in_a_slot_holder_do_not_wait_for_a_slot() {
     }
     assert!(outer.wait().unwrap().success());
 }
+
+#[test]
+fn monorepo_workspaces_one_level_down_each_get_their_own_pool() {
+    let f = Fixture::new();
+    let roots = &f.roots[..1];
+    f.git(&f.repo, &["rm", "-rq", "Cargo.toml", "src"]);
+    for ws in ["alpha", "beta"] {
+        fs::create_dir_all(f.repo.join(ws).join("src")).unwrap();
+        fs::write(f.repo.join(ws).join("Cargo.toml"), format!("[package]\nname = \"{ws}\"\nversion = \"0.1.0\"\n")).unwrap();
+        fs::write(f.repo.join(ws).join("src/main.rs"), "fn main() {}\n").unwrap();
+    }
+    fs::create_dir_all(f.repo.join("docs")).unwrap();
+    fs::write(f.repo.join("docs/README.md"), "no cargo here\n").unwrap();
+    f.git(&f.repo, &["add", "."]);
+    f.git(&f.repo, &["commit", "-qm", "monorepo"]);
+    f.pool(&f.repo, roots, &["install-wrapper"]);
+
+    let a = f.worktree("a");
+    let head = f.git(&a, &["rev-parse", "HEAD"]);
+    f.pool(&a, roots, &["post-checkout", "0000000000000000000000000000000000000000", head.trim(), "1"]);
+    let git_dir = PathBuf::from(f.git(&a, &["rev-parse", "--absolute-git-dir"]).trim());
+    for ws in ["alpha", "beta"] {
+        assert!(fs::symlink_metadata(a.join(ws).join("target")).unwrap().is_dir(), "the hook defers every workspace");
+        assert!(git_dir.join(format!("cargo-pool-attach-{ws}")).exists());
+    }
+    assert!(!a.join("target").exists() && !a.join("docs/target").exists());
+
+    // The first cargo command in one workspace leases its slot only.
+    f.pool(&a.join("alpha/src"), roots, &["/bin/true", "-vV"]);
+    let alpha = fs::read_link(a.join("alpha/target")).unwrap();
+    assert!(fs::symlink_metadata(a.join("beta/target")).unwrap().is_dir());
+    fs::write(alpha.join("artifact"), "alpha").unwrap();
+    f.pool(&a, roots, &["attach", "--no-seed"]);
+    let beta = fs::read_link(a.join("beta/target")).unwrap();
+    assert!(f.git(&a, &["status", "--porcelain"]).is_empty(), "the links are excluded from git");
+    let pool = |t: &Path| t.parent().unwrap().parent().unwrap().parent().unwrap().to_path_buf();
+    assert_ne!(pool(&alpha), pool(&beta), "workspaces of one repository have separate pools");
+    let status = f.pool(&a, roots, &["status"]);
+    assert!(status.contains(pool(&alpha).to_str().unwrap()) && status.contains(pool(&beta).to_str().unwrap()));
+    let status = f.pool(&a.join("beta"), roots, &["status"]);
+    assert!(!status.contains(pool(&alpha).to_str().unwrap()));
+
+    // Released together; a new worktree gets each workspace's own warm slot back.
+    f.pool(&a, roots, &["detach"]);
+    assert!(!a.join("alpha/target").exists() && !a.join("beta/target").exists());
+    let b = f.worktree("b");
+    f.pool(&b, roots, &["attach"]);
+    assert_eq!(fs::read_link(b.join("alpha/target")).unwrap(), alpha);
+    assert_eq!(fs::read_link(b.join("beta/target")).unwrap(), beta);
+    assert!(f.pool(&b, roots, &["stats"]).contains("attached   2 worktrees"));
+}
