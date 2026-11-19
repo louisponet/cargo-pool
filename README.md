@@ -10,6 +10,14 @@ Share warm cargo `target/` directories between git worktrees, so a fresh worktre
 - Every repository (keyed by its git common dir) gets a pool of **slots** in
   `<pool-directory>/<repo>-<hash>/slots/<n>/target`. The default pool directory is
   `~/.cache/cargo-pool`.
+- cargo-pool attaches the cargo workspace at the worktree's top level. A repository with no
+  `Cargo.toml` at its top level is treated as a monorepo: every directory one level down
+  that holds a `Cargo.toml` is a workspace with its own `target` and its own pool
+  (`<repo>-<dir>-<hash>`), because slots of different workspaces build different crates.
+  `attach`, `detach`, `status`, `stats` and `gc` act on the workspace you run them in, or on
+  every workspace when you run them at the top level. The first cargo command of a deferred
+  worktree leases a slot for the workspace it runs in, so run cargo inside the workspace
+  directory, not with `--manifest-path` from the top level.
 - `cargo-pool attach` replaces a worktree's `target` with a symlink to a slot. Each slot
   is leased to one worktree at a time, so parallel agents never block on each other's
   cargo build lock. The main checkout uses the same rules. Existing build artifacts are
@@ -109,7 +117,8 @@ That runs `cargo install --git https://github.com/louisponet/cargo-pool` followe
 
   On older git it falls back to appending a guarded block to the current repository's
   `.git/hooks/post-checkout`; run `cargo pool install-hook` in each other repo too. The hook
-  never fails the checkout and ignores repos without a top-level `Cargo.toml`.
+  never fails the checkout and ignores repos without a `Cargo.toml` at the top level or one
+  level down.
 - **The rustc wrapper** (`build.rustc-wrapper` in `~/.cargo/config.toml`, via a small shim
   script), which checks
   disk usage on every pooled build. Cargo runs every compiler call through `cargo-pool`.
@@ -207,8 +216,8 @@ with nothing to compile don't show up, and without the wrapper no builds are rec
 
 | command | |
 |---|---|
-| `cargo pool attach [path] [--force] [--no-seed]` | attach a worktree and preserve its target (idempotent); `--force` discards it |
-| `cargo pool detach [path]` | release the slot and remove the symlink, or cancel a deferred attach or unfinished copy |
+| `cargo pool attach [path] [--force] [--no-seed]` | attach the workspaces of a worktree at or below `path` and preserve their targets (idempotent); `--force` discards them |
+| `cargo pool detach [path]` | release the slots and remove the symlinks, or cancel a deferred attach or unfinished copy |
 | `cargo pool status [--size]` | show slots for this repo (all pools outside a repo) |
 | `cargo pool stats [--days D]` | show recorded metrics for this repo (all pools outside a repo) |
 | `cargo pool gc [--max-age-days D] [--dry-run]` | free disk space if over the limit; optionally delete free slots older than D days |

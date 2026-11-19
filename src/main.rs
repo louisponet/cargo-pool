@@ -1,7 +1,7 @@
 //! cargo-pool: share warm cargo `target/` directories between git worktrees.
 //!
-//! Each repository (identified by its git common dir) gets a pool of slots under
-//! the configured pool directories (default `~/.cache/cargo-pool`). A worktree attaches to a slot
+//! Each cargo workspace of a repository (identified by its git common dir) gets a pool of slots
+//! under the configured pool directories (default `~/.cache/cargo-pool`). A worktree attaches to a slot
 //! by having its `target` replaced with a symlink into the slot. A slot is leased
 //! to at most one worktree at a time, so concurrent agents never fight over the
 //! same cargo build lock. Leases are released explicitly with `detach`, or
@@ -236,19 +236,24 @@ fn distance(dir: &Path, a: Option<&str>, b: &str) -> u64 {
         .unwrap_or(u64::MAX)
 }
 
+/// A cargo workspace of a git worktree, with the pool its `target` dir is leased from.
 #[derive(Clone)]
 struct Repo {
-    /// Top level of the worktree we're operating on.
+    /// Top level of the worktree.
     worktree: PathBuf,
+    /// Directory of the workspace's root `Cargo.toml`, where its `target` lives: the worktree's
+    /// top level, or a directory one level down (see `workspaces`).
+    workspace: PathBuf,
     common_dir: PathBuf,
-    /// Main worktree, if the repository isn't bare.
-    main_worktree: Option<PathBuf>,
-    /// Pool directory for this repository.
+    /// The same workspace in the main worktree, if the repository isn't bare.
+    main_workspace: Option<PathBuf>,
+    /// Pool directory for this workspace.
     pool: PathBuf,
 }
 
 impl Repo {
-    fn discover(path: &Path) -> Result<Repo> {
+    /// The workspaces of the worktree holding `path` that contain `path` or lie below it.
+    fn discover(path: &Path) -> Result<Vec<Repo>> {
         let worktree = PathBuf::from(git(path, &["rev-parse", "--show-toplevel"])?);
         let common = git(&worktree, &["rev-parse", "--path-format=absolute", "--git-common-dir"])?;
         let common_dir = fs::canonicalize(&common)?;
@@ -260,14 +265,37 @@ impl Repo {
             .file_name()
             .map(|n| n.to_string_lossy().trim_end_matches(".git").to_string())
             .unwrap_or_else(|| "repo".into());
-        let key = format!("{name}-{:016x}", fnv1a(common_dir.as_os_str().as_encoded_bytes()));
         let roots = pool_roots()?;
-        let pool = select_pool(&roots, &key, &worktree, &common_dir)?;
-        Ok(Repo { worktree, common_dir, main_worktree, pool })
+        let path = fs::canonicalize(path)?;
+        workspaces(&worktree)
+            .into_iter()
+            .filter(|ws| path.starts_with(ws) || ws.starts_with(&path))
+            .map(|workspace| {
+                let rel = workspace.strip_prefix(&worktree)?;
+                // Workspaces of one repository build different crates: each gets its own pool.
+                let key = if rel.as_os_str().is_empty() {
+                    format!("{name}-{:016x}", fnv1a(common_dir.as_os_str().as_encoded_bytes()))
+                } else {
+                    let id = common_dir.join(rel);
+                    format!("{name}-{}-{:016x}", rel.display(), fnv1a(id.as_os_str().as_encoded_bytes()))
+                };
+                let pool = select_pool(&roots, &key, &workspace, &common_dir)?;
+                let main_workspace = main_worktree.as_ref().map(|m| m.join(rel));
+                Ok(Repo { worktree: worktree.clone(), workspace, common_dir: common_dir.clone(), main_workspace, pool })
+            })
+            .collect()
+    }
+
+    /// The workspace at `workspace`.
+    fn of_workspace(workspace: &Path) -> Result<Repo> {
+        Repo::discover(workspace)?
+            .into_iter()
+            .find(|r| r.workspace == workspace)
+            .ok_or_else(|| anyhow!("{} is not a cargo workspace", workspace.display()))
     }
 
     fn head(&self) -> Result<String> {
-        git(&self.worktree, &["rev-parse", "HEAD"])
+        git(&self.workspace, &["rev-parse", "HEAD"])
     }
 
     fn max_disk_percent(&self) -> f64 {
@@ -284,6 +312,25 @@ impl Repo {
         FileLock::acquire(&self.pool.join(".lock"), true)?
             .ok_or_else(|| anyhow!("could not lock pool"))
     }
+}
+
+/// The cargo workspaces of a worktree: its top level if that holds a `Cargo.toml`, else every
+/// directory one level down that holds one (a monorepo of projects). Without a manifest above
+/// it, cargo makes each of those the root of its own workspace, with its own `target`.
+fn workspaces(worktree: &Path) -> Vec<PathBuf> {
+    if worktree.join("Cargo.toml").is_file() {
+        return vec![worktree.to_path_buf()];
+    }
+    let mut out: Vec<PathBuf> = fs::read_dir(worktree)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter(|e| e.file_type().is_ok_and(|t| t.is_dir()))
+        .map(|e| e.path())
+        .filter(|p| p.join("Cargo.toml").is_file())
+        .collect();
+    out.sort();
+    out
 }
 
 /// Env var, else git config of the repository at `git_dir` (any dir inside it), else default.
@@ -507,6 +554,7 @@ fn modified_ns(m: &fs::Metadata) -> u64 {
 
 #[derive(Serialize, Deserialize, Clone)]
 struct Lease {
+    /// The workspace dir holding the `target` link (see `Repo::workspace`).
     worktree: PathBuf,
     head: String,
     acquired_at: u64,
@@ -579,7 +627,7 @@ impl Slot {
 
     fn state(&self) -> State {
         let Some(l) = &self.meta.lease else { return State::Free };
-        if l.pending && (l.worktree.join(".git").exists() || now().saturating_sub(l.acquired_at) < PENDING_TIMEOUT_SECS) {
+        if l.pending && (l.worktree.join("Cargo.toml").exists() || now().saturating_sub(l.acquired_at) < PENDING_TIMEOUT_SECS) {
             return State::Held;
         }
         if fs::read_link(l.worktree.join("target")).is_ok_and(|t| t == self.target()) {
@@ -1311,7 +1359,7 @@ fn backdate(wt: &Path, snap: &Snapshot) -> Result<(usize, usize)> {
 /// don't change when this worktree moves to another commit, so the units would stay fresh
 /// and keep embedding the other checkout's version info. Returns how many were reset.
 fn invalidate_foreign_git_inputs(repo: &Repo, target: &Path) -> Result<usize> {
-    let own_gitdir = git(&repo.worktree, &["rev-parse", "--path-format=absolute", "--git-dir"])?;
+    let own_gitdir = git(&repo.workspace, &["rev-parse", "--path-format=absolute", "--git-dir"])?;
     let common = repo.common_dir.as_os_str().as_bytes();
     let own_prefix = format!("{own_gitdir}/");
     let refers_elsewhere = |bytes: &[u8]| {
@@ -1825,16 +1873,35 @@ struct AttachOpts {
 }
 
 fn attach(path: &Path, opts: AttachOpts) -> Result<()> {
-    let repo = Repo::discover(path)?;
-    let _attach_lock =
-        attach_marker(&repo.worktree).map(|m| FileLock::acquire(&m.with_extension("lock"), true)).transpose()?;
-    if !repo.worktree.join("Cargo.toml").exists() {
-        if !opts.from_hook {
-            println!("{} is not a cargo workspace, nothing to do", repo.worktree.display());
-        }
-        return Ok(());
+    let repos = Repo::discover(path)?;
+    if repos.is_empty() && !opts.from_hook {
+        println!("{} is not in a cargo workspace, nothing to do", path.display());
     }
-    let link = repo.worktree.join("target");
+    each_workspace(&repos, |repo| attach_workspace(repo, &opts))
+}
+
+/// Run `f` for every workspace: one failing doesn't stop the others.
+fn each_workspace(repos: &[Repo], mut f: impl FnMut(&Repo) -> Result<()>) -> Result<()> {
+    let mut failed = 0;
+    for repo in repos {
+        if let Err(e) = f(repo) {
+            if repos.len() == 1 {
+                return Err(e);
+            }
+            eprintln!("cargo-pool: error: {}: {e:#}", repo.workspace.display());
+            failed += 1;
+        }
+    }
+    if failed > 0 {
+        bail!("{failed} of {} workspaces failed", repos.len());
+    }
+    Ok(())
+}
+
+fn attach_workspace(repo: &Repo, opts: &AttachOpts) -> Result<()> {
+    let _attach_lock =
+        attach_marker(&repo.workspace).map(|m| FileLock::acquire(&m.with_added_extension("lock"), true)).transpose()?;
+    let link = repo.workspace.join("target");
     // A failed compiler probe leaves an empty directory here to prevent Cargo caching its failure.
     let _ = fs::remove_dir(link.join(".rustc_info.json"));
     let slots_dir = repo.slots_dir();
@@ -1846,22 +1913,22 @@ fn attach(path: &Path, opts: AttachOpts) -> Result<()> {
                 let _lock = repo.lock()?;
                 let held = load_slots(&repo.slots_dir())?
                     .into_iter()
-                    .find(|s| s.target() == dest && s.meta.lease.as_ref().is_some_and(|l| l.worktree == repo.worktree));
+                    .find(|s| s.target() == dest && s.meta.lease.as_ref().is_some_and(|l| l.worktree == repo.workspace));
                 if let Some(mut slot) = held {
                     if slot.meta.lease.as_ref().is_some_and(|l| l.pending) {
                         drop(_lock);
                         let _build_locks = lock_target(&slot.target(), opts.wait_for_build)
                             .ok_or_else(|| anyhow!("{} is busy building", link.display()))?;
                         let _lock = repo.lock()?;
-                        let old = slot.saved_files(&repo.worktree).with_extension("attaching");
+                        let old = slot.saved_files(&repo.workspace).with_extension("attaching");
                         if old.exists() {
                             fs::remove_dir_all(old)?;
                         }
                         if slot.meta.adoption.is_some() {
-                            save_snapshot(&slot.dir, &take_snapshot(&repo.worktree, None)?)?;
+                            save_snapshot(&slot.dir, &take_snapshot(&repo.workspace, None)?)?;
                         }
                         if !slot.meta.seed_pending {
-                            prepare_worktree(&repo, &slot.dir)?;
+                            prepare_worktree(repo, &slot.dir)?;
                         }
                         slot.meta.lease.as_mut().unwrap().pending = false;
                         slot.meta.adoption = None;
@@ -1885,7 +1952,7 @@ fn attach(path: &Path, opts: AttachOpts) -> Result<()> {
                 let _pool = repo.lock()?;
                 if load_slots(&slots_dir)?.iter().any(|s| {
                     s.meta.adoption.is_some()
-                        && s.meta.lease.as_ref().is_some_and(|l| l.pending && l.worktree == repo.worktree)
+                        && s.meta.lease.as_ref().is_some_and(|l| l.pending && l.worktree == repo.workspace)
                 }) {
                     bail!("unfinished adoption; rerun attach without --force before discarding its source");
                 }
@@ -1900,18 +1967,18 @@ fn attach(path: &Path, opts: AttachOpts) -> Result<()> {
     if opts.from_hook
         && !cargo_output(&link)
         && wrapper_installed()
-        && let Some(marker) = attach_marker(&repo.worktree)
+        && let Some(marker) = attach_marker(&repo.workspace)
     {
         fs::write(marker, "")?;
         // An empty dir rather than nothing: other post-checkout hooks may fill a missing
         // `target` (e.g. by copying the main checkout's).
         fs::create_dir_all(&link)?;
-        exclude_target(&repo)?;
-        warn_path_dependent_config(&repo);
+        exclude_target(repo)?;
+        warn_path_dependent_config(repo);
         eprintln!("cargo-pool: {} gets a pooled target dir on the first cargo command", link.display());
         return Ok(());
     }
-    lease_slot(&repo, opts.seed, opts.wait_for_build)
+    lease_slot(repo, opts.seed, opts.wait_for_build)
 }
 
 fn cargo_output(target: &Path) -> bool {
@@ -2142,14 +2209,14 @@ fn adoption_source(target: &Path, strays: &[PathBuf]) -> Result<u64> {
 /// Lease the best free slot (or a new one) to the worktree and link its `target` to it.
 fn lease_slot(repo: &Repo, seed: bool, wait_for_build: bool) -> Result<()> {
     let started = Instant::now();
-    let link = repo.worktree.join("target");
+    let link = repo.workspace.join("target");
     let slots_dir = repo.slots_dir();
     let max_disk = repo.max_disk_percent();
     let (mut recovery, _recovery_lock) = {
         let _pool = repo.lock()?;
         let slot = load_slots(&slots_dir)?
             .into_iter()
-            .find(|s| s.meta.lease.as_ref().is_some_and(|l| l.pending && l.worktree == repo.worktree));
+            .find(|s| s.meta.lease.as_ref().is_some_and(|l| l.pending && l.worktree == repo.workspace));
         let lock = match &slot {
             Some(s) => Some(
                 FileLock::acquire(&s.dir.join("seed.lock"), false)?
@@ -2162,7 +2229,7 @@ fn lease_slot(repo: &Repo, seed: bool, wait_for_build: bool) -> Result<()> {
     let mut _build_locks =
         lock_target(&link, wait_for_build).ok_or_else(|| anyhow!("{} is busy building", link.display()))?;
     if let Some(slot) = &recovery {
-        let old = slot.saved_files(&repo.worktree).with_extension("attaching");
+        let old = slot.saved_files(&repo.workspace).with_extension("attaching");
         if fs::symlink_metadata(&old).is_ok_and(|m| m.is_dir()) {
             _build_locks.extend(
                 lock_target(&old, wait_for_build).ok_or_else(|| anyhow!("{} is busy building", old.display()))?,
@@ -2212,7 +2279,7 @@ fn lease_slot(repo: &Repo, seed: bool, wait_for_build: bool) -> Result<()> {
         }
     }
     let head = repo.head()?;
-    let lease = |pending| Lease { worktree: repo.worktree.clone(), head: head.clone(), acquired_at: now(), pending };
+    let lease = |pending| Lease { worktree: repo.workspace.clone(), head: head.clone(), acquired_at: now(), pending };
 
     let lock = repo.lock()?;
     let mut slots = load_slots(&repo.slots_dir())?;
@@ -2220,20 +2287,20 @@ fn lease_slot(repo: &Repo, seed: bool, wait_for_build: bool) -> Result<()> {
 
     // Best free slot: closest commit, then most recently used.
     let pending =
-        slots.iter().position(|s| s.meta.lease.as_ref().is_some_and(|l| l.pending && l.worktree == repo.worktree));
+        slots.iter().position(|s| s.meta.lease.as_ref().is_some_and(|l| l.pending && l.worktree == repo.workspace));
     let pick = slots
         .iter()
         .enumerate()
         .filter(|(_, s)| !adopting && s.state() == State::Free)
         .min_by_key(|(_, s)| {
-            (distance(&repo.worktree, s.meta.last_head.as_deref(), &head), u64::MAX - s.meta.last_used)
+            (distance(&repo.workspace, s.meta.last_head.as_deref(), &head), u64::MAX - s.meta.last_used)
         })
         .map(|(i, _)| i);
 
     let slot_idx = match pending.or(pick) {
         Some(i) => {
             let s = &mut slots[i];
-            let d = distance(&repo.worktree, s.meta.last_head.as_deref(), &head);
+            let d = distance(&repo.workspace, s.meta.last_head.as_deref(), &head);
             s.meta.lease = Some(lease(true));
             if adopting {
                 s.meta.seed_pending = false;
@@ -2278,7 +2345,7 @@ fn lease_slot(repo: &Repo, seed: bool, wait_for_build: bool) -> Result<()> {
 
     let slot = &mut slots[slot_idx];
     let _seed_lock = if recovery.is_none() { FileLock::acquire(&slot.dir.join("seed.lock"), true)? } else { None };
-    let saved = slot.saved_files(&repo.worktree);
+    let saved = slot.saved_files(&repo.workspace);
     preserve_link_targets(&link)?;
     exclude_target(repo)?;
     if cross_device {
@@ -2365,7 +2432,7 @@ fn lease_slot(repo: &Repo, seed: bool, wait_for_build: bool) -> Result<()> {
         symlink(slot.target(), &link).with_context(|| format!("creating {}", link.display()))?;
     }
     if adopting {
-        save_snapshot(&slot.dir, &take_snapshot(&repo.worktree, None)?)?;
+        save_snapshot(&slot.dir, &take_snapshot(&repo.workspace, None)?)?;
     }
     warn_path_dependent_config(repo);
     record(&slot.dir, Event::Attach { reused: pick.is_some(), ms: ms_since(started) });
@@ -2379,16 +2446,22 @@ fn lease_slot(repo: &Repo, seed: bool, wait_for_build: bool) -> Result<()> {
     Ok(())
 }
 
-/// Marks a worktree that should lease a slot on its next cargo command. Lives in the
+/// Marks a workspace that should lease a slot on its next cargo command. Lives in the
 /// worktree's own git dir, so it disappears with the worktree.
-fn attach_marker(worktree: &Path) -> Option<PathBuf> {
+fn attach_marker(workspace: &Path) -> Option<PathBuf> {
+    // The workspace is the worktree's top level or a directory one level down.
+    let (worktree, name) = if workspace.join(".git").exists() {
+        (workspace, "cargo-pool-attach".to_string())
+    } else {
+        (workspace.parent()?, format!("cargo-pool-attach-{}", workspace.file_name()?.to_string_lossy()))
+    };
     let dot_git = worktree.join(".git");
     let git_dir = match fs::read_to_string(&dot_git) {
         Ok(s) => worktree.join(s.strip_prefix("gitdir:")?.trim()),
         Err(_) if dot_git.is_dir() => dot_git,
         Err(_) => return None,
     };
-    Some(git_dir.join("cargo-pool-attach"))
+    Some(git_dir.join(name))
 }
 
 /// Lease a slot for a worktree whose attach was deferred, when cargo first probes the
@@ -2397,15 +2470,21 @@ fn attach_marker(worktree: &Path) -> Option<PathBuf> {
 fn attach_on_first_use() -> Result<()> {
     let cwd = std::env::current_dir()?;
     let Some(worktree) = cwd.ancestors().find(|a| a.join(".git").exists()) else { return Ok(()) };
-    let Some(marker) = attach_marker(worktree).filter(|m| m.exists()) else { return Ok(()) };
+    let Some((workspace, marker)) = cwd
+        .ancestors()
+        .take_while(|a| a.starts_with(worktree))
+        .find_map(|a| Some((a, attach_marker(a).filter(|m| m.exists())?)))
+    else {
+        return Ok(());
+    };
     // Parallel cargo commands wait for one attach.
     let _lock = FileLock::acquire(&marker, true)?;
     if !marker.exists() {
         return Ok(());
     }
-    if let Err(e) = attach(worktree, AttachOpts { seed: true, force: false, from_hook: false, wait_for_build: true }) {
+    if let Err(e) = attach(workspace, AttachOpts { seed: true, force: false, from_hook: false, wait_for_build: true }) {
         // Cargo caches failed probes too. A directory prevents that write while keeping logs accessible.
-        let cache = worktree.join("target/.rustc_info.json");
+        let cache = workspace.join("target/.rustc_info.json");
         let _ = fs::remove_file(&cache);
         fs::create_dir_all(&cache).context("preventing Cargo from caching a failed attach probe")?;
         return Err(e);
@@ -2425,7 +2504,7 @@ fn prepare_worktree(repo: &Repo, slot_dir: &Path) -> Result<()> {
     if backdate_enabled(repo)
         && let Some(snap) = valid_snapshot(slot_dir)
     {
-        (matched, total) = backdate(&repo.worktree, &snap)?;
+        (matched, total) = backdate(&repo.workspace, &snap)?;
         eprintln!(
             "cargo-pool: {matched} of {total} files are unchanged since the slot's last build; only the other {} count as edits",
             total - matched
@@ -2436,7 +2515,7 @@ fn prepare_worktree(repo: &Repo, slot_dir: &Path) -> Result<()> {
     if reset > 0 {
         eprintln!("cargo-pool: {reset} build units recorded another checkout's git state (e.g. git_version!); they'll rebuild here");
     }
-    prune(&repo.worktree, slot_dir, false)?;
+    prune(&repo.workspace, slot_dir, false)?;
     record(
         slot_dir,
         Event::Prepare { backdated: matched as u64, files: total as u64, reset: reset as u64, ms: ms_since(started) },
@@ -2475,7 +2554,7 @@ fn seed_on_first_use() -> Result<()> {
     let id: u32 = slot_dir.file_name().and_then(|n| n.to_str()).and_then(|n| n.parse().ok()).unwrap_or(0);
     let meta: SlotMeta = serde_json::from_slice(&fs::read(slot_dir.join("slot.json"))?)?;
     let Some(lease) = meta.lease.clone() else { return Ok(()) };
-    let repo = Repo::discover(&lease.worktree)?;
+    let repo = Repo::of_workspace(&lease.worktree)?;
     let mut slot = Slot { id, dir: slot_dir.to_path_buf(), meta };
     // Another cargo already started building into it: too late to swap the dir out.
     let seeded_from = if cargo_locks(&slot.target()).is_empty() {
@@ -2529,13 +2608,13 @@ fn path_dependent_linkers(worktree: &Path) -> Vec<(String, String)> {
 }
 
 fn warn_path_dependent_config(repo: &Repo) {
-    for (triple, linker) in path_dependent_linkers(&repo.worktree) {
+    for (triple, linker) in path_dependent_linkers(&repo.workspace) {
         eprintln!(
             "cargo-pool: warning: .cargo/config.toml sets target.{triple}.linker = \"{linker}\", a relative path.\n\
              cargo-pool:   Cargo hashes the resolved linker path into every crate's fingerprint, so each\n\
              cargo-pool:   worktree recompiles everything even with a shared target dir."
         );
-        if let (false, Some(main)) = (triple.starts_with("cfg("), &repo.main_worktree) {
+        if let (false, Some(main)) = (triple.starts_with("cfg("), &repo.main_workspace) {
             let var = format!("CARGO_TARGET_{}_LINKER", triple.to_uppercase().replace(['-', '.'], "_"));
             eprintln!(
                 "cargo-pool:   Fix: point it at a path that's the same in every checkout, e.g.\n\
@@ -2568,7 +2647,7 @@ fn seed_sources(repo: &Repo, slots: &[Slot]) -> Vec<(PathBuf, Option<String>)> {
             (s.target(), head)
         })
         .collect();
-    if let Some(main) = &repo.main_worktree {
+    if let Some(main) = &repo.main_workspace {
         let t = main.join("target");
         if fs::symlink_metadata(&t).is_ok_and(|m| m.is_dir()) {
             out.push((t, git(main, &["rev-parse", "HEAD"]).ok()));
@@ -2644,7 +2723,7 @@ fn seed_plan(src: &Path, lock: Option<&Lockfile>, rustc: Option<u64>) -> SeedPla
 fn seed(repo: &Repo, slot: &Slot, head: &str, sources: Vec<(PathBuf, Option<String>)>) -> Result<Option<String>> {
     let mut ranked: Vec<_> = sources
         .into_iter()
-        .map(|(t, h)| (distance(&repo.worktree, h.as_deref(), head), t.parent().map_or(0, last_compile_ns), t, h))
+        .map(|(t, h)| (distance(&repo.workspace, h.as_deref(), head), t.parent().map_or(0, last_compile_ns), t, h))
         .collect();
     ranked.sort_by_key(|(d, act, ..)| (*d, u64::MAX - act));
     let begun = Instant::now();
@@ -2653,8 +2732,8 @@ fn seed(repo: &Repo, slot: &Slot, head: &str, sources: Vec<(PathBuf, Option<Stri
     // What an interrupted seed left behind would count against the copy's room.
     let tmp = slot.dir.join("target.seeding");
     let _ = fs::remove_dir_all(&tmp);
-    let lock = Lockfile::read(&repo.worktree);
-    let toolchain = toolchain_hash(&repo.worktree);
+    let lock = Lockfile::read(&repo.workspace);
+    let toolchain = toolchain_hash(&repo.workspace);
     let root = repo.pool.parent().unwrap();
     // What a copy may take below the limit once free_disk has freed all it may for a seed, worked
     // out when the first copy doesn't fit: bigger candidates aren't worth another scan, and none
@@ -2668,7 +2747,7 @@ fn seed(repo: &Repo, slot: &Slot, head: &str, sources: Vec<(PathBuf, Option<Stri
         }
         // The receiver hasn't built yet: its compiler is the source slot's if their toolchain
         // files match. The main checkout's target has no stamp.
-        let from_main = repo.main_worktree.as_ref().is_some_and(|m| src == m.join("target"));
+        let from_main = repo.main_workspace.as_ref().is_some_and(|m| src == m.join("target"));
         let rustc = src
             .parent()
             .filter(|_| !from_main)
@@ -2758,7 +2837,7 @@ fn seed(repo: &Repo, slot: &Slot, head: &str, sources: Vec<(PathBuf, Option<Stri
         merge_target(&tmp, &slot.target(), Conflict::Destination)?;
         // Carry over the file snapshot that matches this target, so the new worktree can
         // be backdated: the source slot's (if still valid), or one of the main checkout.
-        let snap = match (&repo.main_worktree, src.parent()) {
+        let snap = match (&repo.main_workspace, src.parent()) {
             (Some(main), _) if src == main.join("target") => take_snapshot(main, None).ok(),
             (_, Some(src_slot)) => valid_snapshot(src_slot),
             _ => None,
@@ -2791,8 +2870,9 @@ fn exclude_target(repo: &Repo) -> Result<()> {
     let info = repo.common_dir.join("info");
     let exclude = info.join("exclude");
     let current = fs::read_to_string(&exclude).unwrap_or_default();
-    let patterns = ["/target", "/target.cargo-pool-files/"];
-    if patterns.iter().all(|pattern| current.lines().any(|l| l.trim() == *pattern)) {
+    let rel = repo.workspace.strip_prefix(&repo.worktree)?;
+    let patterns = ["target", "target.cargo-pool-files/"].map(|p| format!("/{}", rel.join(p).display()));
+    if patterns.iter().all(|pattern| current.lines().any(|l| l.trim() == pattern)) {
         return Ok(());
     }
     fs::create_dir_all(&info)?;
@@ -2809,16 +2889,23 @@ fn exclude_target(repo: &Repo) -> Result<()> {
 }
 
 fn detach(path: &Path) -> Result<()> {
-    let repo = Repo::discover(path)?;
+    let repos = Repo::discover(path)?;
+    if repos.is_empty() {
+        bail!("{} is not in a cargo workspace", path.display());
+    }
+    each_workspace(&repos, detach_workspace)
+}
+
+fn detach_workspace(repo: &Repo) -> Result<()> {
     let _attach_lock =
-        attach_marker(&repo.worktree).map(|m| FileLock::acquire(&m.with_extension("lock"), true)).transpose()?;
-    let link = repo.worktree.join("target");
+        attach_marker(&repo.workspace).map(|m| FileLock::acquire(&m.with_added_extension("lock"), true)).transpose()?;
+    let link = repo.workspace.join("target");
     let _ = fs::remove_dir(link.join(".rustc_info.json"));
     {
         let _pool = repo.lock()?;
         if let Some(mut slot) = load_slots(&repo.slots_dir())?
             .into_iter()
-            .find(|s| s.meta.lease.as_ref().is_some_and(|l| l.pending && l.worktree == repo.worktree))
+            .find(|s| s.meta.lease.as_ref().is_some_and(|l| l.pending && l.worktree == repo.workspace))
         {
             if slot.meta.adoption == Some(Adoption::Copying)
                 && !fs::symlink_metadata(&link).is_ok_and(|m| m.is_symlink())
@@ -2827,20 +2914,20 @@ fn detach(path: &Path) -> Result<()> {
                     .ok_or_else(|| anyhow!("slot {} is busy attaching", slot.id))?;
                 slot.release(None)?;
                 slot.save()?;
-                if let Some(marker) = attach_marker(&repo.worktree).filter(|m| m.exists()) {
+                if let Some(marker) = attach_marker(&repo.workspace).filter(|m| m.exists()) {
                     fs::remove_file(marker)?;
                 }
                 println!("cargo-pool: cancelled adoption; original target kept at {}", link.display());
                 return Ok(());
             }
-            bail!("{} has an unfinished attach; rerun attach before detaching", repo.worktree.display());
+            bail!("{} has an unfinished attach; rerun attach before detaching", repo.workspace.display());
         }
     }
-    if let Some(marker) = attach_marker(&repo.worktree).filter(|m| m.exists()) {
+    if let Some(marker) = attach_marker(&repo.workspace).filter(|m| m.exists()) {
         fs::remove_file(marker)?;
         if !fs::symlink_metadata(&link).is_ok_and(|m| m.is_symlink()) {
             let _ = fs::remove_dir(&link);
-            println!("cargo-pool: {} won't be attached on its first build anymore", repo.worktree.display());
+            println!("cargo-pool: {} won't be attached on its first build anymore", repo.workspace.display());
             return Ok(());
         }
     }
@@ -2852,7 +2939,7 @@ fn detach(path: &Path) -> Result<()> {
         .find(|s| s.target() == dest)
         .ok_or_else(|| anyhow!("{} points to {}, which is not a slot of this pool", link.display(), dest.display()))?;
     fs::remove_file(&link)?;
-    if slot.meta.lease.as_ref().is_some_and(|l| l.worktree == repo.worktree) {
+    if slot.meta.lease.as_ref().is_some_and(|l| l.worktree == repo.workspace) {
         slot.release(repo.head().ok())?;
         slot.save()?;
     }
@@ -2890,7 +2977,8 @@ fn du(p: &Path) -> String {
 
 fn status(size: bool) -> Result<()> {
     let cwd = std::env::current_dir()?;
-    let Ok(repo) = Repo::discover(&cwd) else {
+    let repos = Repo::discover(&cwd).unwrap_or_default();
+    if repos.is_empty() {
         for root in pool_roots()? {
             println!("pools in {}:", root.display());
             for e in fs::read_dir(&root).into_iter().flatten().flatten() {
@@ -2900,8 +2988,9 @@ fn status(size: bool) -> Result<()> {
             }
         }
         return Ok(());
-    };
-    for root in pool_roots()? {
+    }
+    let roots = pool_roots()?;
+    for (repo, root) in repos.iter().flat_map(|r| roots.iter().map(move |root| (r, root))) {
         let repo = Repo { pool: fs::canonicalize(root)?.join(repo.pool.file_name().unwrap()), ..repo.clone() };
         let _lock = repo.lock()?;
         let mut slots = load_slots(&repo.slots_dir())?;
@@ -2919,7 +3008,7 @@ fn status(size: bool) -> Result<()> {
         for s in &slots {
             let built = s.meta.lease.as_ref().map(|l| l.head.as_str()).or(s.meta.last_head.as_deref());
             let dist = match (&head, built) {
-                (Some(h), Some(b)) => match distance(&repo.worktree, Some(b), h) {
+                (Some(h), Some(b)) => match distance(&repo.workspace, Some(b), h) {
                     u64::MAX => "unrelated".into(),
                     d => format!("{d} from HEAD"),
                 },
@@ -2982,14 +3071,18 @@ struct Totals {
 }
 
 fn stats(days: Option<u64>) -> Result<()> {
-    let key = Repo::discover(&std::env::current_dir()?).ok().map(|r| r.pool.file_name().unwrap().to_owned());
+    let keys: Vec<OsString> = Repo::discover(&std::env::current_dir()?)
+        .unwrap_or_default()
+        .into_iter()
+        .map(|r| r.pool.file_name().unwrap().to_owned())
+        .collect();
     let cutoff = days.map_or(0, |d| now().saturating_sub(d * 86400));
     // Keyed by pool name: a repository's slots can be spread over several pool directories.
     let mut pools: BTreeMap<OsString, Totals> = BTreeMap::new();
     for root in pool_roots()? {
         for pool in fs::read_dir(&root).into_iter().flatten().flatten().map(|e| e.path()) {
             let name = pool.file_name().unwrap().to_owned();
-            if key.as_ref().is_some_and(|k| *k != name) || !pool.join("slots").is_dir() {
+            if (!keys.is_empty() && !keys.contains(&name)) || !pool.join("slots").is_dir() {
                 continue;
             }
             let t = pools.entry(name).or_default();
@@ -3115,8 +3208,10 @@ fn dur(ms: u64) -> String {
 }
 
 fn gc(max_age_days: Option<u64>, dry_run: bool) -> Result<()> {
-    let repo = Repo::discover(&std::env::current_dir()?)?;
-    for root in pool_roots()? {
+    let cwd = std::env::current_dir()?;
+    let repos = Repo::discover(&cwd)?;
+    let roots = pool_roots()?;
+    for (repo, root) in repos.iter().flat_map(|r| roots.iter().map(move |root| (r, root))) {
         let repo = Repo { pool: fs::canonicalize(root)?.join(repo.pool.file_name().unwrap()), ..repo.clone() };
         let lock = repo.lock()?;
         let mut slots = load_slots(&repo.slots_dir())?;
@@ -3145,12 +3240,13 @@ fn gc(max_age_days: Option<u64>, dry_run: bool) -> Result<()> {
             println!("no free slots unused for more than {d} days");
         }
         drop(lock);
-
-        let max_disk = repo.max_disk_percent();
-        let pct = disk_percent(&repo.pool, 0)?;
+    }
+    let max_disk = setting(&cwd, "CARGO_POOL_MAX_DISK_PERCENT", "cargo-pool.maxDiskPercent", 90.0);
+    for root in &roots {
+        fs::create_dir_all(root)?;
         if dry_run {
-            println!("disk at {pct:.1}% (limit {max_disk}%)");
-        } else if !free_disk(repo.pool.parent().unwrap(), max_disk, 0, &[], Evict::Any)? {
+            println!("disk at {:.1}% (limit {max_disk}%)", disk_percent(root, 0)?);
+        } else if !free_disk(root, max_disk, 0, &[], Evict::Any)? {
             eprintln!("cargo-pool: warning: disk is still above {max_disk}% after cleaning up all pools");
         }
     }
