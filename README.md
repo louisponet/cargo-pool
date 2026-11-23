@@ -48,6 +48,16 @@ Share warm cargo `target/` directories between git worktrees, so a fresh worktre
   place when a worktree takes it over, and after each build once its worktree's `Cargo.lock` or
   toolchain has changed. It never runs during a build. If a deleted unit was needed after all,
   cargo rebuilds it.
+- **Global shared dependency cache**: after each build (and when adopting an existing
+  `target/`), cargo-pool harvests finished external registry and git dependency units into
+  `<pool-directory>/shared/` (excluding any unit whose inputs reference the checkout or its
+  `.git/` metadata). Any new worktree, monorepo workspace, or separate repository whose
+  `Cargo.lock` and toolchain match hydrates missing dependency units from `shared/` in
+  parallel using copy-on-write reflinks when available (`FICLONE` on btrfs/XFS, falling back
+  to `copy_file_range` on ext4). This also warms new worktrees when all of a repo's slots
+  are busy building, and propagates newly built profiles (including `--release` and custom
+  `[profile.<name>]` profiles) or upgraded dependencies to other idle worktrees on their
+  next cargo command.
 - **Disk limit**: if a disk holding a pool directory is above `maxDiskPercent` (default 90%),
   cargo-pool frees space on that filesystem, across all repos' pools and configured
   directories, until usage is back under the limit. This happens on every attach, on every pooled build (with the rustc wrapper
@@ -55,13 +65,16 @@ Share warm cargo `target/` directories between git worktrees, so a fresh worktre
   one being written to: new slots go to the disk with the most room, so a full disk might
   otherwise never see another build. First it deletes the `incremental/` caches of the least
   recently used slots: they only speed up rebuilding a crate after an edit, and rustc starts
-  them over. Then it deletes the least recently used slots, whether or not a worktree holds
+  them over. Next it evicts the least recently used entries from the global shared dependency
+  cache. Then it deletes the least recently used slots, whether or not a worktree holds
   them. A slot counts as used when something is compiled into it or it is released. A worktree whose slot is deleted loses its `target` link and
   gets a new slot on its next cargo command. Slots with a build running or being seeded
   are never touched. Once attached, the main checkout's slot follows the same eviction rules.
-  A new slot is only seeded if the copy fits under the limit. Making room for it deletes
-  incremental caches of any slot, then only slots no worktree holds; if that isn't enough,
-  nothing is deleted and the slot starts empty.
+  A new slot is only seeded if the copy fits under the limit (with reflinks counted as 0
+  extra bytes on CoW filesystems). Making room for it deletes
+  incremental caches of any slot, then shared dependency units, then only slots no worktree holds; if that isn't enough,
+  nothing is deleted and the slot falls back to hydrating from `shared/` (narrowing to the
+  active profile if needed) or starts empty.
 - Leases end on their own when the worktree is deleted (`git worktree remove`),
   or explicitly with `cargo-pool detach`.
 - `/target` is added to `.git/info/exclude`, because `target/` patterns in `.gitignore`
@@ -168,20 +181,21 @@ entries remain.
 ## Path-dependent cargo config
 
 Sharing a target dir only helps if cargo's fingerprints don't depend on where the
-checkout lives. A relative linker in the repo's own config breaks that:
+checkout lives. A relative linker, `[env]` entry with `relative = true`, or relative
+`build.rustc` / `build.rustc-wrapper` in the repo's own config breaks that:
 
 ```toml
 [target.x86_64-unknown-linux-gnu]
 linker = "scripts/my-linker.sh"
 ```
 
-Cargo resolves the path inside each worktree and hashes the absolute linker path into every
+Cargo resolves the path inside each worktree and hashes the absolute path into every
 crate's fingerprint, so every worktree recompiles everything (`Dirty …: the config settings
-changed` in `cargo build -v`). `cargo-pool attach` warns about this. Build scripts that print
+changed` in `cargo build -v`). `cargo-pool attach` warns about all of these. Build scripts that print
 absolute `rerun-if-changed` paths outside their package have the same effect for everything
 depending on them ("the rerun-if-changed instructions changed"); print paths relative to
-the package instead. To fix it, give the
-linker a path that's identical in every checkout, e.g. the main checkout's copy:
+the package instead. To fix a relative linker, give it a path that's identical in every
+checkout, e.g. the main checkout's copy:
 
 ```sh
 export CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER=/path/to/main/checkout/scripts/my-linker.sh
@@ -190,9 +204,9 @@ export CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER=/path/to/main/checkout/scrip
 ## Metrics
 
 Every pool keeps an append-only log, `<pool-directory>/<repo>-<hash>/events.jsonl`, with one
-JSON line per attach, slot preparation (backdating), seed, build, snapshot, prune, trimmed
-incremental cache and evicted slot, including how long it took. A seed also counts the candidates
-it passed over and why. `cargo pool stats` sums it up:
+JSON line per attach, slot preparation (backdating), seed, shared dependency hydrate/harvest,
+build, snapshot, prune, trimmed incremental cache and evicted slot, including how long it took.
+A seed also counts the candidates it passed over and why. `cargo pool stats` sums it up:
 
 ```
 cargo-pool-ac7e5f46c861e3b5 (/home/you/cargo-pool/.git): 4 slots, 2 in use, all time
@@ -200,6 +214,7 @@ cargo-pool-ac7e5f46c861e3b5 (/home/you/cargo-pool/.git): 4 slots, 2 in use, all 
   seeded     6 of 7 new slots, 45.2G copied, 80.1G left out; 3m12s
   skipped    9 seed sources: 7 without room below the disk limit, 2 busy building, 0 failed to copy
   prepared   41 slots: 98112 of 99840 files backdated, 12 units reset; 8.4s
+  shared     94 hydrated (200M in 2 passes; 21ms), 94 harvested (199M in 2 passes; 36ms)
   setup      3m24s in total (attach + seed + prepare)
   built      120 cargo commands, 3412 units compiled; 1h02m
   snapshots  118 in the background; 1m03s
@@ -218,9 +233,9 @@ with nothing to compile don't show up, and without the wrapper no builds are rec
 |---|---|
 | `cargo pool attach [path] [--force] [--no-seed]` | attach the workspaces of a worktree at or below `path` and preserve their targets (idempotent); `--force` discards them |
 | `cargo pool detach [path]` | release the slots and remove the symlinks, or cancel a deferred attach or unfinished copy |
-| `cargo pool status [--size]` | show slots for this repo (all pools outside a repo) |
+| `cargo pool status [--size]` | show slots for this repo (all pools and shared dependency cache outside a repo) |
 | `cargo pool stats [--days D]` | show recorded metrics for this repo (all pools outside a repo) |
-| `cargo pool gc [--max-age-days D] [--dry-run]` | free disk space if over the limit; optionally delete free slots older than D days |
+| `cargo pool gc [--max-age-days D] [--dry-run]` | free disk space if over the limit; optionally delete free slots and shared dependency units older than D days |
 | `cargo pool install [--no-wrapper]` / `uninstall` | set up / remove the hook and the rustc wrapper |
 | `cargo pool install-hook [path] [--repo]` / `uninstall-hook [path]` | only the hook (global if supported, else per repo) |
 | `cargo pool install-wrapper` / `uninstall-wrapper` | only the rustc wrapper |

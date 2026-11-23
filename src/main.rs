@@ -17,6 +17,7 @@ use std::os::unix::fs::{MetadataExt, symlink};
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, anyhow, bail};
@@ -31,6 +32,10 @@ const IN_JOB_SLOT: &str = "CARGOPOOL_IN_JOB_SLOT";
 const NULL_SHA: &str = "0000000000000000000000000000000000000000";
 /// An unfinished lease whose worktree has disappeared is honoured for this long.
 const PENDING_TIMEOUT_SECS: u64 = 3 * 3600;
+/// Subdirectory under each pool root storing globally shared external dependency build units.
+const SHARED_DIR: &str = "shared";
+/// Linux `FICLONE` ioctl (`_IOW(0x94, 9, int)`) for copy-on-write reflinks on btrfs/XFS.
+const FICLONE: libc::Ioctl = 0x4004_9409 as libc::Ioctl;
 
 #[derive(Parser)]
 #[command(version, about = "Share warm cargo target dirs between git worktrees")]
@@ -148,7 +153,10 @@ fn main() {
 fn run(cli: Cli) -> Result<()> {
     match cli.cmd {
         Cmd::Attach { path, no_seed, force, allow_main: _, from_hook } => {
-            attach(&path_or_cwd(path)?, AttachOpts { seed: !no_seed, force, from_hook, wait_for_build: false })
+            attach(
+                &path_or_cwd(path)?,
+                AttachOpts { seed: !no_seed, force, from_hook, wait_for_build: false, rustc_bin: None },
+            )
         }
         Cmd::Detach { path } => detach(&path_or_cwd(path)?),
         Cmd::Status { size } => status(size),
@@ -181,7 +189,7 @@ fn run(cli: Cli) -> Result<()> {
             if prev != NULL_SHA {
                 return Ok(());
             }
-            let opts = AttachOpts { seed: true, force: false, from_hook: true, wait_for_build: false };
+            let opts = AttachOpts { seed: true, force: false, from_hook: true, wait_for_build: false, rustc_bin: None };
             attach(&std::env::current_dir()?, opts)
         }
     }
@@ -731,6 +739,85 @@ fn human(bytes: u64) -> String {
     if gb >= 1.0 { format!("{gb:.1}G") } else { format!("{:.0}M", bytes as f64 / (1u64 << 20) as f64) }
 }
 
+/// Probe whether `src_dir` and `dst_dir` support copy-on-write reflinks (`FICLONE`).
+fn supports_reflink(src_dir: &Path, dst_dir: &Path) -> bool {
+    let (Ok(sm), Ok(dm)) = (fs::metadata(src_dir), fs::metadata(dst_dir)) else { return false };
+    if sm.dev() != dm.dev() {
+        return false;
+    }
+    let tag = format!(".cargo-pool-reflink-{}-{}", std::process::id(), now_ns());
+    let src = src_dir.join(format!("{tag}.src"));
+    let dst = dst_dir.join(format!("{tag}.dst"));
+    let ok = (|| -> std::io::Result<bool> {
+        fs::write(&src, [0u8; 4096])?;
+        let sf = File::open(&src)?;
+        let df = File::create(&dst)?;
+        Ok(unsafe { libc::ioctl(df.as_raw_fd(), FICLONE, sf.as_raw_fd()) } == 0)
+    })()
+    .unwrap_or(false);
+    let _ = fs::remove_file(&src);
+    let _ = fs::remove_file(&dst);
+    ok
+}
+
+/// Copy one file or symlink from `src` to `dst`, using `FICLONE` reflink when supported and
+/// preserving permissions, mtime, and intra-copy hard links tracked in `linked`.
+fn copy_file_cow(src: &Path, dst: &Path, linked: &mut HashMap<(u64, u64), PathBuf>) -> Result<()> {
+    let meta = fs::symlink_metadata(src).with_context(|| format!("stat {}", src.display()))?;
+    if let Some(parent) = dst.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    if meta.is_symlink() {
+        let target = fs::read_link(src)?;
+        let _ = fs::remove_file(dst);
+        symlink(&target, dst)?;
+        return Ok(());
+    }
+    if meta.nlink() > 1 {
+        let key = (meta.dev(), meta.ino());
+        if let Some(existing) = linked.get(&key) {
+            let _ = fs::remove_file(dst);
+            if fs::hard_link(existing, dst).is_ok() {
+                return Ok(());
+            }
+        } else {
+            linked.insert(key, dst.to_path_buf());
+        }
+    }
+    let mut sf = File::open(src).with_context(|| format!("open {}", src.display()))?;
+    let _ = fs::remove_file(dst);
+    let mut df = File::create(dst).with_context(|| format!("create {}", dst.display()))?;
+    let cloned = unsafe { libc::ioctl(df.as_raw_fd(), FICLONE, sf.as_raw_fd()) } == 0;
+    if !cloned {
+        std::io::copy(&mut sf, &mut df).with_context(|| format!("copy {} -> {}", src.display(), dst.display()))?;
+    }
+    let _ = fs::set_permissions(dst, meta.permissions());
+    if let Ok(mtime) = meta.modified() {
+        let _ = df.set_modified(mtime);
+    }
+    Ok(())
+}
+
+/// Recursively copy `src` into `dst` (creating `dst` if needed) with `copy_file_cow`.
+/// Preserves directory mtimes after populating them.
+fn copy_tree_cow(src: &Path, dst: &Path, linked: &mut HashMap<(u64, u64), PathBuf>) -> Result<()> {
+    let meta = fs::symlink_metadata(src).with_context(|| format!("stat {}", src.display()))?;
+    if !meta.is_dir() {
+        return copy_file_cow(src, dst, linked);
+    }
+    fs::create_dir_all(dst)?;
+    for entry in fs::read_dir(src)? {
+        let entry = entry?;
+        copy_tree_cow(&entry.path(), &dst.join(entry.file_name()), linked)?;
+    }
+    if let Ok(mtime) = meta.modified()
+        && let Ok(d) = File::open(dst)
+    {
+        let _ = d.set_modified(mtime);
+    }
+    Ok(())
+}
+
 /// Which slots `free_disk` may delete. Any slot's incremental caches may go first.
 #[derive(PartialEq, Clone, Copy)]
 enum Evict {
@@ -762,6 +849,45 @@ fn incremental_entries(target: &Path) -> Vec<PathBuf> {
     incremental_caches(target).iter().flat_map(fs::read_dir).flatten().flatten().map(|e| e.path()).collect()
 }
 
+/// Cached external units in `<root>/shared/units/` on `root`'s filesystem, least recently used first.
+fn shared_reclaim_candidates(root: &Path, protect: &[&Path]) -> Result<Vec<PathBuf>> {
+    let mut units = vec![];
+    let device = fs::metadata(root)?.dev();
+    for directory in pool_roots()? {
+        if !fs::metadata(&directory).is_ok_and(|m| m.dev() == device) {
+            continue;
+        }
+        let shared_units = directory.join(SHARED_DIR).join("units");
+        for kind in ["reg", "git"] {
+            for origin_dir in fs::read_dir(shared_units.join(kind)).into_iter().flatten().flatten() {
+                if !origin_dir.file_type().is_ok_and(|t| t.is_dir()) {
+                    continue;
+                }
+                for unit in fs::read_dir(origin_dir.path()).into_iter().flatten().flatten() {
+                    let path = unit.path();
+                    if !unit.file_type().is_ok_and(|t| t.is_dir()) || protect.contains(&path.as_path()) {
+                        continue;
+                    }
+                    units.push((mtime_ns(&path), path));
+                }
+            }
+        }
+    }
+    units.sort_by_key(|(used, _)| *used);
+    Ok(units.into_iter().map(|(_, p)| p).collect())
+}
+
+/// Remove a shared unit directory and prune its parent origin directory if it becomes empty.
+fn remove_shared_unit(unit_dir: &Path) -> Result<()> {
+    if unit_dir.exists() {
+        fs::remove_dir_all(unit_dir).with_context(|| format!("removing {}", unit_dir.display()))?;
+    }
+    if let Some(origin_dir) = unit_dir.parent() {
+        let _ = fs::remove_dir(origin_dir);
+    }
+    Ok(())
+}
+
 /// Slots on `root`'s filesystem, across configured directories, that `free_disk` may take space
 /// from, least recently used first. Discards abandoned partial copies on the way.
 fn reclaim_candidates(root: &Path, protect: &[&Path], evict: Evict) -> Result<Vec<Reclaim>> {
@@ -773,6 +899,9 @@ fn reclaim_candidates(root: &Path, protect: &[&Path], evict: Evict) -> Result<Ve
             continue;
         }
         for pool in fs::read_dir(directory)?.flatten().map(|e| e.path()) {
+            if pool.file_name().is_some_and(|n| n == SHARED_DIR) || !pool.join("slots").is_dir() {
+                continue;
+            }
             for s in load_slots(&pool.join("slots"))? {
                 if protect.contains(&s.dir.as_path()) {
                     continue;
@@ -812,9 +941,13 @@ fn lock_candidate(c: &Reclaim) -> Result<Option<(Slot, Vec<FileLock>)>> {
     Ok(Some((s, locks)))
 }
 
-/// Bytes `free_disk` could take from `candidates` right now, in its order, counted until `enough`
-/// says so: every incremental cache, then every deletable slot.
-fn reclaimable(candidates: &[Reclaim], mut enough: impl FnMut(u64) -> Result<bool>) -> Result<u64> {
+/// Bytes `free_disk` could take from `candidates` and `shared` right now, in its order, counted
+/// until `enough` says so: every incremental cache, then LRU shared units, then every deletable slot.
+fn reclaimable(
+    candidates: &[Reclaim],
+    shared: &[PathBuf],
+    mut enough: impl FnMut(u64) -> Result<bool>,
+) -> Result<u64> {
     let mut freed = 0;
     let mut caches = vec![0; candidates.len()];
     // The probe lets its locks go before the walk, which would otherwise stall a build starting
@@ -827,6 +960,12 @@ fn reclaimable(candidates: &[Reclaim], mut enough: impl FnMut(u64) -> Result<boo
             *cache = dir_size(incremental_entries(&c.slot.target()), &[]);
             freed += *cache;
         }
+    }
+    for unit in shared {
+        if enough(freed)? {
+            return Ok(freed);
+        }
+        freed += dir_size([unit], &[]);
     }
     for (c, cache) in candidates.iter().zip(caches).filter(|(c, _)| c.deletable) {
         if enough(freed)? {
@@ -842,10 +981,9 @@ fn reclaimable(candidates: &[Reclaim], mut enough: impl FnMut(u64) -> Result<boo
 /// Free space on `root`'s filesystem, across configured directories, until disk usage (plus
 /// `extra` bytes about to be written) is below `max_percent`.
 ///
-/// The incremental caches of the least recently used slots go first: losing one costs a worktree
-/// a slower rebuild of the next crate it edits, while losing a slot costs a reseed or a full
-/// build. Then whole slots go, least recently used first; `evict` says whether held ones may go
-/// too. A deleted held slot's worktree is re-attached on its next build. Slots in `protect`,
+/// The incremental caches of the least recently used slots go first, then least recently used
+/// globally shared dependency units, then whole slots (`evict` says whether held ones may go
+/// too). A deleted held slot's worktree is re-attached on its next build. Slots in `protect`,
 /// slots being attached, seeded or built and pools locked by another cargo-pool process are
 /// never touched. Must be called without holding any pool lock. Returns whether the goal was met.
 ///
@@ -858,10 +996,11 @@ fn free_disk(root: &Path, max_percent: f64, extra: u64, protect: &[&Path], evict
         return Ok(true);
     }
     let candidates = reclaim_candidates(root, protect, evict)?;
+    let shared = shared_reclaim_candidates(root, protect)?;
     if fits(0)? {
         return Ok(true);
     }
-    if extra > 0 && !fits(reclaimable(&candidates, &fits)?)? {
+    if extra > 0 && !fits(reclaimable(&candidates, &shared, &fits)?)? {
         return Ok(false);
     }
 
@@ -894,6 +1033,33 @@ fn free_disk(root: &Path, max_percent: f64, extra: u64, protect: &[&Path], evict
         if fits(0)? {
             return Ok(true);
         }
+    }
+
+    let (mut shared_evicted, mut shared_bytes) = (0u64, 0u64);
+    for unit in &shared {
+        let size = dir_size([unit], &[]);
+        if size == 0 && !unit.exists() {
+            continue;
+        }
+        if remove_shared_unit(unit).is_ok() {
+            shared_evicted += 1;
+            shared_bytes += size;
+        }
+        if fits(0)? {
+            if shared_evicted > 0 {
+                eprintln!(
+                    "cargo-pool: disk above {max_percent}%: evicted {shared_evicted} shared dependency units ({})",
+                    human(shared_bytes)
+                );
+            }
+            return Ok(true);
+        }
+    }
+    if shared_evicted > 0 {
+        eprintln!(
+            "cargo-pool: disk above {max_percent}%: evicted {shared_evicted} shared dependency units ({})",
+            human(shared_bytes)
+        );
     }
 
     for c in candidates.iter().filter(|c| c.deletable) {
@@ -947,15 +1113,18 @@ fn is_rustc_wrapper(args: &[OsString]) -> bool {
 /// compiler (through `CARGO_POOL_RUSTC_WRAPPER`, e.g. sccache, if set).
 fn rustc_wrapper(args: Vec<OsString>) -> ! {
     if args[2..].iter().any(|a| a == "-vV") {
-        if let Err(e) = attach_on_first_use() {
+        if let Err(e) = attach_on_first_use(&args[1]) {
             eprintln!("cargo-pool: attaching to a pooled target dir failed: {e:#}");
             std::process::exit(1);
         }
-        if let Err(e) = seed_on_first_use() {
+        if let Err(e) = seed_on_first_use(&args[1]) {
             eprintln!("cargo-pool: warning: seeding the slot failed, building from scratch: {e:#}");
         }
+        if let Err(e) = hydrate_on_probe(&args[1]) {
+            eprintln!("cargo-pool: warning: hydrating shared dependencies failed: {e:#}");
+        }
     }
-    if let Err(e) = check_disk_during_build(&args[2..]) {
+    if let Err(e) = check_disk_during_build(&args[1], &args[2..]) {
         eprintln!("cargo-pool: warning: disk check failed: {e:#}");
     }
     let held = hold_job_slot(&args[2..]).unwrap_or_else(|e| {
@@ -1038,7 +1207,7 @@ fn hold_job_slot(rustc_args: &[OsString]) -> Result<bool> {
     }
 }
 
-fn check_disk_during_build(rustc_args: &[OsString]) -> Result<()> {
+fn check_disk_during_build(rustc_bin: &OsString, rustc_args: &[OsString]) -> Result<()> {
     let Some(out_dir) = rustc_args.iter().position(|a| a == "--out-dir").and_then(|i| rustc_args.get(i + 1)) else {
         return Ok(());
     };
@@ -1053,7 +1222,7 @@ fn check_disk_during_build(rustc_args: &[OsString]) -> Result<()> {
         && slots == "slots"
     {
         let dir = root.join(pool).join(slots).join(id);
-        if let Err(e) = note_pooled_compile(&dir) {
+        if let Err(e) = note_pooled_compile(&dir, rustc_bin) {
             eprintln!("cargo-pool: warning: can't track build for mtime snapshots: {e:#}");
         }
         slot_dir = Some(dir);
@@ -1234,12 +1403,11 @@ fn dir_listing_hash(p: &Path) -> Option<u64> {
     Some(names.iter().fold(FNV_OFFSET, |h, n| fnv1a_update(fnv1a_update(h, n.as_encoded_bytes()), b"\0")))
 }
 
-fn hash_file(p: &Path) -> Option<u64> {
+fn hash_file_buf(p: &Path, buf: &mut [u8]) -> Option<u64> {
     let mut f = File::open(p).ok()?;
-    let mut buf = vec![0; 1 << 16];
     let mut h = FNV_OFFSET;
     loop {
-        match f.read(&mut buf).ok()? {
+        match f.read(buf).ok()? {
             0 => return Some(h),
             n => h = fnv1a_update(h, &buf[..n]),
         }
@@ -1256,6 +1424,7 @@ fn worktree_files(wt: &Path) -> Result<Vec<String>> {
 
 fn take_snapshot(wt: &Path, prev: Option<&Snapshot>) -> Result<Snapshot> {
     let mut snap = Snapshot { taken_at: now_ns(), ..Default::default() };
+    let mut buf = vec![0u8; 1 << 16];
     for rel in worktree_files(wt)? {
         let p = wt.join(&rel);
         let Ok(m) = fs::symlink_metadata(&p) else { continue };
@@ -1266,7 +1435,7 @@ fn take_snapshot(wt: &Path, prev: Option<&Snapshot>) -> Result<Snapshot> {
         let hash = match prev.and_then(|s| s.files.get(&rel)) {
             Some(&(s, t, h)) if (s, t) == (size, mtime) => h,
             _ => {
-                let Some(h) = hash_file(&p) else { continue };
+                let Some(h) = hash_file_buf(&p, &mut buf) else { continue };
                 // Modified while hashing: the hash may not belong to this mtime.
                 match fs::symlink_metadata(&p) {
                     Ok(m) if (m.len(), modified_ns(&m)) == (size, mtime) => h,
@@ -1315,29 +1484,62 @@ fn valid_snapshot(slot_dir: &Path) -> Option<Snapshot> {
     load_snapshot(slot_dir).filter(|s| s.taken_at > last_compile_ns(slot_dir))
 }
 
+fn io_workers(items: usize) -> usize {
+    if items < 4 {
+        return 1;
+    }
+    std::thread::available_parallelism().map_or(1, |n| n.get()).min(8).min(items)
+}
+
 /// Give every file in `wt` whose content matches the snapshot its recorded mtime.
 /// Returns (files matched, files in the worktree).
 fn backdate(wt: &Path, snap: &Snapshot) -> Result<(usize, usize)> {
     let files = worktree_files(wt)?;
-    let mut matched = 0;
-    for rel in &files {
-        let Some(&(size, mtime, hash)) = snap.files.get(rel) else { continue };
+    let backdate_one = |rel: &String, buf: &mut Vec<u8>| -> bool {
+        let Some(&(size, mtime, hash)) = snap.files.get(rel) else { return false };
         let p = wt.join(rel);
-        let Ok(m) = fs::symlink_metadata(&p) else { continue };
+        let Ok(m) = fs::symlink_metadata(&p) else { return false };
         if !m.is_file() || m.len() != size {
-            continue;
+            return false;
         }
         if modified_ns(&m) != mtime {
-            if hash_file(&p) != Some(hash) {
-                continue;
+            if hash_file_buf(&p, buf) != Some(hash) {
+                return false;
             }
             if let Err(e) = File::open(&p).and_then(|f| f.set_modified(UNIX_EPOCH + Duration::from_nanos(mtime))) {
                 eprintln!("cargo-pool: warning: cannot backdate {}: {e}", p.display());
-                continue;
+                return false;
             }
         }
-        matched += 1;
-    }
+        true
+    };
+    let workers = if files.len() >= 64 { io_workers(files.len()) } else { 1 };
+    let matched = if workers <= 1 {
+        let mut buf = vec![0u8; 1 << 16];
+        files.iter().filter(|rel| backdate_one(rel, &mut buf)).count()
+    } else {
+        let next = AtomicUsize::new(0);
+        let matched = AtomicUsize::new(0);
+        std::thread::scope(|s| {
+            for _ in 0..workers {
+                s.spawn(|| {
+                    let mut buf = vec![0u8; 1 << 16];
+                    let mut local = 0;
+                    loop {
+                        let i = next.fetch_add(1, Ordering::Relaxed);
+                        if i >= files.len() {
+                            break;
+                        }
+                        if backdate_one(&files[i], &mut buf) {
+                            local += 1;
+                        }
+                    }
+                    matched.fetch_add(local, Ordering::Relaxed);
+                });
+            }
+        });
+        matched.into_inner()
+    };
     // Same for directories whose entries are unchanged (setting a child's mtime doesn't
     // touch its parent's, so the order doesn't matter).
     for (rel, &(mtime, listing)) in &snap.dirs {
@@ -1378,6 +1580,11 @@ fn invalidate_foreign_git_inputs(repo: &Repo, target: &Path) -> Result<usize> {
             .into_iter()
             .flatten()
             .flatten()
+            .filter(|f| {
+                let name = f.file_name();
+                let s = name.to_string_lossy();
+                s.ends_with(".json") || s.starts_with("dep-")
+            })
             .any(|f| fs::read(f.path()).is_ok_and(|b| refers_elsewhere(&b)));
         if foreign {
             fs::remove_dir_all(&fingerprint)?;
@@ -1444,6 +1651,7 @@ struct Lockfile {
 }
 
 /// Where a build unit's crate came from.
+#[derive(Clone)]
 enum Origin {
     /// `<name>-<version>`.
     Registry(String),
@@ -1547,13 +1755,16 @@ fn unit_hash(name: &str) -> Option<&str> {
     })
 }
 
-/// What pruning reads from a unit's fingerprint JSON (`<kind>-<target>.json`).
+/// What pruning and shared-cache harvesting read from a unit's fingerprint JSON (`<kind>-<target>.json`).
 #[derive(Deserialize)]
 struct Fingerprint {
     /// Hash of the compiler that built the unit.
     rustc: Option<u64>,
     /// (package id, name, public, fingerprint)
     deps: Vec<(u64, String, bool, u64)>,
+    /// Local fingerprint checks (`RerunIfChanged`, `CheckDepInfo`, `RerunIfEnvChanged`, ...).
+    #[serde(default)]
+    local: Vec<serde_json::Value>,
 }
 
 /// Build units in `target` that a worktree at `lock` can't use: built from a crate version or git
@@ -1713,15 +1924,1086 @@ fn prune(worktree: &Path, slot_dir: &Path, just_built: bool) -> Result<()> {
     Ok(())
 }
 
+// ---------------------------------------------------------------------------
+// global shared external-unit store (`<pool-root>/shared/`)
+//
+// Registry and git dependency units whose transitive dependencies are all external produce
+// identical Cargo unit hashes across worktrees, monorepo workspaces, and repositories.
+// After each build, `snapshot_after_build` harvests finished external units into
+// `<pool-root>/shared/units/<reg|git>/<origin>/<profile>__<hash>__<rustc>__<fp>/`.
+// New slots (via seed) and warm slots (via attach or `rustc -vV` probe) hydrate missing
+// `Cargo.lock`-pinned units from the shared store using reflinks where supported or copies.
+
+#[derive(Serialize, Deserialize)]
+struct SharedUnitMeta {
+    profile: String,
+    hash: String,
+    rustc: u64,
+    fp: u64,
+    deps: Vec<u64>,
+}
+
+struct ExternalUnit {
+    profile_rel: String,
+    hash: String,
+    origin: Origin,
+    rustc: u64,
+    fp: u64,
+    deps: Vec<u64>,
+    /// Paths relative to `<target>/<profile_rel>` belonging to this unit.
+    files: Vec<PathBuf>,
+}
+
+fn safe_path_component(s: &str) -> bool {
+    !s.is_empty() && !s.contains('/') && !s.contains('\\') && s != "." && s != ".."
+}
+
+fn encode_profile(rel: &str) -> String {
+    rel.replace('/', "%")
+}
+
+fn decode_profile(enc: &str) -> String {
+    enc.replace('%', "/")
+}
+
+fn origin_subpath(origin: &Origin) -> Option<PathBuf> {
+    match origin {
+        Origin::Registry(pkg) if safe_path_component(pkg) => Some(PathBuf::from("reg").join(pkg)),
+        Origin::Git(rev) if safe_path_component(rev) => Some(PathBuf::from("git").join(rev)),
+        _ => None,
+    }
+}
+
+/// Parse `<profile_enc>__<hash>__<rustc>__<fp>` from a shared unit directory name.
+fn parse_shared_unit_name(name: &str) -> Option<(String, String, u64, u64)> {
+    let mut parts = name.split("__");
+    let profile = decode_profile(parts.next()?);
+    let hash = parts.next()?.to_string();
+    let rustc: u64 = parts.next()?.parse().ok()?;
+    let fp: u64 = parts.next()?.parse().ok()?;
+    if parts.next().is_some() || !is_hash(&hash) {
+        return None;
+    }
+    Some((profile, hash, rustc, fp))
+}
+
+fn contains_bytes(haystack: &[u8], needle: &[u8]) -> bool {
+    !needle.is_empty() && haystack.windows(needle.len()).any(|w| w == needle)
+}
+
+fn local_references_worktree(local: &[serde_json::Value], worktree: &[u8], common_dir: &[u8]) -> bool {
+    let check_path = |s: &str| {
+        let b = s.as_bytes();
+        Path::new(s).is_absolute()
+            && (b.starts_with(worktree) || b.starts_with(common_dir) || contains_bytes(b, b"/.git/"))
+    };
+    for item in local {
+        if let Some(paths) = item.get("RerunIfChanged").and_then(|v| v.get("paths")).and_then(|v| v.as_array())
+            && paths.iter().filter_map(|p| p.as_str()).any(check_path)
+        {
+            return true;
+        }
+    }
+    false
+}
+
+/// Extract finished purely-external build units from `target` (registry/git crates whose
+/// transitive dependencies are all external and that don't reference files in `worktree` or `common_dir`).
+fn extract_external_units(target: &Path, worktree: &Path, common_dir: &Path) -> Vec<ExternalUnit> {
+    struct RawUnit {
+        profile_idx: usize,
+        profile_rel: String,
+        hash: String,
+        dir: Option<PathBuf>,
+        origin: Option<Origin>,
+        is_run_build_script: bool,
+        rustc: Option<u64>,
+        own_fp: Option<u64>,
+        deps: Vec<u64>,
+        external: bool,
+        references_worktree: bool,
+    }
+    let wt_bytes = worktree.as_os_str().as_encoded_bytes();
+    let common_bytes = common_dir.as_os_str().as_encoded_bytes();
+    let wt_target = worktree.join("target");
+    let wt_target_bytes = wt_target.as_os_str().as_encoded_bytes();
+    let target_bytes = target.as_os_str().as_encoded_bytes();
+    let path_has_prefix = |p: &[u8], prefix: &[u8]| {
+        !prefix.is_empty() && p.starts_with(prefix) && matches!(p.get(prefix.len()), None | Some(b'/'))
+    };
+    let is_in_target = |p: &[u8]| {
+        path_has_prefix(p, wt_target_bytes)
+            || path_has_prefix(p, target_bytes)
+            || (contains_bytes(p, b"/build/") && contains_bytes(p, b"/out/"))
+    };
+    let token_refs_wt = |tok: &[u8]| {
+        !is_in_target(tok)
+            && (path_has_prefix(tok, wt_bytes)
+                || path_has_prefix(tok, common_bytes)
+                || contains_bytes(tok, b"/.git/"))
+    };
+    let dep_refs_wt = |dep_info: &Path| {
+        let Ok(bytes) = fs::read(dep_info) else { return false };
+        bytes.split(|&b| b == b'\n').any(|line| {
+            let line = line.strip_suffix(b"\r").unwrap_or(line);
+            if line.is_empty() || line.starts_with(b"# env-dep:OUT_DIR=") {
+                return false;
+            }
+            if let Some(rest) = line.strip_prefix(b"# env-dep:") {
+                let val = rest.splitn(2, |&b| b == b'=').nth(1).unwrap_or(rest);
+                return token_refs_wt(val);
+            }
+            if line.starts_with(b"#") || line.ends_with(b":") {
+                return false;
+            }
+            let rhs = match line.windows(2).position(|w| w == b": ") {
+                Some(i) => &line[i + 2..],
+                None => line,
+            };
+            // Split Makefile dep paths on unescaped spaces.
+            let mut start = 0;
+            let mut i = 0;
+            while i < rhs.len() {
+                if rhs[i] == b'\\' && i + 1 < rhs.len() {
+                    i += 2;
+                    continue;
+                }
+                if rhs[i] == b' ' {
+                    if i > start && token_refs_wt(&rhs[start..i]) {
+                        return true;
+                    }
+                    start = i + 1;
+                }
+                i += 1;
+            }
+            start < rhs.len() && token_refs_wt(&rhs[start..])
+        })
+    };
+
+    let profiles = profile_dirs(target);
+    let mut units = vec![];
+    let mut by_fingerprint: HashMap<u64, usize> = HashMap::new();
+    // Classic layout file index per profile: hash -> Vec<relative path from profile dir>.
+    let mut classic_files: Vec<HashMap<String, Vec<PathBuf>>> = vec![HashMap::new(); profiles.len()];
+
+    for (p, profile) in profiles.iter().enumerate() {
+        let Ok(profile_rel) = profile.strip_prefix(target) else { continue };
+        let profile_rel = profile_rel.to_string_lossy().into_owned();
+        if profile_rel.is_empty() {
+            continue;
+        }
+        let mut origins: HashMap<String, (Origin, bool)> = HashMap::new();
+        for sub in [".fingerprint", "deps", "build", "examples"] {
+            for e in fs::read_dir(profile.join(sub)).into_iter().flatten().flatten() {
+                let name = e.file_name();
+                let Some(s) = name.to_str() else { continue };
+                let Some(hash) = unit_hash(s) else { continue };
+                classic_files[p].entry(hash.to_string()).or_default().push(Path::new(sub).join(&name));
+                if sub == "deps" && s.ends_with(".d")
+                    && let Some(o) = origin(&e.path())
+                {
+                    origins.insert(hash.to_string(), (o, dep_refs_wt(&e.path())));
+                } else if sub == "build" && e.file_type().is_ok_and(|t| t.is_dir()) {
+                    for f in fs::read_dir(e.path()).into_iter().flatten().flatten() {
+                        let fname = f.file_name();
+                        if let Some(fs) = fname.to_str().filter(|n| n.ends_with(".d"))
+                            && unit_hash(fs) == Some(hash)
+                            && let Some(o) = origin(&f.path())
+                        {
+                            origins.insert(hash.to_string(), (o, dep_refs_wt(&f.path())));
+                        }
+                    }
+                }
+            }
+        }
+
+        for (hash, fingerprint, dir) in profile_units(profile) {
+            let Some(hash) = hash else { continue };
+            let (mut deps, mut finished, mut rustc, mut own_fp) = (vec![], false, None, None);
+            let (mut is_run_bs, mut is_build_bs, mut refs_wt) = (false, false, false);
+            for f in fs::read_dir(&fingerprint).into_iter().flatten().flatten() {
+                let path = f.path();
+                let name = f.file_name();
+                let name_str = name.to_string_lossy();
+                if path.extension().is_none_or(|x| x != "json") {
+                    continue;
+                }
+                finished = true;
+                is_run_bs |= name_str.starts_with("run-build-script-");
+                is_build_bs |= name_str.starts_with("build-script-");
+                if let Some(json) = fs::read(&path).ok().and_then(|b| serde_json::from_slice::<Fingerprint>(&b).ok()) {
+                    deps.extend(json.deps.iter().map(|d| d.3));
+                    rustc = rustc.or(json.rustc);
+                    refs_wt |= local_references_worktree(&json.local, wt_bytes, common_bytes);
+                }
+                if let Some(fp) = fs::read_to_string(path.with_extension("")).ok().and_then(|s| u64::from_str_radix(s.trim(), 16).ok()) {
+                    let fp = fp.swap_bytes();
+                    by_fingerprint.insert(fp, units.len());
+                    own_fp = own_fp.or(Some(fp));
+                }
+            }
+            let (origin, dep_wt) = match &dir {
+                None => origins.remove(&hash).map_or((None, false), |(o, w)| (Some(o), w)),
+                Some(dir) => fs::read_dir(dir.join("out"))
+                    .into_iter()
+                    .flatten()
+                    .flatten()
+                    .find_map(|e| {
+                        let name = e.file_name();
+                        let s = name.to_str()?;
+                        if !s.ends_with(".d") {
+                            return None;
+                        }
+                        let own = unit_hash(s) == Some(hash.as_str()) || (is_build_bs && !is_run_bs);
+                        own.then(|| origin(&e.path()).map(|o| (o, dep_refs_wt(&e.path())))).flatten()
+                    })
+                    .map_or((None, false), |(o, w)| (Some(o), w)),
+            };
+            refs_wt |= dep_wt;
+            let external = finished && rustc.is_some() && own_fp.is_some() && !refs_wt && origin.is_some();
+            units.push(RawUnit {
+                profile_idx: p,
+                profile_rel: profile_rel.clone(),
+                hash,
+                dir,
+                origin,
+                is_run_build_script: is_run_bs,
+                rustc,
+                own_fp,
+                deps,
+                external,
+                references_worktree: refs_wt,
+            });
+        }
+    }
+
+    // `run-build-script` units have no `.d` file of their own; inherit origin from their `build-script-build` dep.
+    for i in 0..units.len() {
+        if units[i].is_run_build_script && units[i].origin.is_none() && !units[i].references_worktree {
+            let inherited = units[i]
+                .deps
+                .iter()
+                .find_map(|fp| by_fingerprint.get(fp).and_then(|&j| units[j].origin.clone()));
+            if let Some(o) = inherited {
+                units[i].origin = Some(o);
+                units[i].external = units[i].rustc.is_some() && units[i].own_fp.is_some();
+            }
+        }
+    }
+
+    // Fixed-point closure: drop any unit whose transitive deps aren't all present and external.
+    let mut changed = true;
+    while changed {
+        changed = false;
+        for i in 0..units.len() {
+            if !units[i].external {
+                continue;
+            }
+            let ok = units[i].deps.iter().all(|fp| by_fingerprint.get(fp).is_some_and(|&j| units[j].external));
+            if !ok {
+                units[i].external = false;
+                changed = true;
+            }
+        }
+    }
+
+    let mut out = vec![];
+    for u in units.into_iter().filter(|u| u.external) {
+        let Some(origin) = u.origin else { continue };
+        let (Some(rustc), Some(fp)) = (u.rustc, u.own_fp) else { continue };
+        let files = match u.dir {
+            Some(dir) => match dir.strip_prefix(&profiles[u.profile_idx]) {
+                Ok(rel) => vec![rel.to_path_buf()],
+                Err(_) => continue,
+            },
+            None => classic_files[u.profile_idx].remove(&u.hash).unwrap_or_default(),
+        };
+        if files.is_empty() {
+            continue;
+        }
+        out.push(ExternalUnit { profile_rel: u.profile_rel, hash: u.hash, origin, rustc, fp, deps: u.deps, files });
+    }
+    out
+}
+
+/// FNV-1a hex digest of `rustc -vV` output, used to map a compiler binary to Cargo's `Fingerprint.rustc`.
+fn rustc_vv_hash(rustc_bin: Option<&OsString>, cwd: &Path) -> Option<String> {
+    let program = rustc_bin.map(Path::new).unwrap_or_else(|| Path::new("rustc"));
+    let out = Command::new(program).arg("-vV").current_dir(cwd).output().ok()?;
+    if !out.status.success() || out.stdout.is_empty() {
+        return None;
+    }
+    Some(format!("{:016x}", fnv1a(&out.stdout)))
+}
+
+fn record_toolchain(shared_dir: &Path, vv_hash: &str, rustc_fp: u64) -> Result<()> {
+    fs::create_dir_all(shared_dir)?;
+    let _lock = FileLock::acquire(&shared_dir.join(".lock"), true)?;
+    let path = shared_dir.join("toolchains.json");
+    let mut map: BTreeMap<String, u64> = fs::read(&path)
+        .ok()
+        .and_then(|b| serde_json::from_slice(&b).ok())
+        .unwrap_or_default();
+    if map.get(vv_hash) == Some(&rustc_fp) {
+        return Ok(());
+    }
+    map.insert(vv_hash.to_string(), rustc_fp);
+    let tmp = shared_dir.join(format!("toolchains.json.tmp.{}", std::process::id()));
+    fs::write(&tmp, serde_json::to_vec_pretty(&map)?)?;
+    fs::rename(tmp, path)?;
+    Ok(())
+}
+
+fn lookup_toolchain(roots: &[PathBuf], vv_hash: &str) -> Option<u64> {
+    for root in roots {
+        let path = root.join(SHARED_DIR).join("toolchains.json");
+        let Ok(bytes) = fs::read(&path) else { continue };
+        let Ok(map) = serde_json::from_slice::<BTreeMap<String, u64>>(&bytes) else { continue };
+        if let Some(&fp) = map.get(vv_hash) {
+            return Some(fp);
+        }
+    }
+    None
+}
+
+fn toolchain_recorded(shared_dir: &Path, rustc_fp: u64) -> bool {
+    let path = shared_dir.join("toolchains.json");
+    fs::read(&path)
+        .ok()
+        .and_then(|b| serde_json::from_slice::<BTreeMap<String, u64>>(&b).ok())
+        .is_some_and(|map| map.values().any(|&fp| fp == rustc_fp))
+}
+
+fn shared_generation(roots: &[PathBuf]) -> u64 {
+    roots
+        .iter()
+        .filter_map(|r| fs::read_to_string(r.join(SHARED_DIR).join("generation")).ok())
+        .filter_map(|s| s.trim().parse::<u64>().ok())
+        .sum()
+}
+
+fn bump_shared_generation(shared_dir: &Path) -> Result<u64> {
+    let _lock = FileLock::acquire(&shared_dir.join(".lock"), true)?;
+    let path = shared_dir.join("generation");
+    let next = fs::read_to_string(&path).ok().and_then(|s| s.trim().parse::<u64>().ok()).unwrap_or(0) + 1;
+    let tmp = shared_dir.join(format!("generation.tmp.{}", std::process::id()));
+    fs::write(&tmp, format!("{next}\n"))?;
+    fs::rename(tmp, path)?;
+    Ok(next)
+}
+
+/// Remove Cargo's cached `rustc -vV` probe file on other idle slots so their next Cargo command
+/// runs the `-vV` hook and hydrates newly published shared dependency units.
+fn invalidate_idle_probe_caches(except_slot: &Path) {
+    let Ok(roots) = pool_roots() else { return };
+    for root in roots {
+        for pool in fs::read_dir(&root).into_iter().flatten().flatten().map(|e| e.path()) {
+            if pool.file_name().is_some_and(|n| n == SHARED_DIR) || !pool.join("slots").is_dir() {
+                continue;
+            }
+            for slot in load_slots(&pool.join("slots")).unwrap_or_default() {
+                if slot.dir == except_slot || slot.state() != State::Held {
+                    continue;
+                }
+                let target = slot.target();
+                let cache = target.join(".rustc_info.json");
+                // Regular file only: a directory is the failed-probe guard from attach_on_first_use.
+                if fs::symlink_metadata(&cache).is_ok_and(|m| m.is_file())
+                    && let Some(_locks) = lock_target(&target, false)
+                {
+                    let _ = fs::remove_file(&cache);
+                }
+            }
+        }
+    }
+}
+
+/// Publish finished purely-external units from `slot_dir` into `<pool-root>/shared/`.
+/// Never mutates `slot_dir/target` and never pushes the disk above `maxDiskPercent`.
+fn harvest_shared(worktree: &Path, common_dir: &Path, slot_dir: &Path) -> Result<()> {
+    if let Some(lock) = Lockfile::read(worktree)
+        && lock.packages.is_empty()
+        && lock.commits.is_empty()
+    {
+        return Ok(());
+    }
+    let target = slot_dir.join("target");
+    let Some(root) = slot_dir.parent().and_then(Path::parent).and_then(Path::parent) else { return Ok(()) };
+    let max_disk = setting(common_dir, "CARGO_POOL_MAX_DISK_PERCENT", "cargo-pool.maxDiskPercent", 90.0);
+    if disk_percent(root, 0)? >= max_disk {
+        return Ok(());
+    }
+    // Skip if a build is currently running; snapshot_after_build will retry when it finishes.
+    if lock_target(&target, false).is_none() {
+        return Ok(());
+    }
+    let compile_before = last_compile_ns(slot_dir);
+    let started = Instant::now();
+    let units = extract_external_units(&target, worktree, common_dir);
+    if units.is_empty() {
+        return Ok(());
+    }
+
+    let shared_dir = root.join(SHARED_DIR);
+    let rustc_bin = fs::read_to_string(slot_dir.join("last-rustc")).ok().map(|s| OsString::from(s.trim()));
+    if let Some(rustc_fp) = last_rustc(&target).or_else(|| units.first().map(|u| u.rustc))
+        && !toolchain_recorded(&shared_dir, rustc_fp)
+        && let Some(vv) = rustc_vv_hash(rustc_bin.as_ref(), worktree)
+    {
+        let _ = record_toolchain(&shared_dir, &vv, rustc_fp);
+    }
+
+    let tmp_root = shared_dir.join("tmp");
+    let units_root = shared_dir.join("units");
+    let reflink = fs::create_dir_all(&tmp_root).is_ok() && supports_reflink(&target, &tmp_root);
+    let now_time = SystemTime::now();
+
+    struct Pending {
+        unit: ExternalUnit,
+        dest_parent: PathBuf,
+        dest: PathBuf,
+        size: u64,
+    }
+    let mut pending = vec![];
+    let mut planned_extra = 0i64;
+    for unit in units {
+        if last_compile_ns(slot_dir) != compile_before {
+            break;
+        }
+        let Some(origin_rel) = origin_subpath(&unit.origin) else { continue };
+        let unit_name = format!(
+            "{}__{}__{}__{}",
+            encode_profile(&unit.profile_rel),
+            unit.hash,
+            unit.rustc,
+            unit.fp
+        );
+        let dest_parent = units_root.join(origin_rel);
+        let dest = dest_parent.join(&unit_name);
+        if dest.exists() {
+            if let Ok(d) = File::open(&dest) {
+                let _ = d.set_modified(now_time);
+            }
+            continue;
+        }
+        let profile_dir = target.join(&unit.profile_rel);
+        let src_paths: Vec<PathBuf> = unit.files.iter().map(|rel| profile_dir.join(rel)).collect();
+        let size = dir_size(&src_paths, &[]);
+        if !reflink {
+            if disk_percent(root, planned_extra + size as i64)? >= max_disk {
+                continue;
+            }
+            planned_extra += size as i64;
+        }
+        pending.push(Pending { unit, dest_parent, dest, size });
+    }
+
+    // Pre-create destination origin directories once so workers don't race on mkdir.
+    for p in &pending {
+        let _ = fs::create_dir_all(&p.dest_parent);
+    }
+
+    let published = AtomicU64::new(0);
+    let bytes = AtomicU64::new(0);
+    let aborted = AtomicBool::new(false);
+    let next = AtomicUsize::new(0);
+    let pid = std::process::id();
+    let stamp = now_ns();
+    let workers = io_workers(pending.len());
+
+    let harvest_one = |idx: usize| {
+        if aborted.load(Ordering::Relaxed) {
+            return;
+        }
+        if last_compile_ns(slot_dir) != compile_before {
+            aborted.store(true, Ordering::Relaxed);
+            return;
+        }
+        let p = &pending[idx];
+        let profile_dir = target.join(&p.unit.profile_rel);
+        let stage = tmp_root.join(format!("{pid}-{stamp}-{idx}"));
+        let files_dir = stage.join("files");
+        let meta = SharedUnitMeta {
+            profile: p.unit.profile_rel.clone(),
+            hash: p.unit.hash.clone(),
+            rustc: p.unit.rustc,
+            fp: p.unit.fp,
+            deps: p.unit.deps.clone(),
+        };
+        let mut linked = HashMap::new();
+        let copy_ok = (|| -> Result<()> {
+            fs::create_dir_all(&files_dir)?;
+            for rel in &p.unit.files {
+                copy_tree_cow(&profile_dir.join(rel), &files_dir.join(rel), &mut linked)?;
+            }
+            fs::write(stage.join("meta.json"), serde_json::to_vec(&meta)?)?;
+            Ok(())
+        })();
+        if copy_ok.is_err() || last_compile_ns(slot_dir) != compile_before {
+            let _ = fs::remove_dir_all(&stage);
+            if last_compile_ns(slot_dir) != compile_before {
+                aborted.store(true, Ordering::Relaxed);
+            }
+            return;
+        }
+        if fs::rename(&stage, &p.dest).is_ok() {
+            published.fetch_add(1, Ordering::Relaxed);
+            bytes.fetch_add(p.size, Ordering::Relaxed);
+        } else {
+            let _ = fs::remove_dir_all(&stage);
+            if let Ok(d) = File::open(&p.dest) {
+                let _ = d.set_modified(now_time);
+            }
+        }
+    };
+
+    if workers <= 1 {
+        for i in 0..pending.len() {
+            harvest_one(i);
+            if aborted.load(Ordering::Relaxed) {
+                break;
+            }
+        }
+    } else {
+        std::thread::scope(|s| {
+            for _ in 0..workers {
+                s.spawn(|| loop {
+                    if aborted.load(Ordering::Relaxed) {
+                        break;
+                    }
+                    let i = next.fetch_add(1, Ordering::Relaxed);
+                    if i >= pending.len() {
+                        break;
+                    }
+                    harvest_one(i);
+                });
+            }
+        });
+    }
+    let _ = fs::remove_dir(&tmp_root);
+
+    let published = published.into_inner();
+    let bytes = bytes.into_inner();
+    if published > 0 {
+        let _ = bump_shared_generation(&shared_dir);
+        record(slot_dir, Event::Harvest { units: published, bytes, ms: ms_since(started) });
+        invalidate_idle_probe_caches(slot_dir);
+    }
+    Ok(())
+}
+
+/// Configured `build.target` triples from the worktree's `.cargo/config.toml` (if any).
+fn configured_targets(worktree: &Path) -> Vec<String> {
+    let mut out = vec![];
+    for name in ["config.toml", "config"] {
+        let Ok(text) = fs::read_to_string(worktree.join(".cargo").join(name)) else { continue };
+        let Ok(table) = text.parse::<toml::Table>() else { continue };
+        let Some(target) = table.get("build").and_then(|b| b.get("target")) else { continue };
+        if let Some(s) = target.as_str() {
+            out.push(s.to_string());
+        } else if let Some(arr) = target.as_array() {
+            out.extend(arr.iter().filter_map(|v| v.as_str()).map(String::from));
+        }
+    }
+    if let Ok(t) = std::env::var("CARGO_BUILD_TARGET")
+        && !t.is_empty()
+        && !out.contains(&t)
+    {
+        out.push(t);
+    }
+    out
+}
+
+/// Custom `[profile.<name>]` directory names defined in `<worktree>/Cargo.toml`.
+fn configured_profiles(worktree: &Path) -> Vec<String> {
+    let Ok(text) = fs::read_to_string(worktree.join("Cargo.toml")) else { return vec![] };
+    let Ok(table) = text.parse::<toml::Table>() else { return vec![] };
+    let Some(profiles) = table.get("profile").and_then(|v| v.as_table()) else { return vec![] };
+    profiles
+        .keys()
+        .filter(|k| !matches!(k.as_str(), "dev" | "release" | "test" | "bench"))
+        .cloned()
+        .collect()
+}
+
+fn map_cargo_profile(name: &str) -> String {
+    match name {
+        "dev" | "test" => "debug".to_string(),
+        "bench" => "release".to_string(),
+        other => other.to_string(),
+    }
+}
+
+/// Parse the profile dir (`debug`, `release`, `<custom>`, or `<triple>/<profile>`) from a cargo
+/// command line argv slice.
+fn parse_cargo_cmdline_profile(args: &[String], env_target: Option<&str>) -> Option<String> {
+    let first = args.first()?;
+    let bin = Path::new(first).file_name().and_then(|n| n.to_str())?;
+    if !bin.starts_with("cargo") {
+        return None;
+    }
+    let mut profile: Option<String> = None;
+    let mut target: Option<String> = env_target.filter(|t| !t.is_empty()).map(String::from);
+    let mut subcmd: Option<&str> = None;
+    let mut i = 1;
+    while i < args.len() {
+        let a = args[i].as_str();
+        if a == "--" {
+            break;
+        }
+        if a == "--release" || a == "-r" {
+            profile = Some("release".to_string());
+        } else if let Some(p) = a.strip_prefix("--profile=") {
+            profile = Some(map_cargo_profile(p));
+        } else if a == "--profile" && i + 1 < args.len() {
+            i += 1;
+            profile = Some(map_cargo_profile(&args[i]));
+        } else if let Some(t) = a.strip_prefix("--target=") {
+            target = Some(t.to_string());
+        } else if a == "--target" && i + 1 < args.len() {
+            i += 1;
+            target = Some(args[i].clone());
+        } else if subcmd.is_none() && !a.starts_with('-') && !a.starts_with('+') {
+            subcmd = Some(a);
+        }
+        i += 1;
+    }
+    let prof = profile.unwrap_or_else(|| if subcmd == Some("bench") { "release" } else { "debug" }.to_string());
+    Some(match target {
+        Some(t) => format!("{t}/{prof}"),
+        None => prof,
+    })
+}
+
+/// Detect the active Cargo profile dir by inspecting ancestor process command lines via `/proc`.
+fn cargo_invocation_profile() -> Option<String> {
+    let env_target = std::env::var("CARGO_BUILD_TARGET").ok();
+    let mut pid = unsafe { libc::getppid() };
+    for _ in 0..3 {
+        if pid <= 1 {
+            break;
+        }
+        if let Ok(raw) = fs::read(format!("/proc/{pid}/cmdline")) {
+            let args: Vec<String> = raw
+                .split(|&b| b == 0)
+                .filter(|s| !s.is_empty())
+                .map(|s| String::from_utf8_lossy(s).into_owned())
+                .collect();
+            if let Some(p) = parse_cargo_cmdline_profile(&args, env_target.as_deref()) {
+                return Some(p);
+            }
+        }
+        let Ok(status) = fs::read_to_string(format!("/proc/{pid}/status")) else { break };
+        let Some(ppid) = status
+            .lines()
+            .find_map(|l| l.strip_prefix("PPid:"))
+            .and_then(|v| v.trim().parse::<libc::pid_t>().ok())
+        else {
+            break;
+        };
+        pid = ppid;
+    }
+    None
+}
+
+/// Profiles that make sense to hydrate for this repository: host `debug`/`release`, custom
+/// `[profile.<name>]` from `Cargo.toml`, any profile already present in this repo's slots,
+/// `<target>/<profile>` for configured targets, and the active Cargo invocation's profile.
+fn wanted_profiles(repo: &Repo, roots: &[PathBuf], active: Option<&str>) -> HashSet<String> {
+    let mut base_profiles: Vec<String> = vec!["debug".to_string(), "release".to_string()];
+    base_profiles.extend(configured_profiles(&repo.workspace));
+    let mut wanted: HashSet<String> = base_profiles.iter().cloned().collect();
+    for triple in configured_targets(&repo.workspace) {
+        for p in &base_profiles {
+            wanted.insert(format!("{triple}/{p}"));
+        }
+    }
+    if let Some(a) = active {
+        wanted.insert(a.to_string());
+    }
+    if let Some(pool_name) = repo.pool.file_name() {
+        for root in roots {
+            let slots_dir = root.join(pool_name).join("slots");
+            for slot in load_slots(&slots_dir).unwrap_or_default() {
+                let t = slot.target();
+                for p in profile_dirs(&t) {
+                    if let Ok(rel) = p.strip_prefix(&t) {
+                        wanted.insert(rel.to_string_lossy().into_owned());
+                    }
+                }
+            }
+        }
+    }
+    wanted
+}
+
+/// Resolve the `Fingerprint.rustc` u64 for `worktree` before or after its first build.
+fn resolve_rustc_fp(worktree: &Path, slot_dir: &Path, rustc_bin: Option<&OsString>, roots: &[PathBuf]) -> Option<u64> {
+    let toolchain = toolchain_hash(worktree);
+    let same_rustc_bin = match rustc_bin {
+        None => true,
+        Some(bin) => fs::read(slot_dir.join("last-rustc")).ok().as_deref() == Some(bin.as_encoded_bytes()),
+    };
+    // Fast path: warm slot already recorded its Fingerprint.rustc for this exact compiler binary.
+    if same_rustc_bin
+        && let Some(stamp) = Stamp::read(slot_dir)
+        && stamp.toolchain == toolchain
+        && stamp.rustc.is_some()
+    {
+        return stamp.rustc;
+    }
+    if let Some(vv) = rustc_vv_hash(rustc_bin, worktree)
+        && let Some(fp) = lookup_toolchain(roots, &vv)
+    {
+        return Some(fp);
+    }
+    if let Some(stamp) = Stamp::read(slot_dir)
+        && stamp.toolchain == toolchain
+        && stamp.rustc.is_some()
+    {
+        return stamp.rustc;
+    }
+    last_rustc(&slot_dir.join("target"))
+}
+
+/// Hydrate missing `Cargo.lock`-pinned external dependency units from `<pool-root>/shared/`
+/// into `slot_dir/target`, preserving any valid worktree snapshot mtimes.
+fn hydrate_slot(repo: &Repo, slot_dir: &Path, rustc_bin: Option<&OsString>) -> Result<u64> {
+    let roots = pool_roots()?;
+    let generation = shared_generation(&roots);
+    if generation == 0 {
+        return Ok(0);
+    }
+    let Some(lock) = Lockfile::read(&repo.workspace) else { return Ok(0) };
+    let active_profile = cargo_invocation_profile();
+    let toolchain = toolchain_hash(&repo.workspace);
+    let stamp_str = format!(
+        "{generation} {} {toolchain} {}\n",
+        lock.hash,
+        active_profile.as_deref().unwrap_or("")
+    );
+    if fs::read_to_string(slot_dir.join("hydrated-gen")).ok().as_deref() == Some(stamp_str.as_str()) {
+        return Ok(0);
+    }
+    let Some(rustc_fp) = resolve_rustc_fp(&repo.workspace, slot_dir, rustc_bin, &roots) else {
+        return Ok(0);
+    };
+
+    let target = slot_dir.join("target");
+    fs::create_dir_all(&target)?;
+    let Some(_build_locks) = lock_target(&target, false) else { return Ok(0) };
+    let started = Instant::now();
+
+    // Snapshot existing units and fingerprints already present in the slot.
+    let mut existing_units: HashSet<(String, String)> = HashSet::new();
+    let mut existing_fps: HashSet<u64> = HashSet::new();
+    for profile in profile_dirs(&target) {
+        let Ok(rel) = profile.strip_prefix(&target) else { continue };
+        let rel = rel.to_string_lossy().into_owned();
+        for (hash, fingerprint, _) in profile_units(&profile) {
+            let Some(hash) = hash else { continue };
+            let mut has_json = false;
+            for f in fs::read_dir(&fingerprint).into_iter().flatten().flatten() {
+                let path = f.path();
+                if path.extension().is_none_or(|x| x != "json") {
+                    continue;
+                }
+                has_json = true;
+                if let Some(fp) = fs::read_to_string(path.with_extension("")).ok().and_then(|s| u64::from_str_radix(s.trim(), 16).ok()) {
+                    existing_fps.insert(fp.swap_bytes());
+                }
+            }
+            if has_json {
+                existing_units.insert((rel.clone(), hash));
+            }
+        }
+    }
+
+    let wanted = wanted_profiles(repo, &roots, active_profile.as_deref());
+    let slot_dev = fs::metadata(&target).ok().map(|m| m.dev());
+    // Prefer pool roots on the same filesystem so reflinks can be used when available.
+    let mut ordered_roots = roots.clone();
+    ordered_roots.sort_by_key(|r| fs::metadata(r).ok().map(|m| m.dev()) != slot_dev);
+
+    struct Candidate {
+        path: PathBuf,
+        root: PathBuf,
+        mtime: u64,
+        meta: SharedUnitMeta,
+        size: u64,
+        reflink: bool,
+    }
+    // Keep the newest (or same-FS) candidate per `(profile, hash)`.
+    let mut by_key: HashMap<(String, String), Candidate> = HashMap::new();
+    let mut scan_origin = |origin_dir: &Path, root: &Path| {
+        for e in fs::read_dir(origin_dir).into_iter().flatten().flatten() {
+            if !e.file_type().is_ok_and(|t| t.is_dir()) {
+                continue;
+            }
+            let name = e.file_name();
+            let Some((profile, hash, rustc, _fp)) = name.to_str().and_then(parse_shared_unit_name) else {
+                continue;
+            };
+            if rustc != rustc_fp || !wanted.contains(&profile) || existing_units.contains(&(profile.clone(), hash.clone())) {
+                continue;
+            }
+            let path = e.path();
+            let mtime = mtime_ns(&path);
+            let key = (profile, hash);
+            let same_fs = fs::metadata(root).ok().map(|m| m.dev()) == slot_dev;
+            if let Some(prev) = by_key.get(&key) {
+                let prev_same_fs = fs::metadata(&prev.root).ok().map(|m| m.dev()) == slot_dev;
+                if (prev_same_fs, prev.mtime) >= (same_fs, mtime) {
+                    continue;
+                }
+            }
+            let Some(meta) = fs::read(path.join("meta.json")).ok().and_then(|b| serde_json::from_slice::<SharedUnitMeta>(&b).ok()) else {
+                continue;
+            };
+            by_key.insert(key, Candidate { path, root: root.to_path_buf(), mtime, meta, size: 0, reflink: false });
+        }
+    };
+
+    for root in &ordered_roots {
+        let units_root = root.join(SHARED_DIR).join("units");
+        if !units_root.is_dir() {
+            continue;
+        }
+        let reg_root = units_root.join("reg");
+        for pkg in &lock.packages {
+            if safe_path_component(pkg) {
+                let d = reg_root.join(pkg);
+                if d.is_dir() {
+                    scan_origin(&d, root);
+                }
+            }
+        }
+        if !lock.commits.is_empty() {
+            for e in fs::read_dir(units_root.join("git")).into_iter().flatten().flatten() {
+                let name = e.file_name();
+                if let Some(rev) = name.to_str()
+                    && lock.commits.iter().any(|c| c.starts_with(rev))
+                    && e.file_type().is_ok_and(|t| t.is_dir())
+                {
+                    scan_origin(&e.path(), root);
+                }
+            }
+        }
+    }
+
+    if by_key.is_empty() {
+        let _ = fs::write(slot_dir.join("hydrated-gen"), &stamp_str);
+        return Ok(0);
+    }
+
+    let retain_complete = |cands: &mut Vec<Candidate>| {
+        loop {
+            let avail: HashSet<u64> = existing_fps.iter().copied().chain(cands.iter().map(|c| c.meta.fp)).collect();
+            let before = cands.len();
+            cands.retain(|c| c.meta.deps.iter().all(|d| avail.contains(d)));
+            if cands.len() == before {
+                break;
+            }
+        }
+    };
+
+    // Keep only dependency-complete sets (every dep is already in the slot or also being hydrated).
+    let mut candidates: Vec<Candidate> = by_key.into_values().collect();
+    retain_complete(&mut candidates);
+    if candidates.is_empty() {
+        let _ = fs::write(slot_dir.join("hydrated-gen"), &stamp_str);
+        return Ok(0);
+    }
+
+    // Disk budget check: on CoW filesystems reflinking takes ~0 bytes; on non-CoW filesystems
+    // ensure we never push the slot's disk above `maxDiskPercent`. If all profiles together don't
+    // fit, fall back to hydrating just the active profile (e.g. `debug`) so the current build wins.
+    let slot_root = repo.pool.parent().unwrap();
+    let max_disk = repo.max_disk_percent();
+    let mut reflink_by_root: HashMap<PathBuf, bool> = HashMap::new();
+    for c in &mut candidates {
+        c.reflink = *reflink_by_root.entry(c.root.clone()).or_insert_with(|| supports_reflink(&c.root, &target));
+        c.size = dir_size([c.path.join("files")], &[]);
+    }
+    let extra_of = |cands: &[Candidate]| -> u64 {
+        cands.iter().filter(|c| !c.reflink).map(|c| c.size).sum()
+    };
+    let mut narrowed = false;
+    let extra = extra_of(&candidates);
+    if extra > 0 {
+        let protect_paths: Vec<&Path> = std::iter::once(slot_dir)
+            .chain(candidates.iter().map(|c| c.path.as_path()))
+            .collect();
+        if !free_disk(slot_root, max_disk, extra, &protect_paths, Evict::Unheld)? {
+            let focus = active_profile.as_deref().unwrap_or("debug");
+            let before = candidates.len();
+            candidates.retain(|c| c.meta.profile == focus);
+            retain_complete(&mut candidates);
+            if candidates.is_empty() || candidates.len() == before {
+                return Ok(0);
+            }
+            let focus_extra = extra_of(&candidates);
+            let focus_protect: Vec<&Path> = std::iter::once(slot_dir)
+                .chain(candidates.iter().map(|c| c.path.as_path()))
+                .collect();
+            if focus_extra > 0 && !free_disk(slot_root, max_disk, focus_extra, &focus_protect, Evict::Unheld)? {
+                return Ok(0);
+            }
+            narrowed = true;
+        }
+    }
+
+    // Record valid snapshot timestamp and existing activity dir mtimes so hydrating into a warm
+    // slot never falsely invalidates its snapshot for backdating.
+    let valid_snap_at = valid_snapshot(slot_dir).map(|s| s.taken_at);
+    let mut saved_mtimes: HashMap<PathBuf, SystemTime> = HashMap::new();
+    if valid_snap_at.is_some() {
+        for profile in profile_dirs(&target) {
+            for sub in ["deps", ".fingerprint", "incremental"] {
+                let p = profile.join(sub);
+                if let Ok(t) = fs::metadata(&p).and_then(|m| m.modified()) {
+                    saved_mtimes.insert(p, t);
+                }
+            }
+        }
+    }
+
+    // Pre-create shared parent directories per profile so worker threads only write disjoint paths.
+    let mut created_dirs: HashSet<PathBuf> = HashSet::new();
+    for c in &candidates {
+        let files_src = c.path.join("files");
+        let dp = target.join(&c.meta.profile);
+        for e in fs::read_dir(&files_src).into_iter().flatten().flatten() {
+            if !e.file_type().is_ok_and(|t| t.is_dir()) {
+                continue;
+            }
+            let sub = dp.join(e.file_name());
+            if created_dirs.insert(sub.clone()) {
+                let _ = fs::create_dir_all(&sub);
+            }
+            // New build-dir layout nests units under `build/<pkg>/<hash>/`.
+            if e.file_name() == "build" {
+                for pkg in fs::read_dir(e.path()).into_iter().flatten().flatten() {
+                    if pkg.file_type().is_ok_and(|t| t.is_dir()) {
+                        let pkg_dir = sub.join(pkg.file_name());
+                        if created_dirs.insert(pkg_dir.clone()) {
+                            let _ = fs::create_dir_all(&pkg_dir);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    let hydrated = AtomicU64::new(0);
+    let bytes = AtomicU64::new(0);
+    let next = AtomicUsize::new(0);
+    let now_time = SystemTime::now();
+    let workers = io_workers(candidates.len());
+
+    let hydrate_one = |c: &Candidate| {
+        let files_src = c.path.join("files");
+        if !files_src.is_dir() {
+            return;
+        }
+        let dest_profile = target.join(&c.meta.profile);
+        let mut linked = HashMap::new();
+        if copy_tree_cow(&files_src, &dest_profile, &mut linked).is_ok() {
+            hydrated.fetch_add(1, Ordering::Relaxed);
+            bytes.fetch_add(c.size, Ordering::Relaxed);
+            if let Ok(d) = File::open(&c.path) {
+                let _ = d.set_modified(now_time);
+            }
+        }
+    };
+
+    if workers <= 1 {
+        for c in &candidates {
+            hydrate_one(c);
+        }
+    } else {
+        std::thread::scope(|s| {
+            for _ in 0..workers {
+                s.spawn(|| loop {
+                    let i = next.fetch_add(1, Ordering::Relaxed);
+                    if i >= candidates.len() {
+                        break;
+                    }
+                    hydrate_one(&candidates[i]);
+                });
+            }
+        });
+    }
+
+    if let Some(snap_at) = valid_snap_at {
+        let cap = UNIX_EPOCH + Duration::from_nanos(snap_at.saturating_sub(1));
+        for profile in profile_dirs(&target) {
+            for sub in ["deps", ".fingerprint", "incremental"] {
+                let p = profile.join(sub);
+                if p.is_dir() {
+                    let restore = saved_mtimes.get(&p).copied().unwrap_or(cap);
+                    if let Ok(f) = File::open(&p) {
+                        let _ = f.set_modified(restore);
+                    }
+                }
+            }
+        }
+    }
+
+    if !narrowed {
+        let _ = fs::write(slot_dir.join("hydrated-gen"), &stamp_str);
+    }
+    let hydrated = hydrated.into_inner();
+    let bytes = bytes.into_inner();
+    if hydrated > 0 {
+        let ms = ms_since(started);
+        eprintln!(
+            "cargo-pool: hydrated {hydrated} shared dependency units ({}) in {}",
+            human(bytes),
+            dur(ms)
+        );
+        record(slot_dir, Event::Hydrate { units: hydrated, bytes, ms });
+    }
+    Ok(hydrated)
+}
+
+/// Hydrate newly published shared dependencies into an already-warm slot on Cargo's `rustc -vV` probe.
+fn hydrate_on_probe(rustc_bin: &OsString) -> Result<()> {
+    let cwd = std::env::current_dir()?;
+    let roots = pool_roots()?;
+    if shared_generation(&roots) == 0 {
+        return Ok(());
+    }
+    let Some(target) = cwd
+        .ancestors()
+        .filter_map(|a| fs::read_link(a.join("target")).ok())
+        .find(|t| containing_pool_root(&roots, t).ok().flatten().is_some())
+    else {
+        return Ok(());
+    };
+    let Some(slot_dir) = target.parent() else { return Ok(()) };
+    let Some(_seed_lock) = FileLock::acquire(&slot_dir.join("seed.lock"), false)? else { return Ok(()) };
+    let meta: SlotMeta = serde_json::from_slice(&fs::read(slot_dir.join("slot.json"))?)?;
+    let Some(lease) = meta.lease.filter(|l| !l.pending) else { return Ok(()) };
+    let Ok(repo) = Repo::of_workspace(&lease.worktree) else { return Ok(()) };
+    hydrate_slot(&repo, slot_dir, Some(rustc_bin))?;
+    Ok(())
+}
+
 fn backdate_enabled(repo: &Repo) -> bool {
     setting(&repo.common_dir, "CARGO_POOL_BACKDATE", "cargo-pool.backdate", true)
 }
 
 /// Called by the rustc wrapper for every compile into a slot: invalidate the slot's
 /// snapshot and make sure a waiter will snapshot the worktree once the build ends.
-fn note_pooled_compile(slot_dir: &Path) -> Result<()> {
+fn note_pooled_compile(slot_dir: &Path, rustc_bin: &OsString) -> Result<()> {
     let marker = OpenOptions::new().create(true).truncate(false).write(true).open(slot_dir.join("last-compile"))?;
     marker.set_modified(SystemTime::now())?;
+    let rustc_path = slot_dir.join("last-rustc");
+    let rustc_bytes = rustc_bin.as_encoded_bytes();
+    if fs::read(&rustc_path).ok().as_deref() != Some(rustc_bytes) {
+        let _ = fs::write(&rustc_path, rustc_bytes);
+    }
     // One line per compile; the snapshot waiter turns them into a `Build` event.
     let _ = OpenOptions::new()
         .create(true)
@@ -1749,13 +3031,14 @@ fn note_pooled_compile(slot_dir: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Wait until no build is running in the slot, then snapshot its worktree. Retries if a
-/// build started meanwhile, so the snapshot always reflects the state after the last one.
+/// Wait until no build is running in the slot, then snapshot its worktree and harvest
+/// finished external dependency units into `<pool-root>/shared/`. Retries if a build
+/// started meanwhile, so the snapshot always reflects the state after the last one.
 fn snapshot_after_build(slot_dir: &Path) -> Result<()> {
     let target = slot_dir.join("target");
     loop {
         let Some(_lock) = FileLock::acquire(&slot_dir.join("snapshot.lock"), false)? else { return Ok(()) };
-        loop {
+        let harvested_for = loop {
             for l in cargo_locks(&target) {
                 drop(FileLock::acquire(&l, true)?);
             }
@@ -1772,8 +3055,13 @@ fn snapshot_after_build(slot_dir: &Path) -> Result<()> {
             if last_compile_ns(slot_dir) < snap.taken_at {
                 save_snapshot(slot_dir, &snap)?;
                 record(slot_dir, Event::Snapshot { files: snap.files.len() as u64, ms: ms_since(started) });
-                break;
+                break lease.worktree;
             }
+        };
+        if let Some(pool) = slot_dir.parent().and_then(Path::parent)
+            && let Ok(common_str) = fs::read_to_string(pool.join("repo"))
+        {
+            let _ = harvest_shared(&harvested_for, Path::new(common_str.trim()), slot_dir);
         }
         drop(_lock);
         // A compile that saw our lock held didn't start a waiter: if one slipped in, go again.
@@ -1819,6 +3107,10 @@ enum Event {
     Trim { bytes: u64 },
     /// Build units the slot's worktree can't use at its Cargo.lock and toolchain were deleted, freeing `bytes`.
     Prune { units: u64, bytes: u64, ms: u64 },
+    /// External dependency units published into the global shared cache.
+    Harvest { units: u64, bytes: u64, ms: u64 },
+    /// External dependency units hydrated from the global shared cache into the slot.
+    Hydrate { units: u64, bytes: u64, ms: u64 },
 }
 
 #[derive(Serialize, Deserialize)]
@@ -1870,6 +3162,7 @@ struct AttachOpts {
     force: bool,
     from_hook: bool,
     wait_for_build: bool,
+    rustc_bin: Option<OsString>,
 }
 
 fn attach(path: &Path, opts: AttachOpts) -> Result<()> {
@@ -1928,7 +3221,7 @@ fn attach_workspace(repo: &Repo, opts: &AttachOpts) -> Result<()> {
                             save_snapshot(&slot.dir, &take_snapshot(&repo.workspace, None)?)?;
                         }
                         if !slot.meta.seed_pending {
-                            prepare_worktree(repo, &slot.dir)?;
+                            prepare_worktree(repo, &slot.dir, opts.rustc_bin.as_ref())?;
                         }
                         slot.meta.lease.as_mut().unwrap().pending = false;
                         slot.meta.adoption = None;
@@ -1978,7 +3271,7 @@ fn attach_workspace(repo: &Repo, opts: &AttachOpts) -> Result<()> {
         eprintln!("cargo-pool: {} gets a pooled target dir on the first cargo command", link.display());
         return Ok(());
     }
-    lease_slot(repo, opts.seed, opts.wait_for_build)
+    lease_slot(repo, opts.seed, opts.wait_for_build, opts.rustc_bin.as_ref())
 }
 
 fn cargo_output(target: &Path) -> bool {
@@ -2207,7 +3500,7 @@ fn adoption_source(target: &Path, strays: &[PathBuf]) -> Result<u64> {
 }
 
 /// Lease the best free slot (or a new one) to the worktree and link its `target` to it.
-fn lease_slot(repo: &Repo, seed: bool, wait_for_build: bool) -> Result<()> {
+fn lease_slot(repo: &Repo, seed: bool, wait_for_build: bool, rustc_bin: Option<&OsString>) -> Result<()> {
     let started = Instant::now();
     let link = repo.workspace.join("target");
     let slots_dir = repo.slots_dir();
@@ -2437,11 +3730,14 @@ fn lease_slot(repo: &Repo, seed: bool, wait_for_build: bool) -> Result<()> {
     warn_path_dependent_config(repo);
     record(&slot.dir, Event::Attach { reused: pick.is_some(), ms: ms_since(started) });
     if !slot.meta.seed_pending {
-        prepare_worktree(repo, &slot.dir)?;
+        prepare_worktree(repo, &slot.dir, rustc_bin)?;
     }
     slot.meta.lease.as_mut().unwrap().pending = false;
     slot.meta.adoption = None;
     slot.save()?;
+    if adopting {
+        let _ = harvest_shared(&repo.workspace, &repo.common_dir, &slot.dir);
+    }
     eprintln!("cargo-pool: {} -> slot {}", link.display(), slot.id);
     Ok(())
 }
@@ -2467,7 +3763,7 @@ fn attach_marker(workspace: &Path) -> Option<PathBuf> {
 /// Lease a slot for a worktree whose attach was deferred, when cargo first probes the
 /// compiler (`rustc -vV`). Without a target dir cargo has no cached probe, and it probes
 /// before touching the target dir, so the link is in place before cargo needs it.
-fn attach_on_first_use() -> Result<()> {
+fn attach_on_first_use(rustc_bin: &OsString) -> Result<()> {
     let cwd = std::env::current_dir()?;
     let Some(worktree) = cwd.ancestors().find(|a| a.join(".git").exists()) else { return Ok(()) };
     let Some((workspace, marker)) = cwd
@@ -2482,7 +3778,14 @@ fn attach_on_first_use() -> Result<()> {
     if !marker.exists() {
         return Ok(());
     }
-    if let Err(e) = attach(workspace, AttachOpts { seed: true, force: false, from_hook: false, wait_for_build: true }) {
+    let opts = AttachOpts {
+        seed: true,
+        force: false,
+        from_hook: false,
+        wait_for_build: true,
+        rustc_bin: Some(rustc_bin.clone()),
+    };
+    if let Err(e) = attach(workspace, opts) {
         // Cargo caches failed probes too. A directory prevents that write while keeping logs accessible.
         let cache = workspace.join("target/.rustc_info.json");
         let _ = fs::remove_file(&cache);
@@ -2498,7 +3801,7 @@ fn wrapper_installed() -> bool {
 }
 
 /// Make a warm slot's build state fit the worktree it was just given to.
-fn prepare_worktree(repo: &Repo, slot_dir: &Path) -> Result<()> {
+fn prepare_worktree(repo: &Repo, slot_dir: &Path, rustc_bin: Option<&OsString>) -> Result<()> {
     let started = Instant::now();
     let (mut matched, mut total) = (0, 0);
     if backdate_enabled(repo)
@@ -2516,6 +3819,9 @@ fn prepare_worktree(repo: &Repo, slot_dir: &Path) -> Result<()> {
         eprintln!("cargo-pool: {reset} build units recorded another checkout's git state (e.g. git_version!); they'll rebuild here");
     }
     prune(&repo.workspace, slot_dir, false)?;
+    if let Err(e) = hydrate_slot(repo, slot_dir, rustc_bin) {
+        eprintln!("cargo-pool: warning: hydrating shared dependencies failed: {e:#}");
+    }
     record(
         slot_dir,
         Event::Prepare { backdated: matched as u64, files: total as u64, reset: reset as u64, ms: ms_since(started) },
@@ -2526,7 +3832,7 @@ fn prepare_worktree(repo: &Repo, slot_dir: &Path) -> Result<()> {
 /// Seed a pending slot when cargo first probes the compiler (`rustc -vV`) in its worktree.
 /// Cargo runs that probe before it creates or locks anything in the target dir, and an
 /// empty slot has no cached probe, so the first cargo command always comes through here.
-fn seed_on_first_use() -> Result<()> {
+fn seed_on_first_use(rustc_bin: &OsString) -> Result<()> {
     let cwd = std::env::current_dir()?;
     let roots = pool_roots()?;
     let Some(target) = cwd
@@ -2581,7 +3887,9 @@ fn seed_on_first_use() -> Result<()> {
         slot.save()?;
     }
     if seeded_from.is_some() {
-        prepare_worktree(&repo, slot_dir)?;
+        prepare_worktree(&repo, slot_dir, Some(rustc_bin))?;
+    } else if let Err(e) = hydrate_slot(&repo, slot_dir, Some(rustc_bin)) {
+        eprintln!("cargo-pool: warning: hydrating shared dependencies failed: {e:#}");
     }
     Ok(())
 }
@@ -2607,6 +3915,37 @@ fn path_dependent_linkers(worktree: &Path) -> Vec<(String, String)> {
     out
 }
 
+/// Other worktree-path-dependent settings in `.cargo/config.toml`: `[env]` entries with
+/// `relative = true`, and relative `build.rustc` / `build.rustc-wrapper` / `build.rustc-workspace-wrapper`.
+fn path_dependent_settings(worktree: &Path) -> Vec<(String, String)> {
+    let mut out = vec![];
+    for name in ["config.toml", "config"] {
+        let Ok(text) = fs::read_to_string(worktree.join(".cargo").join(name)) else { continue };
+        let Ok(table) = text.parse::<toml::Table>() else { continue };
+        if let Some(env_tbl) = table.get("env").and_then(|e| e.as_table()) {
+            for (k, v) in env_tbl {
+                if let Some(t) = v.as_table()
+                    && t.get("relative").and_then(|r| r.as_bool()) == Some(true)
+                    && let Some(val) = t.get("value").and_then(|v| v.as_str())
+                {
+                    out.push((format!("env.{k}"), val.to_string()));
+                }
+            }
+        }
+        if let Some(build) = table.get("build").and_then(|b| b.as_table()) {
+            for key in ["rustc", "rustc-wrapper", "rustc-workspace-wrapper"] {
+                if let Some(val) = build.get(key).and_then(|v| v.as_str())
+                    && val.contains('/')
+                    && !Path::new(val).is_absolute()
+                {
+                    out.push((format!("build.{key}"), val.to_string()));
+                }
+            }
+        }
+    }
+    out
+}
+
 fn warn_path_dependent_config(repo: &Repo) {
     for (triple, linker) in path_dependent_linkers(&repo.workspace) {
         eprintln!(
@@ -2622,6 +3961,12 @@ fn warn_path_dependent_config(repo: &Repo) {
                 main.join(&linker).display()
             );
         }
+    }
+    for (setting, value) in path_dependent_settings(&repo.workspace) {
+        eprintln!(
+            "cargo-pool: warning: .cargo/config.toml sets {setting} = \"{value}\" relative to the worktree.\n\
+             cargo-pool:   Cargo resolves this per checkout, which invalidates fingerprints across worktrees."
+        );
     }
 }
 
@@ -2760,8 +4105,12 @@ fn seed(repo: &Repo, slot: &Slot, head: &str, sources: Vec<(PathBuf, Option<Stri
             continue; // evicted since it was listed
         }
         let size = dir_size(plan.parts.iter().map(|p| src.join(p)), &[]);
+        let reflink = supports_reflink(&src, &slot.dir);
+        let extra = if reflink { 0 } else { size };
         let protect: Vec<&Path> = [src.parent(), Some(slot.dir.as_path())].into_iter().flatten().collect();
-        if disk_room.is_some_and(|r| size as i64 > r) || !free_disk(root, max_disk, size, &protect, Evict::Unheld)? {
+        if (extra > 0 && disk_room.is_some_and(|r| extra as i64 > r))
+            || !free_disk(root, max_disk, extra, &protect, Evict::Unheld)?
+        {
             eprintln!(
                 "cargo-pool: copying {} ({}) would push the disk above {max_disk}%, skipping it",
                 src.display(),
@@ -2771,7 +4120,8 @@ fn seed(repo: &Repo, slot: &Slot, head: &str, sources: Vec<(PathBuf, Option<Stri
                 let (used, avail) = disk_usage(root)?;
                 let below_limit = ((used + avail) as f64 * max_disk / 100.0) as i64 - used;
                 let candidates = reclaim_candidates(root, &[&slot.dir], Evict::Unheld)?;
-                disk_room = Some(below_limit + reclaimable(&candidates, |_| Ok(false))? as i64);
+                let shared = shared_reclaim_candidates(root, &[&slot.dir])?;
+                disk_room = Some(below_limit + reclaimable(&candidates, &shared, |_| Ok(false))? as i64);
             }
             no_room += 1;
             continue;
@@ -2975,6 +4325,17 @@ fn du(p: &Path) -> String {
         .unwrap_or_else(|| "?".into())
 }
 
+fn shared_unit_count(root: &Path) -> usize {
+    let units = root.join(SHARED_DIR).join("units");
+    ["reg", "git"]
+        .into_iter()
+        .flat_map(|k| fs::read_dir(units.join(k)).into_iter().flatten().flatten())
+        .filter(|e| e.file_type().is_ok_and(|t| t.is_dir()))
+        .flat_map(|e| fs::read_dir(e.path()).into_iter().flatten().flatten())
+        .filter(|e| e.file_type().is_ok_and(|t| t.is_dir()))
+        .count()
+}
+
 fn status(size: bool) -> Result<()> {
     let cwd = std::env::current_dir()?;
     let repos = Repo::discover(&cwd).unwrap_or_default();
@@ -2982,9 +4343,17 @@ fn status(size: bool) -> Result<()> {
         for root in pool_roots()? {
             println!("pools in {}:", root.display());
             for e in fs::read_dir(&root).into_iter().flatten().flatten() {
+                if e.file_name() == SHARED_DIR || !e.path().join("slots").is_dir() {
+                    continue;
+                }
                 let repo = fs::read_to_string(e.path().join("repo")).unwrap_or_default();
                 let n = fs::read_dir(e.path().join("slots")).map_or(0, |d| d.count());
                 println!("  {:<40} {n} slots  {repo}", e.file_name().to_string_lossy());
+            }
+            let shared_n = shared_unit_count(&root);
+            if shared_n > 0 {
+                let sz = if size { format!("  {}", du(&root.join(SHARED_DIR))) } else { String::new() };
+                println!("  {:<40} {shared_n} units{sz}", "shared dependency cache");
             }
         }
         return Ok(());
@@ -3031,6 +4400,13 @@ fn status(size: bool) -> Result<()> {
             );
         }
     }
+    for root in &roots {
+        let shared_n = shared_unit_count(root);
+        if shared_n > 0 {
+            let sz = if size { format!("  {}", du(&root.join(SHARED_DIR))) } else { String::new() };
+            println!("shared {} ({shared_n} cached external units{sz})", root.join(SHARED_DIR).display());
+        }
+    }
     Ok(())
 }
 
@@ -3068,6 +4444,14 @@ struct Totals {
     pruned_units: u64,
     pruned_bytes: u64,
     prune_ms: u64,
+    harvests: u64,
+    harvested_units: u64,
+    harvested_bytes: u64,
+    harvest_ms: u64,
+    hydrates: u64,
+    hydrated_units: u64,
+    hydrated_bytes: u64,
+    hydrate_ms: u64,
 }
 
 fn stats(days: Option<u64>) -> Result<()> {
@@ -3142,6 +4526,18 @@ fn stats(days: Option<u64>) -> Result<()> {
                         t.pruned_bytes += bytes;
                         t.prune_ms += ms;
                     }
+                    Event::Harvest { units, bytes, ms } => {
+                        t.harvests += 1;
+                        t.harvested_units += units;
+                        t.harvested_bytes += bytes;
+                        t.harvest_ms += ms;
+                    }
+                    Event::Hydrate { units, bytes, ms } => {
+                        t.hydrates += 1;
+                        t.hydrated_units += units;
+                        t.hydrated_bytes += bytes;
+                        t.hydrate_ms += ms;
+                    }
                 }
             }
         }
@@ -3182,6 +4578,19 @@ fn stats(days: Option<u64>) -> Result<()> {
             t.reset,
             dur(t.prepare_ms)
         );
+        if t.hydrates > 0 || t.harvests > 0 {
+            println!(
+                "  shared     {} hydrated ({} in {} passes; {}), {} harvested ({} in {} passes; {})",
+                t.hydrated_units,
+                human(t.hydrated_bytes),
+                t.hydrates,
+                dur(t.hydrate_ms),
+                t.harvested_units,
+                human(t.harvested_bytes),
+                t.harvests,
+                dur(t.harvest_ms),
+            );
+        }
         println!("  setup      {} in total (attach + seed + prepare)", dur(t.attach_ms + t.seed_ms + t.prepare_ms));
         println!("  built      {} cargo commands, {} units compiled; {}", t.builds, t.units, dur(t.build_ms));
         println!("  snapshots  {} in the background; {}", t.snapshots, dur(t.snapshot_ms));
@@ -3211,6 +4620,7 @@ fn gc(max_age_days: Option<u64>, dry_run: bool) -> Result<()> {
     let cwd = std::env::current_dir()?;
     let repos = Repo::discover(&cwd)?;
     let roots = pool_roots()?;
+    let cutoff = max_age_days.map_or(0, |d| now().saturating_sub(d * 86400));
     for (repo, root) in repos.iter().flat_map(|r| roots.iter().map(move |root| (r, root))) {
         let repo = Repo { pool: fs::canonicalize(root)?.join(repo.pool.file_name().unwrap()), ..repo.clone() };
         let lock = repo.lock()?;
@@ -3218,7 +4628,6 @@ fn gc(max_age_days: Option<u64>, dry_run: bool) -> Result<()> {
         if !dry_run {
             reclaim_stale(&mut slots)?;
         }
-        let cutoff = max_age_days.map_or(0, |d| now().saturating_sub(d * 86400));
         let removed: BTreeMap<_, _> = slots
             .iter()
             .filter(|s| s.state() != State::Held && s.last_used() < cutoff)
@@ -3240,6 +4649,28 @@ fn gc(max_age_days: Option<u64>, dry_run: bool) -> Result<()> {
             println!("no free slots unused for more than {d} days");
         }
         drop(lock);
+    }
+    if max_age_days.is_some() {
+        let cutoff_ns = cutoff.saturating_mul(1_000_000_000);
+        for (_, root) in pool_filesystems(&roots) {
+            let expired: Vec<PathBuf> = shared_reclaim_candidates(root, &[])?
+                .into_iter()
+                .filter(|u| mtime_ns(u) < cutoff_ns)
+                .collect();
+            if !expired.is_empty() {
+                if dry_run {
+                    println!("would remove {} shared dependency units", expired.len());
+                } else {
+                    let mut removed = 0;
+                    for u in &expired {
+                        if remove_shared_unit(u).is_ok() {
+                            removed += 1;
+                        }
+                    }
+                    println!("removed {removed} shared dependency units");
+                }
+            }
+        }
     }
     let max_disk = setting(&cwd, "CARGO_POOL_MAX_DISK_PERCENT", "cargo-pool.maxDiskPercent", 90.0);
     for root in &roots {
@@ -3609,6 +5040,147 @@ mod tests {
         assert!(!exists("build/tool"), "a unit of another compiler must be deleted with its empty package dir");
         assert!(exists("build/serde_json/aaaaaaaaaaaaaaaa") && exists(".fingerprint/app-4444444444444444"));
         assert_eq!(Stamp::read(&slot).unwrap().rustc, Some(2));
+        fs::remove_dir_all(&base).unwrap();
+    }
+
+    #[test]
+    fn detects_path_dependent_env_and_wrapper() {
+        let dir = std::env::temp_dir().join(format!("cargo-pool-cfg-{}", std::process::id()));
+        fs::create_dir_all(dir.join(".cargo")).unwrap();
+        fs::write(
+            dir.join(".cargo/config.toml"),
+            "[target.x86_64-unknown-linux-gnu]\nlinker = \"scripts/ld.sh\"\n\n\
+             [env]\nREL_DIR = { value = \"assets\", relative = true }\nABS_VAL = { value = \"assets\", relative = false }\nPLAIN = \"foo\"\n\n\
+             [build]\nrustc-wrapper = \"bin/wrap.sh\"\nrustc = \"/usr/bin/rustc\"\n",
+        )
+        .unwrap();
+        let found = path_dependent_settings(&dir);
+        fs::remove_dir_all(&dir).unwrap();
+        assert_eq!(
+            found,
+            vec![
+                ("env.REL_DIR".to_string(), "assets".to_string()),
+                ("build.rustc-wrapper".to_string(), "bin/wrap.sh".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn parses_cargo_cmdline_profiles_and_targets() {
+        let s = |xs: &[&str]| xs.iter().map(|x| (*x).to_string()).collect::<Vec<_>>();
+        assert_eq!(parse_cargo_cmdline_profile(&s(&["cargo", "build"]), None), Some("debug".into()));
+        assert_eq!(parse_cargo_cmdline_profile(&s(&["/usr/bin/cargo", "build", "--release"]), None), Some("release".into()));
+        assert_eq!(parse_cargo_cmdline_profile(&s(&["cargo", "test", "-r"]), None), Some("release".into()));
+        assert_eq!(parse_cargo_cmdline_profile(&s(&["cargo", "bench"]), None), Some("release".into()));
+        assert_eq!(parse_cargo_cmdline_profile(&s(&["cargo", "build", "--profile", "fast-dev"]), None), Some("fast-dev".into()));
+        assert_eq!(parse_cargo_cmdline_profile(&s(&["cargo", "build", "--profile=dev"]), None), Some("debug".into()));
+        assert_eq!(
+            parse_cargo_cmdline_profile(&s(&["cargo", "build", "--target", "wasm32-unknown-unknown", "--release"]), None),
+            Some("wasm32-unknown-unknown/release".into())
+        );
+        assert_eq!(
+            parse_cargo_cmdline_profile(&s(&["cargo", "run", "--", "--release"]), Some("aarch64-unknown-linux-gnu")),
+            Some("aarch64-unknown-linux-gnu/debug".into())
+        );
+        assert_eq!(parse_cargo_cmdline_profile(&s(&["rustc", "-vV"]), None), None);
+    }
+
+    #[test]
+    fn shared_unit_name_and_profile_roundtrip() {
+        let name = format!("{}__0123456789abcdef__99__12345", encode_profile("x86_64-unknown-linux-gnu/custom-fast"));
+        assert_eq!(
+            parse_shared_unit_name(&name),
+            Some(("x86_64-unknown-linux-gnu/custom-fast".into(), "0123456789abcdef".into(), 99, 12345))
+        );
+        assert_eq!(parse_shared_unit_name("bad-name"), None);
+    }
+
+    #[test]
+    fn extracts_only_pure_external_units_and_handles_out_dir() {
+        let base = std::env::temp_dir().join(format!("cargo-pool-extract-{}", std::process::id()));
+        let (wt, common, target) = (base.join("wt"), base.join("common.git"), base.join("wt/target"));
+        let debug = target.join("debug");
+        for d in [".fingerprint", "deps", "build"] {
+            fs::create_dir_all(debug.join(d)).unwrap();
+        }
+        fs::create_dir_all(&common).unwrap();
+
+        let write_fp = |pkg: &str, hash: &str, kind: &str, fp: u64, deps: &[u64], local_json: &str| {
+            let dir = debug.join(format!(".fingerprint/{pkg}-{hash}"));
+            fs::create_dir_all(&dir).unwrap();
+            let deps_s: Vec<String> = deps.iter().map(|d| format!("[1,\"d\",false,{d}]")).collect();
+            fs::write(
+                dir.join(format!("{kind}.json")),
+                format!("{{\"rustc\":42,\"deps\":[{}],\"local\":{local_json}}}", deps_s.join(",")),
+            )
+            .unwrap();
+            fs::write(dir.join(kind), format!("{:016x}", fp.swap_bytes())).unwrap();
+        };
+
+        // 1. Registry crate with build.rs + OUT_DIR generated file in .d (MUST be extracted).
+        write_fp("serde_core", "1111111111111111", "build-script-build-script-build", 10, &[], "[]");
+        fs::create_dir_all(debug.join("build/serde_core-1111111111111111")).unwrap();
+        fs::write(
+            debug.join("build/serde_core-1111111111111111/build_script_build-1111111111111111.d"),
+            format!(
+                "{}/debug/build/serde_core-1111111111111111/build_script_build-1111111111111111: /c/registry/src/idx/serde_core-1.0.229/build.rs\n",
+                target.display()
+            ),
+        )
+        .unwrap();
+
+        write_fp(
+            "serde_core",
+            "2222222222222222",
+            "run-build-script-build-script-build",
+            11,
+            &[10],
+            "[{\"RerunIfChanged\":{\"output\":\"debug/build/serde_core-2222222222222222/output\",\"paths\":[\"build.rs\"]}}]",
+        );
+        fs::create_dir_all(debug.join("build/serde_core-2222222222222222/out")).unwrap();
+        fs::write(debug.join("build/serde_core-2222222222222222/out/private.rs"), "// gen").unwrap();
+
+        write_fp("serde_core", "3333333333333333", "lib-serde_core", 12, &[11], "[]");
+        fs::write(debug.join("deps/libserde_core-3333333333333333.rlib"), "rlib").unwrap();
+        fs::write(
+            debug.join("deps/serde_core-3333333333333333.d"),
+            format!(
+                "{}/debug/deps/serde_core-3333333333333333.d: /c/registry/src/idx/serde_core-1.0.229/src/lib.rs {}/debug/build/serde_core-2222222222222222/out/private.rs\n# env-dep:OUT_DIR={}/debug/build/serde_core-2222222222222222/out\n",
+                target.display(),
+                target.display(),
+                target.display()
+            ),
+        )
+        .unwrap();
+
+        // 2. Registry crate that reads a file inside the worktree (MUST be excluded, along with dependents).
+        write_fp("leaky", "4444444444444444", "lib-leaky", 13, &[], "[]");
+        fs::write(debug.join("deps/libleaky-4444444444444444.rlib"), "rlib").unwrap();
+        fs::write(
+            debug.join("deps/leaky-4444444444444444.d"),
+            format!("{}/debug/deps/leaky-4444444444444444.d: /c/registry/src/idx/leaky-1.0.0/src/lib.rs {}/config.json\n", target.display(), wt.display()),
+        )
+        .unwrap();
+
+        write_fp("uses_leaky", "5555555555555555", "lib-uses_leaky", 14, &[13], "[]");
+        fs::write(debug.join("deps/libuses_leaky-5555555555555555.rlib"), "rlib").unwrap();
+        fs::write(
+            debug.join("deps/uses_leaky-5555555555555555.d"),
+            format!("{}/debug/deps/uses_leaky-5555555555555555.d: /c/registry/src/idx/uses_leaky-1.0.0/src/lib.rs\n", target.display()),
+        )
+        .unwrap();
+
+        // 3. Workspace crate (MUST be excluded).
+        write_fp("app", "6666666666666666", "bin-app", 15, &[12], "[]");
+        fs::write(
+            debug.join("deps/app-6666666666666666.d"),
+            format!("{}/debug/deps/app-6666666666666666.d: {}/src/main.rs\n", target.display(), wt.display()),
+        )
+        .unwrap();
+
+        let extracted = extract_external_units(&target, &wt, &common);
+        let hashes: HashSet<&str> = extracted.iter().map(|u| u.hash.as_str()).collect();
+        assert_eq!(hashes, HashSet::from(["1111111111111111", "2222222222222222", "3333333333333333"]));
         fs::remove_dir_all(&base).unwrap();
     }
 }

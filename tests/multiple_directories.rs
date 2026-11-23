@@ -94,14 +94,28 @@ impl Fixture {
     }
 }
 
+fn remove_dir_all_retry(path: &Path) {
+    for _ in 0..50 {
+        match fs::remove_dir_all(path) {
+            Ok(()) => return,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return,
+            Err(e) if e.kind() == std::io::ErrorKind::DirectoryNotEmpty => {
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            Err(e) => panic!("remove_dir_all({}): {e}", path.display()),
+        }
+    }
+    fs::remove_dir_all(path).unwrap();
+}
+
 impl Drop for Fixture {
     fn drop(&mut self) {
         for root in &self.roots {
             if !root.starts_with(&self.dir) && root.exists() {
-                fs::remove_dir_all(root).unwrap();
+                remove_dir_all_retry(root);
             }
         }
-        fs::remove_dir_all(&self.dir).unwrap();
+        remove_dir_all_retry(&self.dir);
     }
 }
 
@@ -1939,4 +1953,307 @@ fn monorepo_workspaces_one_level_down_each_get_their_own_pool() {
     assert_eq!(fs::read_link(b.join("alpha/target")).unwrap(), alpha);
     assert_eq!(fs::read_link(b.join("beta/target")).unwrap(), beta);
     assert!(f.pool(&b, roots, &["stats"]).contains("attached   2 worktrees"));
+}
+
+fn write_fake_rustc(dir: &Path) -> PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+    let rustc = dir.join("fake-rustc");
+    fs::write(&rustc, "#!/bin/sh\necho 'rustc 1.91.0 (fake)'\n").unwrap();
+    fs::set_permissions(&rustc, fs::Permissions::from_mode(0o755)).unwrap();
+    rustc
+}
+
+#[allow(clippy::too_many_arguments)]
+fn seed_external_unit(
+    profile_dir: &Path,
+    target_root: &Path,
+    pkg: &str,
+    version: &str,
+    hash: &str,
+    rustc: u64,
+    fp: u64,
+    deps: &[u64],
+    payload: &[u8],
+) {
+    for d in [".fingerprint", "deps"] {
+        fs::create_dir_all(profile_dir.join(d)).unwrap();
+    }
+    let fp_dir = profile_dir.join(format!(".fingerprint/{pkg}-{hash}"));
+    fs::create_dir_all(&fp_dir).unwrap();
+    let deps_s: Vec<String> = deps.iter().map(|d| format!("[1,\"d\",false,{d}]")).collect();
+    fs::write(
+        fp_dir.join(format!("lib-{pkg}.json")),
+        format!("{{\"rustc\":{rustc},\"deps\":[{}],\"local\":[]}}", deps_s.join(",")),
+    )
+    .unwrap();
+    fs::write(fp_dir.join(format!("lib-{pkg}")), format!("{:016x}", fp.swap_bytes())).unwrap();
+    fs::write(profile_dir.join(format!("deps/lib{pkg}-{hash}.rlib")), payload).unwrap();
+    fs::write(
+        profile_dir.join(format!("deps/{pkg}-{hash}.d")),
+        format!(
+            "{}/deps/{pkg}-{hash}.d: /c/registry/src/index.crates.io-0123/{pkg}-{version}/src/lib.rs\n",
+            target_root.display()
+        ),
+    )
+    .unwrap();
+}
+
+#[test]
+fn global_shared_cache_hydrates_across_repos_and_propagates_live() {
+    let f = Fixture::new();
+    let roots = &f.roots[..1];
+    let rustc = write_fake_rustc(&f.dir);
+    let lock = "version = 4\n\n[[package]]\nname = \"ext\"\nversion = \"1.0.0\"\nsource = \"registry+https://github.com/rust-lang/crates.io-index\"\n";
+
+    // Repo A attaches and builds `ext` in debug.
+    fs::write(f.repo.join("Cargo.lock"), lock).unwrap();
+    f.pool(&f.repo, roots, &["attach", "--no-seed"]);
+    let target_a = fs::read_link(f.repo.join("target")).unwrap();
+    let slot_a = target_a.parent().unwrap().to_path_buf();
+    fs::write(slot_a.join("last-rustc"), rustc.as_os_str().as_encoded_bytes()).unwrap();
+    seed_external_unit(&target_a.join("debug"), &target_a, "ext", "1.0.0", "1111111111111111", 77, 1001, &[], b"debug-rlib");
+    f.pool(&f.repo, roots, &["snapshot-after-build", slot_a.to_str().unwrap()]);
+
+    let status = f.pool(&f.dir, roots, &["status", "--size"]);
+    assert!(status.contains("shared dependency cache"), "status should list shared cache: {status}");
+    assert!(status.contains("1 units"), "expected 1 harvested unit: {status}");
+
+    // Completely separate Repo B with the same Cargo.lock.
+    let repo_b = f.dir.join("repo-b");
+    fs::create_dir_all(repo_b.join("src")).unwrap();
+    fs::write(repo_b.join("Cargo.toml"), "[package]\nname = \"other\"\nversion = \"0.1.0\"\n").unwrap();
+    fs::write(repo_b.join("src/main.rs"), "fn main() {}\n").unwrap();
+    fs::write(repo_b.join("Cargo.lock"), lock).unwrap();
+    f.git(&repo_b, &["init", "-q"]);
+    f.git(&repo_b, &["add", "."]);
+    f.git(&repo_b, &["commit", "-qm", "init"]);
+
+    f.pool(&repo_b, roots, &["attach"]);
+    let target_b = fs::read_link(repo_b.join("target")).unwrap();
+    let slot_b = target_b.parent().unwrap().to_path_buf();
+    // First cargo probe triggers seed_on_first_use -> hydrate_slot.
+    f.pool(&repo_b, roots, &[rustc.to_str().unwrap(), "-vV"]);
+    assert_eq!(fs::read(target_b.join("debug/deps/libext-1111111111111111.rlib")).unwrap(), b"debug-rlib");
+
+    // Simulate Repo B having a cached probe and a valid snapshot.
+    fs::write(target_b.join(".rustc_info.json"), "{}").unwrap();
+    f.pool(&repo_b, roots, &["snapshot-after-build", slot_b.to_str().unwrap()]);
+    let snap_before = fs::read_to_string(slot_b.join("snapshot.json")).unwrap();
+    let snap_at: u64 = serde_json::from_str::<serde_json::Value>(&snap_before).unwrap()["taken_at"].as_u64().unwrap();
+
+    // Repo A now builds `ext` in release and harvests -> invalidates Repo B's idle probe cache.
+    seed_external_unit(&target_a.join("release"), &target_a, "ext", "1.0.0", "2222222222222222", 77, 1002, &[], b"release-rlib");
+    f.pool(&f.repo, roots, &["snapshot-after-build", slot_a.to_str().unwrap()]);
+    assert!(!target_b.join(".rustc_info.json").exists(), "harvest should invalidate idle slot's .rustc_info.json");
+
+    // Repo B's next probe hydrates the new release unit while keeping its snapshot valid.
+    f.pool(&repo_b, roots, &[rustc.to_str().unwrap(), "-vV"]);
+    assert_eq!(fs::read(target_b.join("release/deps/libext-2222222222222222.rlib")).unwrap(), b"release-rlib");
+    let rel_deps_mtime = fs::metadata(target_b.join("release/deps")).unwrap().modified().unwrap()
+        .duration_since(UNIX_EPOCH).unwrap().as_nanos() as u64;
+    assert!(rel_deps_mtime < snap_at, "hydration must not invalidate existing snapshot");
+    let stats_b = f.pool(&repo_b, roots, &["stats"]);
+    assert!(stats_b.contains("shared     2 hydrated"), "expected 2 hydrated units in stats: {stats_b}");
+}
+
+#[test]
+fn busy_seed_source_falls_back_to_global_shared_cache() {
+    let f = Fixture::new();
+    let roots = &f.roots[..1];
+    let rustc = write_fake_rustc(&f.dir);
+    let lock = "version = 4\n\n[[package]]\nname = \"ext\"\nversion = \"1.0.0\"\nsource = \"registry+https://github.com/rust-lang/crates.io-index\"\n";
+    fs::write(f.repo.join("Cargo.lock"), lock).unwrap();
+    f.git(&f.repo, &["add", "Cargo.lock"]);
+    f.git(&f.repo, &["commit", "-qm", "lock"]);
+
+    f.pool(&f.repo, roots, &["attach", "--no-seed"]);
+    let target0 = fs::read_link(f.repo.join("target")).unwrap();
+    let slot0 = target0.parent().unwrap().to_path_buf();
+    fs::write(slot0.join("last-rustc"), rustc.as_os_str().as_encoded_bytes()).unwrap();
+    seed_external_unit(&target0.join("debug"), &target0, "ext", "1.0.0", "1111111111111111", 77, 1001, &[], b"rlib");
+    f.pool(&f.repo, roots, &["snapshot-after-build", slot0.to_str().unwrap()]);
+
+    // Lock slot 0 as busy building, then attach worktree `b` and trigger first-use seeding.
+    let lock_file = fs::OpenOptions::new().create(true).truncate(false).write(true).open(target0.join("debug/.cargo-lock")).unwrap();
+    assert_eq!(unsafe { libc::flock(lock_file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) }, 0);
+
+    let b = f.worktree("b");
+    f.pool(&b, roots, &["attach"]);
+    let target1 = fs::read_link(b.join("target")).unwrap();
+    f.pool(&b, roots, &[rustc.to_str().unwrap(), "-vV"]);
+    drop(lock_file);
+
+    assert_eq!(fs::read(target1.join("debug/deps/libext-1111111111111111.rlib")).unwrap(), b"rlib");
+    let stats = f.pool(&b, roots, &["stats"]);
+    assert!(stats.contains("1 busy building"), "expected seed to skip busy slot: {stats}");
+    assert!(stats.contains("1 hydrated"), "expected fallback hydration from shared cache: {stats}");
+}
+
+#[test]
+fn multi_root_shared_generation_triggers_hydration_from_second_root() {
+    let f = Fixture::new();
+    let rustc = write_fake_rustc(&f.dir);
+    let lock = "version = 4\n\n[[package]]\nname = \"a\"\nversion = \"1.0.0\"\nsource = \"registry+https://github.com/rust-lang/crates.io-index\"\n\n\
+                [[package]]\nname = \"b\"\nversion = \"1.0.0\"\nsource = \"registry+https://github.com/rust-lang/crates.io-index\"\n";
+    fs::write(f.repo.join("Cargo.lock"), lock).unwrap();
+    f.git(&f.repo, &["add", "Cargo.lock"]);
+    f.git(&f.repo, &["commit", "-qm", "lock"]);
+
+    // Harvest unit `a` on root 0 and bump root 0's generation to 5.
+    f.pool(&f.repo, &f.roots[..1], &["attach", "--no-seed"]);
+    let t0 = fs::read_link(f.repo.join("target")).unwrap();
+    let s0 = t0.parent().unwrap().to_path_buf();
+    fs::write(s0.join("last-rustc"), rustc.as_os_str().as_encoded_bytes()).unwrap();
+    seed_external_unit(&t0.join("debug"), &t0, "a", "1.0.0", "aaaaaaaaaaaaaaaa", 88, 2001, &[], b"crate-a");
+    f.pool(&f.repo, &f.roots[..1], &["snapshot-after-build", s0.to_str().unwrap()]);
+    fs::write(f.roots[0].join("shared/generation"), "5\n").unwrap();
+
+    // Worktree `wt` sees both roots and hydrates unit `a` at combined generation 5.
+    let wt = f.worktree("wt");
+    f.pool(&wt, &f.roots, &["attach", "--no-seed"]);
+    let t_wt = fs::read_link(wt.join("target")).unwrap();
+    f.pool(&wt, &f.roots, &[rustc.to_str().unwrap(), "-vV"]);
+    assert!(t_wt.join("debug/deps/liba-aaaaaaaaaaaaaaaa.rlib").exists());
+
+    // Harvest unit `b` on root 1 (root 1's generation goes 0 -> 1, still < 5, but sum goes 5 -> 6).
+    let wt2 = f.worktree("wt2");
+    f.pool(&wt2, &f.roots[1..], &["attach", "--no-seed"]);
+    let t1 = fs::read_link(wt2.join("target")).unwrap();
+    let s1 = t1.parent().unwrap().to_path_buf();
+    fs::write(s1.join("last-rustc"), rustc.as_os_str().as_encoded_bytes()).unwrap();
+    seed_external_unit(&t1.join("debug"), &t1, "b", "1.0.0", "bbbbbbbbbbbbbbbb", 88, 2002, &[], b"crate-b");
+    f.pool(&wt2, &f.roots[1..], &["snapshot-after-build", s1.to_str().unwrap()]);
+
+    // Next probe on `wt` must detect combined generation 6 and hydrate `b` from root 1.
+    f.pool(&wt, &f.roots, &[rustc.to_str().unwrap(), "-vV"]);
+    assert_eq!(fs::read(t_wt.join("debug/deps/libb-bbbbbbbbbbbbbbbb.rlib")).unwrap(), b"crate-b");
+}
+
+#[test]
+fn gc_age_and_disk_pressure_evict_shared_units_before_warm_slots() {
+    let f = Fixture::exclusive();
+    let roots = &f.roots[..1];
+    let rustc = write_fake_rustc(&f.dir);
+    let lock = "version = 4\n\n[[package]]\nname = \"old\"\nversion = \"1.0.0\"\nsource = \"registry+https://github.com/rust-lang/crates.io-index\"\n\n\
+                [[package]]\nname = \"fresh\"\nversion = \"1.0.0\"\nsource = \"registry+https://github.com/rust-lang/crates.io-index\"\n";
+    fs::write(f.repo.join("Cargo.lock"), lock).unwrap();
+    f.pool(&f.repo, roots, &["attach", "--no-seed"]);
+    let target = fs::read_link(f.repo.join("target")).unwrap();
+    let slot = target.parent().unwrap().to_path_buf();
+    fs::write(slot.join("last-rustc"), rustc.as_os_str().as_encoded_bytes()).unwrap();
+    let big = vec![b'x'; 2 << 20];
+    seed_external_unit(&target.join("debug"), &target, "old", "1.0.0", "1111111111111111", 55, 3001, &[], &big);
+    seed_external_unit(&target.join("debug"), &target, "fresh", "1.0.0", "2222222222222222", 55, 3002, &[], &big);
+    f.pool(&f.repo, roots, &["snapshot-after-build", slot.to_str().unwrap()]);
+    f.pool(&f.repo, roots, &["detach"]);
+
+    let old_unit = f.roots[0].join("shared/units/reg/old-1.0.0/debug__1111111111111111__55__3001");
+    let fresh_unit = f.roots[0].join("shared/units/reg/fresh-1.0.0/debug__2222222222222222__55__3002");
+    assert!(old_unit.is_dir() && fresh_unit.is_dir());
+
+    // Backdate `old_unit` by 10 days; dry-run keeps it, real gc deletes only `old_unit`.
+    let ten_days_ago = SystemTime::now() - std::time::Duration::from_secs(10 * 86_400);
+    fs::File::open(&old_unit).unwrap().set_modified(ten_days_ago).unwrap();
+    let dry = f.pool(&f.repo, roots, &["gc", "--max-age-days", "5", "--dry-run"]);
+    assert!(dry.contains("would remove 1 shared dependency units") && old_unit.exists());
+    f.pool(&f.repo, roots, &["gc", "--max-age-days", "5"]);
+    assert!(!old_unit.exists() && fresh_unit.exists());
+
+    // Under disk pressure needing ~1 MiB freed, `fresh_unit` (2 MiB) is evicted before the warm slot.
+    let limit = limit_with_room(&f.roots[0], -(1 << 20));
+    success(
+        f.command(env!("CARGO_BIN_EXE_cargo-pool"), &f.repo)
+            .env("CARGO_POOL_DIRS", &f.roots[0])
+            .env("CARGO_POOL_MAX_DISK_PERCENT", format!("{limit:.6}"))
+            .args(["gc"])
+            .output()
+            .unwrap(),
+    );
+    assert!(!fresh_unit.exists(), "shared unit should be evicted under disk pressure");
+    assert!(slot.exists(), "warm slot must survive when evicting shared units suffices");
+}
+
+#[test]
+fn real_cargo_build_reuses_external_dependencies_across_repositories() {
+    let f = Fixture::new();
+    let roots = &f.roots[..1];
+    f.pool(&f.repo, roots, &["install-wrapper"]);
+
+    // Create a local git dependency with a build script that generates code in OUT_DIR.
+    let dep = f.dir.join("extdep");
+    fs::create_dir_all(dep.join("src")).unwrap();
+    fs::write(dep.join("Cargo.toml"), "[package]\nname = \"extdep\"\nversion = \"0.1.0\"\nedition = \"2021\"\n").unwrap();
+    fs::write(
+        dep.join("build.rs"),
+        "fn main() {\n\
+            let out = std::env::var(\"OUT_DIR\").unwrap();\n\
+            std::fs::write(format!(\"{out}/val.rs\"), \"pub const VAL: u32 = 42;\").unwrap();\n\
+            println!(\"cargo:rerun-if-changed=build.rs\");\n\
+         }\n",
+    )
+    .unwrap();
+    fs::write(dep.join("src/lib.rs"), "include!(concat!(env!(\"OUT_DIR\"), \"/val.rs\"));\n").unwrap();
+    f.git(&dep, &["init", "-q"]);
+    f.git(&dep, &["add", "."]);
+    f.git(&dep, &["commit", "-qm", "init"]);
+    let dep_url = format!("file://{}", dep.display());
+
+    // Repo A builds `extdep` and harvests it into the global shared cache.
+    fs::write(
+        f.repo.join("Cargo.toml"),
+        format!("[package]\nname = \"repo-a\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[dependencies]\nextdep = {{ git = \"{dep_url}\" }}\n"),
+    )
+    .unwrap();
+    fs::write(f.repo.join("src/main.rs"), "fn main() { assert_eq!(extdep::VAL, 42); }\n").unwrap();
+    f.git(&f.repo, &["add", "."]);
+    f.git(&f.repo, &["commit", "-qm", "dep"]);
+    f.pool(&f.repo, roots, &["attach", "--no-seed"]);
+    let target_a = fs::read_link(f.repo.join("target")).unwrap();
+    let slot_a = target_a.parent().unwrap().to_path_buf();
+
+    success(
+        f.command("cargo", &f.repo)
+            .env("CARGO_POOL_DIRS", &f.roots[0])
+            .args(["build"])
+            .output()
+            .unwrap(),
+    );
+    // Wait for any background snapshot-after-build to finish, then ensure harvest has run.
+    let snap_lock = fs::OpenOptions::new().create(true).truncate(false).write(true).open(slot_a.join("snapshot.lock")).unwrap();
+    assert_eq!(unsafe { libc::flock(snap_lock.as_raw_fd(), libc::LOCK_EX) }, 0);
+    drop(snap_lock);
+    f.pool(&f.repo, roots, &["snapshot-after-build", slot_a.to_str().unwrap()]);
+    assert!(f.roots[0].join("shared/units/git").is_dir(), "git dep should be harvested into shared/");
+
+    // Brand-new Repo B depending on the exact same git dependency.
+    let repo_b = f.dir.join("repo-b");
+    fs::create_dir_all(repo_b.join("src")).unwrap();
+    fs::write(
+        repo_b.join("Cargo.toml"),
+        format!("[package]\nname = \"repo-b\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[dependencies]\nextdep = {{ git = \"{dep_url}\" }}\n"),
+    )
+    .unwrap();
+    fs::write(repo_b.join("src/main.rs"), "fn main() { assert_eq!(extdep::VAL, 42); }\n").unwrap();
+    // Copy Cargo.lock so Cargo doesn't re-resolve, updating only the root package name.
+    let lock = fs::read_to_string(f.repo.join("Cargo.lock")).unwrap().replace("name = \"repo-a\"", "name = \"repo-b\"");
+    fs::write(repo_b.join("Cargo.lock"), lock).unwrap();
+    f.git(&repo_b, &["init", "-q"]);
+    f.git(&repo_b, &["add", "."]);
+    f.git(&repo_b, &["commit", "-qm", "init"]);
+    f.pool(&repo_b, roots, &["attach"]);
+    let slot_b = fs::read_link(repo_b.join("target")).unwrap().parent().unwrap().to_path_buf();
+
+    let out = f
+        .command("cargo", &repo_b)
+        .env("CARGO_POOL_DIRS", &f.roots[0])
+        .args(["build", "--offline"])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "repo-b build failed: {}", String::from_utf8_lossy(&out.stderr));
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(!stderr.contains("Compiling extdep"), "extdep should be hydrated and Fresh in repo-b:\n{stderr}");
+    assert!(stderr.contains("Compiling repo-b"), "expected repo-b itself to compile:\n{stderr}");
+    // Wait for Repo B's background snapshot-after-build before Fixture::drop deletes the temp dir.
+    let snap_lock_b = fs::OpenOptions::new().create(true).truncate(false).write(true).open(slot_b.join("snapshot.lock")).unwrap();
+    assert_eq!(unsafe { libc::flock(snap_lock_b.as_raw_fd(), libc::LOCK_EX) }, 0);
 }
