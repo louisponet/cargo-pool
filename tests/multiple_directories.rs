@@ -2257,3 +2257,141 @@ fn real_cargo_build_reuses_external_dependencies_across_repositories() {
     let snap_lock_b = fs::OpenOptions::new().create(true).truncate(false).write(true).open(slot_b.join("snapshot.lock")).unwrap();
     assert_eq!(unsafe { libc::flock(snap_lock_b.as_raw_fd(), libc::LOCK_EX) }, 0);
 }
+
+#[test]
+fn pressure_preserves_held_debug_incremental_over_non_debug_and_excess_free_slots() {
+    let f = Fixture::exclusive();
+    let roots = &f.roots[..1];
+    let held_wt = f.worktree("held");
+    let free_old = f.worktree("free-old");
+    let free_new = f.worktree("free-new");
+    for wt in [&held_wt, &free_old, &free_new] {
+        f.pool(wt, roots, &["attach", "--no-seed"]);
+    }
+    let held_target = fs::read_link(held_wt.join("target")).unwrap();
+    fs::create_dir_all(held_target.join("debug/.fingerprint")).unwrap();
+    fs::create_dir_all(held_target.join("debug/incremental/crate-a")).unwrap();
+    fs::write(held_target.join("debug/incremental/crate-a/cache"), vec![1; 4 << 20]).unwrap();
+    fs::create_dir_all(held_target.join("release-with-debug/.fingerprint")).unwrap();
+    fs::create_dir_all(held_target.join("release-with-debug/incremental/crate-a")).unwrap();
+    fs::write(held_target.join("release-with-debug/incremental/crate-a/cache"), vec![2; 8 << 20]).unwrap();
+
+    let old_target = fs::read_link(free_old.join("target")).unwrap();
+    let new_target = fs::read_link(free_new.join("target")).unwrap();
+    fs::write(old_target.join("artifact"), vec![3; 8 << 20]).unwrap();
+    fs::write(new_target.join("artifact"), vec![4; 8 << 20]).unwrap();
+    f.pool(&free_old, roots, &["detach"]);
+    f.pool(&free_new, roots, &["detach"]);
+    // Make `free_old` older than `free_new`.
+    let old_meta = old_target.parent().unwrap().join("slot.json");
+    let mut json: serde_json::Value = serde_json::from_slice(&fs::read(&old_meta).unwrap()).unwrap();
+    json["last_used"] = 100.into();
+    fs::write(&old_meta, serde_json::to_vec(&json).unwrap()).unwrap();
+
+    // Need ~12 MiB freed: held non-debug incremental (8 MiB) + excess free slot (8 MiB) satisfy it
+    // without touching held debug/incremental (4 MiB) or the newest free slot reserve.
+    success(
+        f.command(env!("CARGO_BIN_EXE_cargo-pool"), &held_wt)
+            .env("CARGO_POOL_DIR", &f.roots[0])
+            .env("CARGO_POOL_MAX_DISK_PERCENT", limit_with_room(&f.roots[0], -(12 << 20)).to_string())
+            .arg("gc")
+            .output()
+            .unwrap(),
+    );
+    assert_eq!(fs::read_dir(held_target.join("release-with-debug/incremental")).unwrap().count(), 0, "non-debug incremental goes first");
+    assert!(!old_target.exists(), "excess free slot goes before held debug incremental");
+    assert_eq!(fs::read_dir(held_target.join("debug/incremental")).unwrap().count(), 1, "held debug incremental survives");
+    assert!(new_target.exists(), "newest free slot reserve survives");
+}
+
+#[test]
+fn workspace_only_build_skips_redundant_harvest() {
+    let f = Fixture::new();
+    let roots = &f.roots[..1];
+    let rustc = write_fake_rustc(&f.dir);
+    let lock = "version = 4\n\n[[package]]\nname = \"ext\"\nversion = \"1.0.0\"\nsource = \"registry+https://github.com/rust-lang/crates.io-index\"\n";
+    fs::write(f.repo.join("Cargo.lock"), lock).unwrap();
+    f.pool(&f.repo, roots, &["attach", "--no-seed"]);
+    let target = fs::read_link(f.repo.join("target")).unwrap();
+    let slot = target.parent().unwrap().to_path_buf();
+    fs::write(slot.join("last-rustc"), rustc.as_os_str().as_encoded_bytes()).unwrap();
+    seed_external_unit(&target.join("debug"), &target, "ext", "1.0.0", "1111111111111111", 77, 1001, &[], b"debug-rlib");
+
+    // First snapshot harvests `ext` and records `harvested-once`.
+    f.pool(&f.repo, roots, &["snapshot-after-build", slot.to_str().unwrap()]);
+    assert!(slot.join("harvested-once").exists());
+    let harvests_before = events(&target).into_iter().filter(|e| e["event"] == "harvest").count();
+    assert_eq!(harvests_before, 1);
+
+    // Add another external unit manually, then simulate a workspace-only compile through the wrapper.
+    seed_external_unit(&target.join("debug"), &target, "ext", "1.0.0", "2222222222222222", 77, 1002, &[], b"debug-rlib-2");
+    let snap_lock = fs::OpenOptions::new().create(true).truncate(false).write(true).open(slot.join("snapshot.lock")).unwrap();
+    assert_eq!(unsafe { libc::flock(snap_lock.as_raw_fd(), libc::LOCK_EX) }, 0);
+    f.pool(&f.repo, roots, &["/bin/true", "--out-dir", target.join("debug/deps").to_str().unwrap(), "src/main.rs"]);
+    drop(snap_lock);
+    f.pool(&f.repo, roots, &["snapshot-after-build", slot.to_str().unwrap()]);
+    let harvests_after_ws = events(&target).into_iter().filter(|e| e["event"] == "harvest").count();
+    assert_eq!(harvests_after_ws, 1, "workspace-only compile should skip rescanning/harvesting");
+
+    // Now simulate an external crate compile: harvest runs and publishes the new unit.
+    let snap_lock = fs::OpenOptions::new().create(true).truncate(false).write(true).open(slot.join("snapshot.lock")).unwrap();
+    assert_eq!(unsafe { libc::flock(snap_lock.as_raw_fd(), libc::LOCK_EX) }, 0);
+    f.pool(
+        &f.repo,
+        roots,
+        &["/bin/true", "--out-dir", target.join("debug/deps").to_str().unwrap(), "/c/registry/src/idx/ext-1.0.0/src/lib.rs"],
+    );
+    drop(snap_lock);
+    f.pool(&f.repo, roots, &["snapshot-after-build", slot.to_str().unwrap()]);
+    let harvests_after_ext = events(&target).into_iter().filter(|e| e["event"] == "harvest").count();
+    assert_eq!(harvests_after_ext, 2, "external compile should trigger harvest");
+}
+
+#[test]
+fn non_cow_seeds_and_hydrates_profiles_on_demand() {
+    let f = Fixture::new();
+    let roots = &f.roots[..1];
+    f.pool(&f.repo, roots, &["install-wrapper"]);
+    f.pool(&f.repo, roots, &["attach", "--no-seed"]);
+    let target0 = fs::read_link(f.repo.join("target")).unwrap();
+    let slot0 = target0.parent().unwrap().to_path_buf();
+
+    // Build both debug and release in the main worktree so slot 0 holds both profiles.
+    success(f.command("cargo", &f.repo).env("CARGO_POOL_DIRS", &f.roots[0]).args(["build"]).output().unwrap());
+    success(f.command("cargo", &f.repo).env("CARGO_POOL_DIRS", &f.roots[0]).args(["build", "--release"]).output().unwrap());
+    let snap_lock = fs::OpenOptions::new().create(true).truncate(false).write(true).open(slot0.join("snapshot.lock")).unwrap();
+    assert_eq!(unsafe { libc::flock(snap_lock.as_raw_fd(), libc::LOCK_EX) }, 0);
+    drop(snap_lock);
+
+    // If the test filesystem supports reflinks, full seeding is free; skip non-CoW assertion.
+    let probe_src = f.dir.join("probe.src");
+    let probe_dst = f.dir.join("probe.dst");
+    fs::write(&probe_src, [0u8; 4096]).unwrap();
+    let sf = fs::File::open(&probe_src).unwrap();
+    let df = fs::File::create(&probe_dst).unwrap();
+    let reflink = unsafe { libc::ioctl(df.as_raw_fd(), 0x4004_9409 as libc::Ioctl, sf.as_raw_fd()) } == 0;
+    if reflink {
+        return;
+    }
+
+    // Worktree B runs `cargo check` (debug): on non-CoW it seeds only `debug/`, not `release/`.
+    let b = f.worktree("b");
+    f.pool(&b, roots, &["attach"]);
+    let target1 = fs::read_link(b.join("target")).unwrap();
+    let slot1 = target1.parent().unwrap().to_path_buf();
+    success(f.command("cargo", &b).env("CARGO_POOL_DIRS", &f.roots[0]).args(["check"]).output().unwrap());
+    assert!(target1.join("debug").is_dir(), "debug profile should be seeded");
+    assert!(!target1.join("release").exists(), "release profile should not be copied during debug seed on non-CoW");
+    assert!(slot1.join("partial-profiles").exists());
+
+    // Wait for snapshot_after_build to clear `.rustc_info.json`, then run `cargo build --release`:
+    // release should be seeded on demand before Cargo compiles.
+    let snap_lock1 = fs::OpenOptions::new().create(true).truncate(false).write(true).open(slot1.join("snapshot.lock")).unwrap();
+    assert_eq!(unsafe { libc::flock(snap_lock1.as_raw_fd(), libc::LOCK_EX) }, 0);
+    drop(snap_lock1);
+    let out = success(f.command("cargo", &b).env("CARGO_POOL_DIRS", &f.roots[0]).args(["build", "--release"]).output().unwrap());
+    let _ = out;
+    assert!(target1.join("release").is_dir(), "release profile should be seeded on demand");
+    let snap_lock2 = fs::OpenOptions::new().create(true).truncate(false).write(true).open(slot1.join("snapshot.lock")).unwrap();
+    assert_eq!(unsafe { libc::flock(snap_lock2.as_raw_fd(), libc::LOCK_EX) }, 0);
+}

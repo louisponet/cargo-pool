@@ -37,8 +37,11 @@ Share warm cargo `target/` directories between git worktrees, so a fresh worktre
   checkout's `target/`); that first command waits for the copy. The copy holds the source's
   build lock, so it never copies a half-written build. The `incremental/` caches are left
   out: they're often most of the bytes, and only speed up the first rebuild of a crate
-  edited after seeding. Without the rustc wrapper installed, new slots stay empty. There is
-  no limit on the number of slots: disk usage is the only limit.
+  edited after seeding. On non-CoW filesystems (such as ext4), seeding copies only the
+  active cargo profile (e.g. `debug`), and additional profiles (such as `--release` or a
+  custom `--profile`) are seeded or hydrated on demand when first used. Without the rustc
+  wrapper installed, new slots stay empty. There is no limit on the number of slots: disk
+  usage is the only limit.
 - **Pruning by Cargo.lock**: cargo never deletes artifacts of dependency versions it no longer
   uses, so slots only grow. cargo-pool drops every build unit that the slot's worktree can't
   use at its current `Cargo.lock` and toolchain: units built from a crate version or git
@@ -48,31 +51,33 @@ Share warm cargo `target/` directories between git worktrees, so a fresh worktre
   place when a worktree takes it over, and after each build once its worktree's `Cargo.lock` or
   toolchain has changed. It never runs during a build. If a deleted unit was needed after all,
   cargo rebuilds it.
-- **Global shared dependency cache**: after each build (and when adopting an existing
-  `target/`), cargo-pool harvests finished external registry and git dependency units into
-  `<pool-directory>/shared/` (excluding any unit whose inputs reference the checkout or its
-  `.git/` metadata). Any new worktree, monorepo workspace, or separate repository whose
-  `Cargo.lock` and toolchain match hydrates missing dependency units from `shared/` in
-  parallel using copy-on-write reflinks when available (`FICLONE` on btrfs/XFS, falling back
-  to `copy_file_range` on ext4). This also warms new worktrees when all of a repo's slots
-  are busy building, and propagates newly built profiles (including `--release` and custom
-  `[profile.<name>]` profiles) or upgraded dependencies to other idle worktrees on their
-  next cargo command.
+- **Global shared dependency cache**: after each build that compiled external crates (and when
+  adopting an existing `target/`), cargo-pool harvests finished external registry and git
+  dependency units into `<pool-directory>/shared/` (excluding any unit whose inputs reference
+  the checkout or its `.git/` metadata, leaving 1% disk headroom below `maxDiskPercent` and
+  avoiding cross-disk duplicates on non-CoW filesystems). Any new worktree, monorepo
+  workspace, or separate repository whose `Cargo.lock` and toolchain match hydrates missing
+  dependency units from `shared/` in parallel using copy-on-write reflinks when available
+  (`FICLONE` on btrfs/XFS, falling back to `copy_file_range` on ext4, where hydration is
+  scoped to the active cargo profile on demand). This also warms new worktrees when all of a
+  repo's slots are busy building, and propagates newly built profiles (including `--release`
+  and custom `[profile.<name>]` profiles) or upgraded dependencies to other idle worktrees on
+  their next cargo command.
 - **Disk limit**: if a disk holding a pool directory is above `maxDiskPercent` (default 90%),
   cargo-pool frees space on that filesystem, across all repos' pools and configured
   directories, until usage is back under the limit. This happens on every attach, on every pooled build (with the rustc wrapper
   installed, see below) and on `gc`, for the disks of all configured directories, not only the
   one being written to: new slots go to the disk with the most room, so a full disk might
-  otherwise never see another build. First it deletes the `incremental/` caches of the least
-  recently used slots: they only speed up rebuilding a crate after an edit, and rustc starts
-  them over. Next it evicts the least recently used entries from the global shared dependency
-  cache. Then it deletes the least recently used slots, whether or not a worktree holds
-  them. A slot counts as used when something is compiled into it or it is released. A worktree whose slot is deleted loses its `target` link and
+  otherwise never see another build. Space is reclaimed in order: unheld slots' `incremental/`
+  caches, held slots' non-`debug` `incremental/` caches, excess free slots (keeping the newest
+  free slot per pool), held slots' `debug/incremental/` caches, least recently used entries
+  from the global shared dependency cache, and finally remaining slots (whether or not a
+  worktree holds them). A slot counts as used when something is compiled into it or it is released. A worktree whose slot is deleted loses its `target` link and
   gets a new slot on its next cargo command. Slots with a build running or being seeded
   are never touched. Once attached, the main checkout's slot follows the same eviction rules.
   A new slot is only seeded if the copy fits under the limit (with reflinks counted as 0
   extra bytes on CoW filesystems). Making room for it deletes
-  incremental caches of any slot, then shared dependency units, then only slots no worktree holds; if that isn't enough,
+  incremental caches, excess free slots, shared dependency units, and remaining unheld slots; if that isn't enough,
   nothing is deleted and the slot falls back to hydrating from `shared/` (narrowing to the
   active profile if needed) or starts empty.
 - Leases end on their own when the worktree is deleted (`git worktree remove`),
