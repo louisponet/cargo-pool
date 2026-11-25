@@ -10,7 +10,7 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::ffi::{CString, OsString};
 use std::fs::{self, File, OpenOptions};
-use std::io::{BufRead, BufReader, Read, Write};
+use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write};
 use std::os::fd::AsRawFd;
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{MetadataExt, symlink};
@@ -847,8 +847,13 @@ fn incremental_caches(target: &Path) -> Vec<PathBuf> {
         .collect()
 }
 
-fn is_debug_incremental(cache: &Path) -> bool {
-    cache.parent().and_then(Path::file_name).is_some_and(|n| n == "debug")
+/// The most recently modified non-empty `incremental/` cache in `target`: the profile this
+/// worktree is actively compiling, whether `debug`, `release-with-debug`, or another profile.
+fn active_incremental_cache(target: &Path) -> Option<PathBuf> {
+    incremental_caches(target)
+        .into_iter()
+        .filter(|p| fs::read_dir(p).is_ok_and(|mut d| d.next().is_some()))
+        .max_by_key(|p| mtime_ns(p))
 }
 
 /// What's in the matching `incremental/` caches of a target dir, one entry per crate.
@@ -971,9 +976,9 @@ fn lock_candidate(c: &Reclaim) -> Result<Option<(Slot, Vec<FileLock>)>> {
 
 /// Bytes `free_disk` could take from `candidates` and `shared` right now, in its exact order:
 /// 1. unheld slots' incremental caches
-/// 2. held slots' non-debug incremental caches (e.g. `release-with-debug`, often 15-40 GB)
+/// 2. held slots' inactive (secondary) incremental caches (keeping each held slot's newest cache)
 /// 3. excess free slots (keeping the newest free slot per pool)
-/// 4. held slots' debug incremental caches
+/// 4. held slots' active incremental caches
 /// 5. LRU shared dependency units
 /// 6. remaining deletable slots (last free slot per pool, then held slots if `Evict::Any`)
 fn reclaimable(
@@ -984,9 +989,13 @@ fn reclaimable(
     let mut freed = 0;
     let mut trimmed = vec![0u64; candidates.len()];
     let mut deleted = vec![false; candidates.len()];
+    let active_caches: Vec<Option<PathBuf>> = candidates
+        .iter()
+        .map(|c| if c.held { active_incremental_cache(&c.slot.target()) } else { None })
+        .collect();
     // The probe lets its locks go before the walk, which would otherwise stall a build starting
     // in the slot.
-    let probe_trim = |c: &Reclaim, pred: fn(&Path) -> bool| -> Result<u64> {
+    let probe_trim = |c: &Reclaim, pred: &dyn Fn(&Path) -> bool| -> Result<u64> {
         if lock_candidate(c)?.is_some() {
             Ok(dir_size(incremental_entries_matching(&c.slot.target(), pred), &[]))
         } else {
@@ -998,7 +1007,7 @@ fn reclaimable(
             return Ok(freed);
         }
         if !candidates[i].held {
-            let sz = probe_trim(&candidates[i], |_| true)?;
+            let sz = probe_trim(&candidates[i], &|_| true)?;
             trimmed[i] += sz;
             freed += sz;
         }
@@ -1008,7 +1017,8 @@ fn reclaimable(
             return Ok(freed);
         }
         if candidates[i].held {
-            let sz = probe_trim(&candidates[i], |p| !is_debug_incremental(p))?;
+            let active = active_caches[i].as_deref();
+            let sz = probe_trim(&candidates[i], &|p| active != Some(p))?;
             trimmed[i] += sz;
             freed += sz;
         }
@@ -1027,7 +1037,8 @@ fn reclaimable(
             return Ok(freed);
         }
         if candidates[i].held {
-            let sz = probe_trim(&candidates[i], is_debug_incremental)?;
+            let active = active_caches[i].as_deref();
+            let sz = probe_trim(&candidates[i], &|p| active == Some(p))?;
             trimmed[i] += sz;
             freed += sz;
         }
@@ -1121,9 +1132,9 @@ fn evict_slot(c: &Reclaim, evict: Evict, max_percent: f64, quiet: bool) -> Resul
 /// Free space on `root`'s filesystem, across configured directories, until disk usage (plus
 /// `extra` bytes about to be written) is below `max_percent`.
 ///
-/// Order: unheld incremental caches, held non-debug incremental caches, excess free slots
-/// (keeping one newest free slot per pool), held debug incremental caches, LRU globally shared
-/// dependency units, then remaining slots (`evict` says whether held ones may go too).
+/// Order: unheld incremental caches, held inactive (secondary) incremental caches, excess free
+/// slots (keeping one newest free slot per pool), held active incremental caches, LRU globally
+/// shared dependency units, then remaining slots (`evict` says whether held ones may go too).
 /// Slots in `protect`, slots being attached, seeded or built and pools locked by another
 /// cargo-pool process are never touched. Must be called without holding any pool lock.
 ///
@@ -1161,7 +1172,8 @@ fn free_disk_impl(
         }
     }
     for c in candidates.iter().filter(|c| c.held) {
-        if trim_slot_caches(c, |p| !is_debug_incremental(p), max_percent, quiet)? && fits(0)? {
+        let active = active_incremental_cache(&c.slot.target());
+        if trim_slot_caches(c, |p| active.as_deref() != Some(p), max_percent, quiet)? && fits(0)? {
             return Ok(true);
         }
     }
@@ -1171,7 +1183,7 @@ fn free_disk_impl(
         }
     }
     for c in candidates.iter().filter(|c| c.held) {
-        if trim_slot_caches(c, is_debug_incremental, max_percent, quiet)? && fits(0)? {
+        if trim_slot_caches(c, |_| true, max_percent, quiet)? && fits(0)? {
             return Ok(true);
         }
     }
@@ -2142,13 +2154,23 @@ fn prune(worktree: &Path, slot_dir: &Path, just_built: bool) -> Result<()> {
 // New slots (via seed) and warm slots (via attach or `rustc -vV` probe) hydrate missing
 // `Cargo.lock`-pinned units from the shared store using reflinks where supported or copies.
 
+/// Schema version for `shared/units/.../meta.json`. Units from older versions (without `abi`
+/// / `dep_abis` SVH tracking) are ignored on hydration and replaced on harvest.
+const SHARED_META_VERSION: u32 = 2;
+
 #[derive(Serialize, Deserialize)]
 struct SharedUnitMeta {
+    #[serde(default)]
+    version: u32,
     profile: String,
     hash: String,
     rustc: u64,
     fp: u64,
+    #[serde(default)]
+    abi: u64,
     deps: Vec<u64>,
+    #[serde(default)]
+    dep_abis: Vec<(u64, u64)>,
 }
 
 struct ExternalUnit {
@@ -2157,9 +2179,125 @@ struct ExternalUnit {
     origin: Origin,
     rustc: u64,
     fp: u64,
+    abi: u64,
     deps: Vec<u64>,
+    dep_abis: Vec<(u64, u64)>,
     /// Paths relative to `<target>/<profile_rel>` belonging to this unit.
     files: Vec<PathBuf>,
+}
+
+/// Hash the leading bytes of a `.rmeta` file, which hold rustc's metadata header and 16-byte
+/// `CrateHash` (SVH). Crates that `include!` from `OUT_DIR` produce a different SVH per worktree
+/// even when their Cargo fingerprint is identical; comparing this hash prevents mixing
+/// incompatible dependency ABIs across worktrees.
+fn rmeta_header_hash(path: &Path) -> Option<u64> {
+    let mut f = File::open(path).ok()?;
+    let mut buf = [0u8; 64];
+    let n = f.read(&mut buf).ok()?;
+    (n > 0).then(|| fnv1a(&buf[..n]))
+}
+
+/// Hash the `lib.rmeta` member header inside a `.rlib` `ar` archive (or the leading bytes if not
+/// an `ar` archive, e.g. synthetic test artifacts).
+fn rlib_abi_hash(path: &Path) -> Option<u64> {
+    let mut f = File::open(path).ok()?;
+    let mut magic = [0u8; 8];
+    let n = f.read(&mut magic).ok()?;
+    if n < 8 || &magic != b"!<arch>\n" {
+        return rmeta_header_hash(path);
+    }
+    let mut hdr = [0u8; 60];
+    while f.read_exact(&mut hdr).is_ok() {
+        if &hdr[58..60] != b"`\n" {
+            break;
+        }
+        let Ok(size_str) = std::str::from_utf8(&hdr[48..58]) else { break };
+        let Ok(size) = size_str.trim().parse::<u64>() else { break };
+        let raw_name = std::str::from_utf8(&hdr[0..16]).unwrap_or("").trim();
+        let (name, payload_size) = if let Some(rest) = raw_name.strip_prefix("#1/")
+            && let Ok(name_len) = rest.parse::<usize>()
+            && (name_len as u64) <= size
+        {
+            let mut nbuf = vec![0u8; name_len];
+            if f.read_exact(&mut nbuf).is_err() {
+                break;
+            }
+            let s = String::from_utf8_lossy(&nbuf).trim_end_matches('\0').to_string();
+            (s, size - name_len as u64)
+        } else {
+            (raw_name.trim_end_matches('/').to_string(), size)
+        };
+        if name == "lib.rmeta" {
+            let to_read = payload_size.min(64) as usize;
+            let mut buf = [0u8; 64];
+            if to_read > 0 && f.read_exact(&mut buf[..to_read]).is_ok() {
+                return Some(fnv1a(&buf[..to_read]));
+            }
+            return None;
+        }
+        let skip = payload_size + (size % 2);
+        if f.seek(SeekFrom::Current(skip as i64)).is_err() {
+            break;
+        }
+    }
+    None
+}
+
+/// Compute a unit's compiled artifact ABI hash for SVH compatibility checks.
+/// Prefers `.rmeta`, falls back to `.rlib`'s embedded `lib.rmeta`, and uses `fallback_fp` for
+/// non-library units (build scripts, `run-build-script`, proc-macros).
+fn unit_abi_hash(dir: Option<&Path>, classic_artifact: Option<&Path>, fallback_fp: u64) -> u64 {
+    if let Some(unit_dir) = dir {
+        let mut rmeta = None;
+        let mut rlib = None;
+        for e in fs::read_dir(unit_dir.join("out")).into_iter().flatten().flatten() {
+            let p = e.path();
+            match p.extension().and_then(|x| x.to_str()) {
+                Some("rmeta") => {
+                    rmeta = Some(p);
+                    break;
+                }
+                Some("rlib") if rlib.is_none() => rlib = Some(p),
+                _ => {}
+            }
+        }
+        if let Some(p) = rmeta {
+            return rmeta_header_hash(&p).unwrap_or(fallback_fp);
+        }
+        if let Some(p) = rlib {
+            return rlib_abi_hash(&p).unwrap_or(fallback_fp);
+        }
+        return fallback_fp;
+    }
+    if let Some(p) = classic_artifact {
+        return match p.extension().and_then(|x| x.to_str()) {
+            Some("rmeta") => rmeta_header_hash(p).unwrap_or(fallback_fp),
+            Some("rlib") => rlib_abi_hash(p).unwrap_or(fallback_fp),
+            _ => fallback_fp,
+        };
+    }
+    fallback_fp
+}
+
+/// Pick the best classic-layout artifact (`.rmeta` over `.rlib`) per unit hash in `profile/deps`.
+fn classic_deps_artifacts(profile: &Path) -> HashMap<String, PathBuf> {
+    let mut out: HashMap<String, PathBuf> = HashMap::new();
+    for e in fs::read_dir(profile.join("deps")).into_iter().flatten().flatten() {
+        let name = e.file_name();
+        let Some(s) = name.to_str() else { continue };
+        let Some(hash) = unit_hash(s) else { continue };
+        let p = e.path();
+        match p.extension().and_then(|x| x.to_str()) {
+            Some("rmeta") => {
+                out.insert(hash.to_string(), p);
+            }
+            Some("rlib") => {
+                out.entry(hash.to_string()).or_insert(p);
+            }
+            _ => {}
+        }
+    }
+    out
 }
 
 fn safe_path_component(s: &str) -> bool {
@@ -2227,6 +2365,7 @@ fn extract_external_units(target: &Path, worktree: &Path, common_dir: &Path) -> 
         is_run_build_script: bool,
         rustc: Option<u64>,
         own_fp: Option<u64>,
+        abi: u64,
         deps: Vec<u64>,
         external: bool,
         references_worktree: bool,
@@ -2301,6 +2440,7 @@ fn extract_external_units(target: &Path, worktree: &Path, common_dir: &Path) -> 
         fingerprint: PathBuf,
         dir: Option<PathBuf>,
         classic_origin: Option<(Origin, bool)>,
+        classic_artifact: Option<PathBuf>,
     }
     let mut tasks = vec![];
 
@@ -2311,16 +2451,24 @@ fn extract_external_units(target: &Path, worktree: &Path, common_dir: &Path) -> 
             continue;
         }
         let mut origins: HashMap<String, (Origin, bool)> = HashMap::new();
+        let mut classic_artifacts: HashMap<String, PathBuf> = HashMap::new();
         for sub in [".fingerprint", "deps", "build", "examples"] {
             for e in fs::read_dir(profile.join(sub)).into_iter().flatten().flatten() {
                 let name = e.file_name();
                 let Some(s) = name.to_str() else { continue };
                 let Some(hash) = unit_hash(s) else { continue };
                 classic_files[p].entry(hash.to_string()).or_default().push(Path::new(sub).join(&name));
-                if sub == "deps" && s.ends_with(".d")
-                    && let Some(o) = origin(&e.path())
-                {
-                    origins.insert(hash.to_string(), (o, dep_refs_wt(&e.path())));
+                if sub == "deps" {
+                    let path = e.path();
+                    if s.ends_with(".d")
+                        && let Some(o) = origin(&path)
+                    {
+                        origins.insert(hash.to_string(), (o, dep_refs_wt(&path)));
+                    } else if s.ends_with(".rmeta") {
+                        classic_artifacts.insert(hash.to_string(), path);
+                    } else if s.ends_with(".rlib") {
+                        classic_artifacts.entry(hash.to_string()).or_insert(path);
+                    }
                 } else if sub == "build" && e.file_type().is_ok_and(|t| t.is_dir()) {
                     for f in fs::read_dir(e.path()).into_iter().flatten().flatten() {
                         let fname = f.file_name();
@@ -2337,6 +2485,7 @@ fn extract_external_units(target: &Path, worktree: &Path, common_dir: &Path) -> 
         for (hash, fingerprint, dir) in profile_units(profile) {
             let Some(hash) = hash else { continue };
             let classic_origin = if dir.is_none() { origins.remove(&hash) } else { None };
+            let classic_artifact = if dir.is_none() { classic_artifacts.remove(&hash) } else { None };
             tasks.push(UnitTask {
                 profile_idx: p,
                 profile_rel: profile_rel.clone(),
@@ -2344,6 +2493,7 @@ fn extract_external_units(target: &Path, worktree: &Path, common_dir: &Path) -> 
                 fingerprint,
                 dir,
                 classic_origin,
+                classic_artifact,
             });
         }
     }
@@ -2392,6 +2542,7 @@ fn extract_external_units(target: &Path, worktree: &Path, common_dir: &Path) -> 
         };
         refs_wt |= dep_wt;
         let external = finished && rustc.is_some() && own_fp.is_some() && !refs_wt && origin.is_some();
+        let abi = own_fp.map_or(0, |fp| unit_abi_hash(t.dir.as_deref(), t.classic_artifact.as_deref(), fp));
         (
             RawUnit {
                 profile_idx: t.profile_idx,
@@ -2402,6 +2553,7 @@ fn extract_external_units(target: &Path, worktree: &Path, common_dir: &Path) -> 
                 is_run_build_script: is_run_bs,
                 rustc,
                 own_fp,
+                abi,
                 deps,
                 external,
                 references_worktree: refs_wt,
@@ -2476,6 +2628,7 @@ fn extract_external_units(target: &Path, worktree: &Path, common_dir: &Path) -> 
         }
     }
 
+    let unit_abis: Vec<u64> = units.iter().map(|u| u.abi).collect();
     let mut out = vec![];
     for u in units.into_iter().filter(|u| u.external) {
         let Some(origin) = u.origin else { continue };
@@ -2490,7 +2643,22 @@ fn extract_external_units(target: &Path, worktree: &Path, common_dir: &Path) -> 
         if files.is_empty() {
             continue;
         }
-        out.push(ExternalUnit { profile_rel: u.profile_rel, hash: u.hash, origin, rustc, fp, deps: u.deps, files });
+        let dep_abis: Vec<(u64, u64)> = u
+            .deps
+            .iter()
+            .filter_map(|&dep_fp| by_fingerprint.get(&dep_fp).map(|&j| (dep_fp, unit_abis[j])))
+            .collect();
+        out.push(ExternalUnit {
+            profile_rel: u.profile_rel,
+            hash: u.hash,
+            origin,
+            rustc,
+            fp,
+            abi: u.abi,
+            deps: u.deps,
+            dep_abis,
+            files,
+        });
     }
     out
 }
@@ -2639,14 +2807,32 @@ fn harvest_shared(worktree: &Path, common_dir: &Path, slot_dir: &Path) -> Result
         dest_parent: PathBuf,
         dest: PathBuf,
         size: u64,
+        replace: bool,
     }
-    let mut pending = vec![];
-    let mut planned_extra = 0i64;
-    for unit in units {
+    enum Existing {
+        Missing,
+        Legacy,
+        Match(PathBuf),
+        Diverged,
+    }
+    let read_shared_meta = |dir: &Path| -> Option<SharedUnitMeta> {
+        fs::read(dir.join("meta.json")).ok().and_then(|b| serde_json::from_slice::<SharedUnitMeta>(&b).ok())
+    };
+    let mut by_fp: HashMap<u64, usize> = HashMap::with_capacity(units.len());
+    for (i, u) in units.iter().enumerate() {
+        by_fp.insert(u.fp, i);
+    }
+    let mut existing_states: Vec<Option<(PathBuf, PathBuf, Existing)>> = Vec::with_capacity(units.len());
+    let mut diverged = vec![false; units.len()];
+    for (i, unit) in units.iter().enumerate() {
         if mtime_ns(&compile_marker) != compile_marker_before {
+            existing_states.resize_with(units.len(), || None);
             break;
         }
-        let Some(origin_rel) = origin_subpath(&unit.origin) else { continue };
+        let Some(origin_rel) = origin_subpath(&unit.origin) else {
+            existing_states.push(None);
+            continue;
+        };
         let unit_name = format!(
             "{}__{}__{}__{}",
             encode_profile(&unit.profile_rel),
@@ -2656,24 +2842,77 @@ fn harvest_shared(worktree: &Path, common_dir: &Path, slot_dir: &Path) -> Result
         );
         let dest_parent = units_root.join(&origin_rel);
         let dest = dest_parent.join(&unit_name);
-        if dest.exists() {
-            if let Ok(d) = File::open(&dest) {
-                let _ = d.set_modified(now_time);
+        let state = if dest.exists() {
+            match read_shared_meta(&dest) {
+                Some(m) if m.version == SHARED_META_VERSION => {
+                    if m.abi == unit.abi {
+                        Existing::Match(dest.clone())
+                    } else {
+                        diverged[i] = true;
+                        Existing::Diverged
+                    }
+                }
+                _ => Existing::Legacy,
             }
-            continue;
-        }
-        // On non-CoW filesystems, avoid duplicating a unit that is already cached on another pool root.
-        if !reflink
-            && let Some(existing) = all_roots
+        } else if !reflink {
+            let mut found = Existing::Missing;
+            for other in all_roots
                 .iter()
                 .map(|r| r.join(SHARED_DIR).join("units").join(&origin_rel).join(&unit_name))
-                .find(|p| p.exists())
-        {
-            if let Ok(d) = File::open(&existing) {
-                let _ = d.set_modified(now_time);
+                .filter(|p| p.exists())
+            {
+                if let Some(m) = read_shared_meta(&other)
+                    && m.version == SHARED_META_VERSION
+                {
+                    if m.abi == unit.abi {
+                        found = Existing::Match(other);
+                    } else {
+                        diverged[i] = true;
+                        found = Existing::Diverged;
+                    }
+                    break;
+                }
             }
+            found
+        } else {
+            Existing::Missing
+        };
+        existing_states.push(Some((dest_parent, dest, state)));
+    }
+    // Never publish a unit whose transitive dependency has a different compiled ABI (SVH) than
+    // the canonical copy already in `shared/`, or hydration could mix incompatible SVHs.
+    let mut changed = true;
+    while changed {
+        changed = false;
+        for i in 0..units.len() {
+            if !diverged[i] && units[i].deps.iter().any(|fp| by_fp.get(fp).is_some_and(|&j| diverged[j])) {
+                diverged[i] = true;
+                changed = true;
+            }
+        }
+    }
+
+    let mut pending = vec![];
+    let mut planned_extra = 0i64;
+    for (i, (unit, slot_state)) in units.into_iter().zip(existing_states).enumerate() {
+        if mtime_ns(&compile_marker) != compile_marker_before {
+            break;
+        }
+        if diverged[i] {
             continue;
         }
+        let Some((dest_parent, dest, state)) = slot_state else { continue };
+        let replace = match state {
+            Existing::Match(existing) => {
+                if let Ok(d) = File::open(&existing) {
+                    let _ = d.set_modified(now_time);
+                }
+                continue;
+            }
+            Existing::Diverged => continue,
+            Existing::Legacy => true,
+            Existing::Missing => false,
+        };
         let profile_dir = target.join(&unit.profile_rel);
         let src_paths: Vec<PathBuf> = unit.files.iter().map(|rel| profile_dir.join(rel)).collect();
         let size = dir_size(&src_paths, &[]);
@@ -2683,7 +2922,7 @@ fn harvest_shared(worktree: &Path, common_dir: &Path, slot_dir: &Path) -> Result
             }
             planned_extra += size as i64;
         }
-        pending.push(Pending { unit, dest_parent, dest, size });
+        pending.push(Pending { unit, dest_parent, dest, size, replace });
     }
 
     // Pre-create destination origin directories once so workers don't race on mkdir.
@@ -2712,11 +2951,14 @@ fn harvest_shared(worktree: &Path, common_dir: &Path, slot_dir: &Path) -> Result
         let stage = tmp_root.join(format!("{pid}-{stamp}-{idx}"));
         let files_dir = stage.join("files");
         let meta = SharedUnitMeta {
+            version: SHARED_META_VERSION,
             profile: p.unit.profile_rel.clone(),
             hash: p.unit.hash.clone(),
             rustc: p.unit.rustc,
             fp: p.unit.fp,
+            abi: p.unit.abi,
             deps: p.unit.deps.clone(),
+            dep_abis: p.unit.dep_abis.clone(),
         };
         let mut linked = HashMap::new();
         let copy_ok = (|| -> Result<()> {
@@ -2733,6 +2975,12 @@ fn harvest_shared(worktree: &Path, common_dir: &Path, slot_dir: &Path) -> Result
                 aborted.store(true, Ordering::Relaxed);
             }
             return;
+        }
+        if p.replace {
+            let old = tmp_root.join(format!("old-{pid}-{stamp}-{idx}"));
+            if fs::rename(&p.dest, &old).is_ok() {
+                let _ = fs::remove_dir_all(&old);
+            }
         }
         if fs::rename(&stage, &p.dest).is_ok() {
             published.fetch_add(1, Ordering::Relaxed);
@@ -3028,15 +3276,17 @@ fn hydrate_slot(repo: &Repo, slot_dir: &Path, rustc_bin: Option<&OsString>) -> R
         let _ = fs::write(slot_dir.join("partial-profiles"), "");
     }
 
-    // Snapshot existing units and fingerprints already present in the slot (only for wanted profiles).
+    // Snapshot existing units, fingerprints, and compiled ABIs already present in the slot.
     let mut existing_units: HashSet<(String, String)> = HashSet::new();
-    let mut existing_fps: HashSet<u64> = HashSet::new();
+    let mut existing_abis: HashMap<u64, u64> = HashMap::new();
     for profile in profile_dirs(&target) {
         let Ok(rel) = profile.strip_prefix(&target) else { continue };
         let rel = rel.to_string_lossy().into_owned();
-        for (hash, fingerprint, _) in profile_units(&profile) {
+        let classic_artifacts = classic_deps_artifacts(&profile);
+        for (hash, fingerprint, dir) in profile_units(&profile) {
             let Some(hash) = hash else { continue };
             let mut has_json = false;
+            let mut unit_fps = vec![];
             for f in fs::read_dir(&fingerprint).into_iter().flatten().flatten() {
                 let path = f.path();
                 if path.extension().is_none_or(|x| x != "json") {
@@ -3044,10 +3294,17 @@ fn hydrate_slot(repo: &Repo, slot_dir: &Path, rustc_bin: Option<&OsString>) -> R
                 }
                 has_json = true;
                 if let Some(fp) = fs::read_to_string(path.with_extension("")).ok().and_then(|s| u64::from_str_radix(s.trim(), 16).ok()) {
-                    existing_fps.insert(fp.swap_bytes());
+                    unit_fps.push(fp.swap_bytes());
                 }
             }
             if has_json {
+                if let Some(&first_fp) = unit_fps.first() {
+                    let classic = if dir.is_none() { classic_artifacts.get(&hash).map(PathBuf::as_path) } else { None };
+                    let abi = unit_abi_hash(dir.as_deref(), classic, first_fp);
+                    for fp in unit_fps {
+                        existing_abis.insert(fp, abi);
+                    }
+                }
                 existing_units.insert((rel.clone(), hash));
             }
         }
@@ -3090,7 +3347,11 @@ fn hydrate_slot(repo: &Repo, slot_dir: &Path, rustc_bin: Option<&OsString>) -> R
                     continue;
                 }
             }
-            let Some(meta) = fs::read(path.join("meta.json")).ok().and_then(|b| serde_json::from_slice::<SharedUnitMeta>(&b).ok()) else {
+            let Some(meta) = fs::read(path.join("meta.json"))
+                .ok()
+                .and_then(|b| serde_json::from_slice::<SharedUnitMeta>(&b).ok())
+                .filter(|m| m.version == SHARED_META_VERSION)
+            else {
                 continue;
             };
             by_key.insert(key, Candidate { path, root: root.to_path_buf(), mtime, meta, size: 0, reflink: false });
@@ -3132,9 +3393,15 @@ fn hydrate_slot(repo: &Repo, slot_dir: &Path, rustc_bin: Option<&OsString>) -> R
 
     let retain_complete = |cands: &mut Vec<Candidate>| {
         loop {
-            let avail: HashSet<u64> = existing_fps.iter().copied().chain(cands.iter().map(|c| c.meta.fp)).collect();
+            let mut avail: HashMap<u64, u64> = existing_abis.clone();
+            for c in cands.iter() {
+                avail.entry(c.meta.fp).or_insert(c.meta.abi);
+            }
             let before = cands.len();
-            cands.retain(|c| c.meta.deps.iter().all(|d| avail.contains(d)));
+            cands.retain(|c| {
+                c.meta.deps.iter().all(|d| avail.contains_key(d))
+                    && c.meta.dep_abis.iter().all(|&(dep_fp, dep_abi)| avail.get(&dep_fp) == Some(&dep_abi))
+            });
             if cands.len() == before {
                 break;
             }

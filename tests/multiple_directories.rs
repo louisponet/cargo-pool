@@ -2259,7 +2259,7 @@ fn real_cargo_build_reuses_external_dependencies_across_repositories() {
 }
 
 #[test]
-fn pressure_preserves_held_debug_incremental_over_non_debug_and_excess_free_slots() {
+fn pressure_preserves_held_active_incremental_over_inactive_and_excess_free_slots() {
     let f = Fixture::exclusive();
     let roots = &f.roots[..1];
     let held_wt = f.worktree("held");
@@ -2271,10 +2271,14 @@ fn pressure_preserves_held_debug_incremental_over_non_debug_and_excess_free_slot
     let held_target = fs::read_link(held_wt.join("target")).unwrap();
     fs::create_dir_all(held_target.join("debug/.fingerprint")).unwrap();
     fs::create_dir_all(held_target.join("debug/incremental/crate-a")).unwrap();
-    fs::write(held_target.join("debug/incremental/crate-a/cache"), vec![1; 4 << 20]).unwrap();
+    fs::write(held_target.join("debug/incremental/crate-a/cache"), vec![1; 8 << 20]).unwrap();
     fs::create_dir_all(held_target.join("release-with-debug/.fingerprint")).unwrap();
     fs::create_dir_all(held_target.join("release-with-debug/incremental/crate-a")).unwrap();
-    fs::write(held_target.join("release-with-debug/incremental/crate-a/cache"), vec![2; 8 << 20]).unwrap();
+    fs::write(held_target.join("release-with-debug/incremental/crate-a/cache"), vec![2; 4 << 20]).unwrap();
+    // Make `debug/incremental` older than `release-with-debug/incremental`, so
+    // `release-with-debug` is the slot's active incremental cache.
+    let older = SystemTime::now() - std::time::Duration::from_secs(3600);
+    fs::File::open(held_target.join("debug/incremental")).unwrap().set_modified(older).unwrap();
 
     let old_target = fs::read_link(free_old.join("target")).unwrap();
     let new_target = fs::read_link(free_new.join("target")).unwrap();
@@ -2288,8 +2292,8 @@ fn pressure_preserves_held_debug_incremental_over_non_debug_and_excess_free_slot
     json["last_used"] = 100.into();
     fs::write(&old_meta, serde_json::to_vec(&json).unwrap()).unwrap();
 
-    // Need ~12 MiB freed: held non-debug incremental (8 MiB) + excess free slot (8 MiB) satisfy it
-    // without touching held debug/incremental (4 MiB) or the newest free slot reserve.
+    // Need ~12 MiB freed: held inactive incremental (8 MiB) + excess free slot (8 MiB) satisfy it
+    // without touching held active `release-with-debug/incremental` (4 MiB) or the newest free slot reserve.
     success(
         f.command(env!("CARGO_BIN_EXE_cargo-pool"), &held_wt)
             .env("CARGO_POOL_DIR", &f.roots[0])
@@ -2298,10 +2302,166 @@ fn pressure_preserves_held_debug_incremental_over_non_debug_and_excess_free_slot
             .output()
             .unwrap(),
     );
-    assert_eq!(fs::read_dir(held_target.join("release-with-debug/incremental")).unwrap().count(), 0, "non-debug incremental goes first");
-    assert!(!old_target.exists(), "excess free slot goes before held debug incremental");
-    assert_eq!(fs::read_dir(held_target.join("debug/incremental")).unwrap().count(), 1, "held debug incremental survives");
+    assert_eq!(fs::read_dir(held_target.join("debug/incremental")).unwrap().count(), 0, "inactive incremental goes first");
+    assert!(!old_target.exists(), "excess free slot goes before held active incremental");
+    assert_eq!(
+        fs::read_dir(held_target.join("release-with-debug/incremental")).unwrap().count(),
+        1,
+        "held active incremental survives"
+    );
     assert!(new_target.exists(), "newest free slot reserve survives");
+}
+
+#[test]
+fn shared_cache_rejects_mismatched_svh_units_across_worktrees() {
+    let f = Fixture::new();
+    let roots = &f.roots[..1];
+    let rustc = write_fake_rustc(&f.dir);
+    let lock = "version = 4\n\n\
+                [[package]]\nname = \"dep_a\"\nversion = \"1.0.0\"\nsource = \"registry+https://github.com/rust-lang/crates.io-index\"\n\n\
+                [[package]]\nname = \"dep_b\"\nversion = \"1.0.0\"\nsource = \"registry+https://github.com/rust-lang/crates.io-index\"\n\n\
+                [[package]]\nname = \"dep_c\"\nversion = \"1.0.0\"\nsource = \"registry+https://github.com/rust-lang/crates.io-index\"\n";
+    fs::write(f.repo.join("Cargo.lock"), lock).unwrap();
+    f.git(&f.repo, &["add", "Cargo.lock"]);
+    f.git(&f.repo, &["commit", "-qm", "lock"]);
+
+    // Worktree A compiles dep_a (SVH-A) and dep_b -> harvests both as the canonical lineage.
+    f.pool(&f.repo, roots, &["attach", "--no-seed"]);
+    let target_a = fs::read_link(f.repo.join("target")).unwrap();
+    let slot_a = target_a.parent().unwrap().to_path_buf();
+    fs::write(slot_a.join("last-rustc"), rustc.as_os_str().as_encoded_bytes()).unwrap();
+    seed_external_unit(&target_a.join("debug"), &target_a, "dep_a", "1.0.0", "aaaaaaaaaaaaaaaa", 77, 1001, &[], b"svh-from-worktree-a");
+    seed_external_unit(&target_a.join("debug"), &target_a, "dep_b", "1.0.0", "bbbbbbbbbbbbbbbb", 77, 1002, &[1001], b"dep-b-for-svh-a");
+    f.pool(&f.repo, roots, &["snapshot-after-build", slot_a.to_str().unwrap()]);
+
+    // Worktree B already has its own dep_a with a different SVH (SVH-B) and builds dep_c against it.
+    let wt_b = f.worktree("b");
+    f.pool(&wt_b, roots, &["attach", "--no-seed"]);
+    let target_b = fs::read_link(wt_b.join("target")).unwrap();
+    let slot_b = target_b.parent().unwrap().to_path_buf();
+    fs::write(slot_b.join("last-rustc"), rustc.as_os_str().as_encoded_bytes()).unwrap();
+    seed_external_unit(&target_b.join("debug"), &target_b, "dep_a", "1.0.0", "aaaaaaaaaaaaaaaa", 77, 1001, &[], b"svh-from-worktree-b");
+    seed_external_unit(&target_b.join("debug"), &target_b, "dep_c", "1.0.0", "cccccccccccccccc", 77, 1003, &[1001], b"dep-c-for-svh-b");
+
+    // Probing B must NOT hydrate dep_b (compiled for SVH-A) into a slot holding SVH-B.
+    f.pool(&wt_b, roots, &[rustc.to_str().unwrap(), "-vV"]);
+    assert!(
+        !target_b.join("debug/deps/libdep_b-bbbbbbbbbbbbbbbb.rlib").exists(),
+        "must not hydrate dep_b compiled against a different dep_a SVH"
+    );
+
+    // Harvesting B must NOT publish dep_c (compiled for SVH-B) into shared/ where dep_a is SVH-A.
+    f.pool(&wt_b, roots, &["snapshot-after-build", slot_b.to_str().unwrap()]);
+    let dep_c_shared = f.roots[0].join("shared/units/reg/dep_c-1.0.0/debug__cccccccccccccccc__77__1003");
+    assert!(
+        !dep_c_shared.exists(),
+        "must not harvest dep_c whose dep_a SVH diverges from shared/ canonical dep_a"
+    );
+
+    // Worktree C (fresh empty slot) hydrates the consistent (dep_a SVH-A, dep_b) pair cleanly.
+    let wt_c = f.worktree("c");
+    f.pool(&wt_c, roots, &["attach", "--no-seed"]);
+    let target_c = fs::read_link(wt_c.join("target")).unwrap();
+    f.pool(&wt_c, roots, &[rustc.to_str().unwrap(), "-vV"]);
+    assert_eq!(fs::read(target_c.join("debug/deps/libdep_a-aaaaaaaaaaaaaaaa.rlib")).unwrap(), b"svh-from-worktree-a");
+    assert_eq!(fs::read(target_c.join("debug/deps/libdep_b-bbbbbbbbbbbbbbbb.rlib")).unwrap(), b"dep-b-for-svh-a");
+
+    // A legacy v1 meta.json (without version=2) is ignored on hydration and replaced on harvest.
+    let dep_a_meta = f.roots[0].join("shared/units/reg/dep_a-1.0.0/debug__aaaaaaaaaaaaaaaa__77__1001/meta.json");
+    fs::write(
+        &dep_a_meta,
+        r#"{"profile":"debug","hash":"aaaaaaaaaaaaaaaa","rustc":77,"fp":1001,"deps":[]}"#,
+    )
+    .unwrap();
+    let wt_d = f.worktree("d");
+    f.pool(&wt_d, roots, &["attach", "--no-seed"]);
+    let target_d = fs::read_link(wt_d.join("target")).unwrap();
+    f.pool(&wt_d, roots, &[rustc.to_str().unwrap(), "-vV"]);
+    assert!(
+        !target_d.join("debug/deps/libdep_a-aaaaaaaaaaaaaaaa.rlib").exists(),
+        "legacy v1 shared units without ABI metadata must not be hydrated"
+    );
+    fs::remove_file(slot_a.join("harvested-once")).unwrap();
+    f.pool(&f.repo, roots, &["snapshot-after-build", slot_a.to_str().unwrap()]);
+    let updated: serde_json::Value = serde_json::from_slice(&fs::read(&dep_a_meta).unwrap()).unwrap();
+    assert_eq!(updated["version"], 2, "harvest should replace legacy v1 unit with v2");
+}
+
+#[test]
+fn real_cargo_build_never_mixes_out_dir_svh_across_worktrees() {
+    let f = Fixture::new();
+    let roots = &f.roots[..1];
+    f.pool(&f.repo, roots, &["install-wrapper"]);
+
+    // `extbase` includes a generated file from OUT_DIR, so its rustc SVH depends on the worktree path.
+    let base = f.dir.join("extbase");
+    fs::create_dir_all(base.join("src")).unwrap();
+    fs::write(base.join("Cargo.toml"), "[package]\nname = \"extbase\"\nversion = \"0.1.0\"\nedition = \"2021\"\n").unwrap();
+    fs::write(
+        base.join("build.rs"),
+        "fn main() {\n\
+            let out = std::env::var(\"OUT_DIR\").unwrap();\n\
+            std::fs::write(format!(\"{out}/val.rs\"), \"pub const VAL: u32 = 7;\").unwrap();\n\
+            println!(\"cargo:rerun-if-changed=build.rs\");\n\
+         }\n",
+    )
+    .unwrap();
+    fs::write(base.join("src/lib.rs"), "include!(concat!(env!(\"OUT_DIR\"), \"/val.rs\"));\n").unwrap();
+    f.git(&base, &["init", "-q"]);
+    f.git(&base, &["add", "."]);
+    f.git(&base, &["commit", "-qm", "init"]);
+    let base_url = format!("file://{}", base.display());
+
+    // `extmid` depends on `extbase` (no build script of its own, like `bitflags` depending on `serde_core`).
+    let mid = f.dir.join("extmid");
+    fs::create_dir_all(mid.join("src")).unwrap();
+    fs::write(
+        mid.join("Cargo.toml"),
+        format!("[package]\nname = \"extmid\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[dependencies]\nextbase = {{ git = \"{base_url}\" }}\n"),
+    )
+    .unwrap();
+    fs::write(mid.join("src/lib.rs"), "pub fn val() -> u32 { extbase::VAL + 1 }\n").unwrap();
+    f.git(&mid, &["init", "-q"]);
+    f.git(&mid, &["add", "."]);
+    f.git(&mid, &["commit", "-qm", "init"]);
+    let mid_url = format!("file://{}", mid.display());
+
+    // Repo A builds extbase + extmid and harvests both into shared/.
+    fs::write(
+        f.repo.join("Cargo.toml"),
+        format!("[package]\nname = \"app\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[dependencies]\nextbase = {{ git = \"{base_url}\" }}\nextmid = {{ git = \"{mid_url}\" }}\n"),
+    )
+    .unwrap();
+    fs::write(f.repo.join("src/main.rs"), "fn main() { assert_eq!(extmid::val(), 8); }\n").unwrap();
+    f.git(&f.repo, &["add", "."]);
+    f.git(&f.repo, &["commit", "-qm", "deps"]);
+
+    // Worktree B builds ONLY extbase locally BEFORE Repo A harvests, giving B a worktree-B SVH for extbase.
+    let wt_b = f.worktree("b");
+    f.pool(&wt_b, roots, &["attach", "--no-seed"]);
+    let slot_b = fs::read_link(wt_b.join("target")).unwrap().parent().unwrap().to_path_buf();
+    success(f.command("cargo", &wt_b).env("CARGO_POOL_DIRS", &f.roots[0]).args(["build", "-p", "extbase"]).output().unwrap());
+    let snap_b = fs::OpenOptions::new().create(true).truncate(false).write(true).open(slot_b.join("snapshot.lock")).unwrap();
+    assert_eq!(unsafe { libc::flock(snap_b.as_raw_fd(), libc::LOCK_EX) }, 0);
+    drop(snap_b);
+
+    // Wipe shared/ so Repo A becomes the canonical shared lineage with worktree-A's SVH.
+    let _ = fs::remove_dir_all(f.roots[0].join("shared"));
+    f.pool(&f.repo, roots, &["attach", "--no-seed"]);
+    let slot_a = fs::read_link(f.repo.join("target")).unwrap().parent().unwrap().to_path_buf();
+    success(f.command("cargo", &f.repo).env("CARGO_POOL_DIRS", &f.roots[0]).args(["build"]).output().unwrap());
+    let snap_a = fs::OpenOptions::new().create(true).truncate(false).write(true).open(slot_a.join("snapshot.lock")).unwrap();
+    assert_eq!(unsafe { libc::flock(snap_a.as_raw_fd(), libc::LOCK_EX) }, 0);
+    drop(snap_a);
+    f.pool(&f.repo, roots, &["snapshot-after-build", slot_a.to_str().unwrap()]);
+
+    // Now Worktree B builds the full `app` (which needs `extmid` -> `extbase`).
+    // Hydration must NOT inject Repo A's `extmid` (linked against SVH-A) next to B's `extbase` (SVH-B),
+    // which previously caused `error[E0463]: can't find crate for extmid`.
+    let out = f.command("cargo", &wt_b).env("CARGO_POOL_DIRS", &f.roots[0]).args(["build"]).output().unwrap();
+    assert!(out.status.success(), "wt_b build hit SVH mismatch: {}", String::from_utf8_lossy(&out.stderr));
+    let snap_b2 = fs::OpenOptions::new().create(true).truncate(false).write(true).open(slot_b.join("snapshot.lock")).unwrap();
+    assert_eq!(unsafe { libc::flock(snap_b2.as_raw_fd(), libc::LOCK_EX) }, 0);
 }
 
 #[test]

@@ -54,8 +54,9 @@ Share warm cargo `target/` directories between git worktrees, so a fresh worktre
 - **Global shared dependency cache**: after each build that compiled external crates (and when
   adopting an existing `target/`), cargo-pool harvests finished external registry and git
   dependency units into `<pool-directory>/shared/` (excluding any unit whose inputs reference
-  the checkout or its `.git/` metadata, leaving 1% disk headroom below `maxDiskPercent` and
-  avoiding cross-disk duplicates on non-CoW filesystems). Any new worktree, monorepo
+  the checkout or its `.git/` metadata, tracking compiled `.rmeta`/`.rlib` SVH hashes so units
+  with worktree-dependent `OUT_DIR` SVHs never mix incompatible dependency ABIs, leaving 1% disk
+  headroom below `maxDiskPercent`, and avoiding cross-disk duplicates on non-CoW filesystems). Any new worktree, monorepo
   workspace, or separate repository whose `Cargo.lock` and toolchain match hydrates missing
   dependency units from `shared/` in parallel using copy-on-write reflinks when available
   (`FICLONE` on btrfs/XFS, falling back to `copy_file_range` on ext4, where hydration is
@@ -69,10 +70,10 @@ Share warm cargo `target/` directories between git worktrees, so a fresh worktre
   installed, see below) and on `gc`, for the disks of all configured directories, not only the
   one being written to: new slots go to the disk with the most room, so a full disk might
   otherwise never see another build. Space is reclaimed in order: unheld slots' `incremental/`
-  caches, held slots' non-`debug` `incremental/` caches, excess free slots (keeping the newest
-  free slot per pool), held slots' `debug/incremental/` caches, least recently used entries
-  from the global shared dependency cache, and finally remaining slots (whether or not a
-  worktree holds them). A slot counts as used when something is compiled into it or it is released. A worktree whose slot is deleted loses its `target` link and
+  caches, held slots' inactive (older) `incremental/` caches, excess free slots (keeping the
+  newest free slot per pool), held slots' active (newest) `incremental/` caches, least recently
+  used entries from the global shared dependency cache, and finally remaining slots (whether or
+  not a worktree holds them). A slot counts as used when something is compiled into it or it is released. A worktree whose slot is deleted loses its `target` link and
   gets a new slot on its next cargo command. Slots with a build running or being seeded
   are never touched. Once attached, the main checkout's slot follows the same eviction rules.
   A new slot is only seeded if the copy fits under the limit (with reflinks counted as 0
