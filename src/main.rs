@@ -85,6 +85,9 @@ enum Cmd {
         /// Also delete free slots unused for longer than this many days.
         #[arg(long)]
         max_age_days: Option<u64>,
+        /// Release held leases idle for longer than this many days back to the free pool.
+        #[arg(long)]
+        detach_idle_days: Option<u64>,
         #[arg(long)]
         dry_run: bool,
     },
@@ -161,7 +164,7 @@ fn run(cli: Cli) -> Result<()> {
         Cmd::Detach { path } => detach(&path_or_cwd(path)?),
         Cmd::Status { size } => status(size),
         Cmd::Stats { days } => stats(days),
-        Cmd::Gc { max_age_days, dry_run } => gc(max_age_days, dry_run),
+        Cmd::Gc { max_age_days, detach_idle_days, dry_run } => gc(max_age_days, detach_idle_days, dry_run),
         Cmd::Install { no_wrapper } => {
             install_hook_auto(None, false)?;
             if !no_wrapper {
@@ -310,6 +313,10 @@ impl Repo {
         setting(&self.common_dir, "CARGO_POOL_MAX_DISK_PERCENT", "cargo-pool.maxDiskPercent", 90.0)
     }
 
+    fn idle_lease_days(&self) -> Option<u64> {
+        idle_lease_days(&self.common_dir)
+    }
+
     fn slots_dir(&self) -> PathBuf {
         self.pool.join("slots")
     }
@@ -348,6 +355,27 @@ fn setting<T: std::str::FromStr>(git_dir: &Path, env: &str, git_key: &str, defau
         .or_else(|| git(git_dir, &["config", "--get", git_key]).ok())
         .and_then(|v| v.parse().ok())
         .unwrap_or(default)
+}
+
+/// Idle lease timeout in days (`CARGO_POOL_IDLE_LEASE_DAYS` / `cargo-pool.idleLeaseDays`).
+/// `None` when unset or `0` (disabled).
+fn idle_lease_days(git_dir: &Path) -> Option<u64> {
+    let raw = std::env::var("CARGO_POOL_IDLE_LEASE_DAYS")
+        .ok()
+        .or_else(|| git(git_dir, &["config", "--get", "cargo-pool.idleLeaseDays"]).ok())?;
+    match raw.trim().parse::<u64>().ok()? {
+        0 => None,
+        days => Some(days),
+    }
+}
+
+/// Repository git dir recorded for a pool, or `/` (reads only global git config) if absent/gone.
+fn pool_git_dir(pool: &Path) -> PathBuf {
+    fs::read_to_string(pool.join("repo"))
+        .ok()
+        .map(|s| PathBuf::from(s.trim()))
+        .filter(|p| p.is_dir())
+        .unwrap_or_else(|| PathBuf::from("/"))
 }
 
 fn pool_roots() -> Result<Vec<PathBuf>> {
@@ -389,7 +417,9 @@ fn select_pool(roots: &[PathBuf], key: &str, worktree: &Path, common_dir: &Path)
     let attached = fs::read_link(worktree.join("target")).ok();
     let head = git(worktree, &["rev-parse", "HEAD"]).ok();
     let max_disk = setting(common_dir, "CARGO_POOL_MAX_DISK_PERCENT", "cargo-pool.maxDiskPercent", 90.0);
+    let idle_cutoff = idle_lease_days(common_dir).map(|d| now().saturating_sub(d.saturating_mul(86400)));
     let mut warm = Vec::new();
+    let mut idle_warm = Vec::new();
     let mut capacity = Vec::new();
     for root in roots {
         fs::create_dir_all(root).with_context(|| format!("creating pool directory {}", root.display()))?;
@@ -414,11 +444,24 @@ fn select_pool(roots: &[PathBuf], key: &str, worktree: &Path, common_dir: &Path)
                         u64::MAX - slot.meta.last_used,
                         pool.clone(),
                     ));
+                } else if let Some(cutoff) = idle_cutoff
+                    && !slot.meta.seed_pending
+                    && is_idle_held(&slot, cutoff)
+                {
+                    let slot_head = slot.meta.lease.as_ref().map(|l| l.head.as_str()).or(slot.meta.last_head.as_deref());
+                    idle_warm.push((
+                        slot.last_active(),
+                        distance(worktree, slot_head, head.as_deref().unwrap_or("")),
+                        pool.clone(),
+                    ));
                 }
             }
         }
     }
     if let Some((_, _, pool)) = warm.into_iter().min() {
+        return Ok(pool);
+    }
+    if let Some((_, _, pool)) = idle_warm.into_iter().min() {
         return Ok(pool);
     }
     Ok(capacity.into_iter().max_by_key(|(bytes, _)| *bytes).unwrap().1)
@@ -614,6 +657,15 @@ impl Slot {
         self.meta.last_used.max(last_compile_ns(&self.dir) / 1_000_000_000)
     }
 
+    /// When a slot's current lease (if held) or previous lease was last active.
+    fn last_active(&self) -> u64 {
+        let used = self.last_used();
+        match &self.meta.lease {
+            Some(l) => used.max(l.acquired_at),
+            None => used,
+        }
+    }
+
     fn saved_files(&self, worktree: &Path) -> PathBuf {
         worktree.join("target.cargo-pool-files").join(format!("{:016x}", fnv1a(self.dir.as_os_str().as_encoded_bytes())))
     }
@@ -647,6 +699,10 @@ impl Slot {
 
     /// Turn a lease into a free slot, remembering what it was built for.
     fn release(&mut self, head: Option<String>) -> Result<()> {
+        self.release_at(head, now())
+    }
+
+    fn release_at(&mut self, head: Option<String>, min_last_used: u64) -> Result<()> {
         self.discard_partial_copy()?;
         if matches!(self.meta.adoption, Some(Adoption::Ready { .. })) {
             merge_target(&self.dir.join("target.adopting"), &self.target(), Conflict::Source)?;
@@ -659,8 +715,9 @@ impl Slot {
         }
         if let Some(l) = self.meta.lease.take() {
             self.meta.adoption = None;
+            self.meta.seed_pending = false;
             self.meta.last_head = head.or(Some(l.head));
-            self.meta.last_used = now().max(last_activity(&self.target()));
+            self.meta.last_used = min_last_used.max(last_activity(&self.target()));
         }
         Ok(())
     }
@@ -690,6 +747,64 @@ fn reclaim_stale(slots: &mut [Slot]) -> Result<()> {
         s.save()?;
     }
     Ok(())
+}
+
+/// Whether `s` is a held slot (not pending attach or adoption) last active before `cutoff`.
+fn is_idle_held(s: &Slot, cutoff: u64) -> bool {
+    let Some(l) = &s.meta.lease else { return false };
+    !l.pending && s.meta.adoption.is_none() && s.state() == State::Held && s.last_active() < cutoff
+}
+
+/// Replace `worktree/target` (if it still links to `slot_target`) with an empty directory and
+/// write its deferred `attach_marker` so the worktree transparently re-attaches on its next
+/// cargo command.
+fn rearm_deferred_attach(worktree: &Path, slot_target: &Path) -> Result<bool> {
+    let link = worktree.join("target");
+    if fs::read_link(&link).is_ok_and(|t| t == slot_target) {
+        if let Some(marker) = attach_marker(worktree) {
+            fs::write(marker, "")?;
+        }
+        fs::remove_file(&link)?;
+        fs::create_dir_all(&link)?;
+        return Ok(true);
+    }
+    Ok(false)
+}
+
+/// Release an idle held slot back to the free pool without deleting its artifacts, restoring the
+/// worktree's deferred attach marker so its next cargo command re-attaches transparently.
+/// Skips slots currently attaching, seeding, snapshotting, or building. Caller holds pool `.lock`.
+fn release_idle_slot(s: &mut Slot, cutoff: u64) -> Result<Option<PathBuf>> {
+    if !is_idle_held(s, cutoff) {
+        return Ok(None);
+    }
+    let worktree = s.meta.lease.as_ref().unwrap().worktree.clone();
+    let Some(marker) = attach_marker(&worktree) else {
+        return Ok(None);
+    };
+    let Some(_attach_lock) = FileLock::acquire(&marker.with_added_extension("lock"), false).ok().flatten() else {
+        return Ok(None);
+    };
+    let Some(_seed_lock) = FileLock::acquire(&s.dir.join("seed.lock"), false)? else {
+        return Ok(None);
+    };
+    let Some(_snap_lock) = FileLock::acquire(&s.dir.join("snapshot.lock"), false)? else {
+        return Ok(None);
+    };
+    let Some(_build_locks) = lock_target(&s.target(), false) else {
+        return Ok(None);
+    };
+    if !is_idle_held(s, cutoff) {
+        return Ok(None);
+    }
+    let last_active = s.last_active();
+    if !rearm_deferred_attach(&worktree, &s.target())? {
+        return Ok(None);
+    }
+    let head = git(&worktree, &["rev-parse", "HEAD"]).ok();
+    s.release_at(head, last_active)?;
+    s.save()?;
+    Ok(Some(worktree))
 }
 
 // ---------------------------------------------------------------------------
@@ -830,9 +945,14 @@ enum Evict {
 struct Reclaim {
     pool: PathBuf,
     slot: Slot,
+    /// Active lease (held and not past `idleLeaseDays`).
     held: bool,
+    /// If `Some(cutoff)`, this slot was held but past `idleLeaseDays` at scan time and is treated
+    /// at unheld priority once verified still idle under lock.
+    idle_cutoff: Option<u64>,
     deletable: bool,
-    /// Older unheld slot in a pool that has more than one unheld slot (keep the newest warm reserve).
+    /// Older unheld (or expired idle-held) slot in a pool with more than one such slot
+    /// (keep the newest warm reserve).
     excess_free: bool,
 }
 
@@ -921,6 +1041,7 @@ fn reclaim_candidates(root: &Path, protect: &[&Path], evict: Evict) -> Result<Ve
             if pool.file_name().is_some_and(|n| n == SHARED_DIR) || !pool.join("slots").is_dir() {
                 continue;
             }
+            let pool_idle_cutoff = idle_lease_days(&pool_git_dir(&pool)).map(|d| now().saturating_sub(d.saturating_mul(86400)));
             for s in load_slots(&pool.join("slots"))? {
                 if protect.contains(&s.dir.as_path()) {
                     continue;
@@ -933,12 +1054,22 @@ fn reclaim_candidates(root: &Path, protect: &[&Path], evict: Evict) -> Result<Ve
                     current.discard_partial_copy()?;
                 }
                 let used = s.last_used();
-                let (used, held, deletable) = match (s.state(), &s.meta.lease) {
+                let (used, held, idle_cutoff, deletable) = match (s.state(), &s.meta.lease) {
                     (State::Held, Some(l)) if l.pending => continue,
-                    (State::Held, Some(l)) => (used.max(l.acquired_at), true, evict == Evict::Any),
-                    _ => (used, false, true),
+                    (State::Held, Some(l)) => {
+                        let active = used.max(l.acquired_at);
+                        if pool_idle_cutoff.is_some_and(|c| active < c) && s.meta.adoption.is_none() {
+                            (active, false, pool_idle_cutoff, true)
+                        } else {
+                            (active, true, None, evict == Evict::Any)
+                        }
+                    }
+                    _ => (used, false, None, true),
                 };
-                candidates.push((used, Reclaim { pool: pool.clone(), slot: s, held, deletable, excess_free: false }));
+                candidates.push((
+                    used,
+                    Reclaim { pool: pool.clone(), slot: s, held, idle_cutoff, deletable, excess_free: false },
+                ));
             }
         }
     }
@@ -1067,6 +1198,9 @@ fn trim_slot_caches(
     quiet: bool,
 ) -> Result<bool> {
     let Some((s, _locks)) = lock_candidate(c)? else { return Ok(false) };
+    if c.idle_cutoff.is_some_and(|cutoff| s.state() == State::Held && !is_idle_held(&s, cutoff)) {
+        return Ok(false);
+    }
     let caches: Vec<PathBuf> = incremental_caches(&s.target()).into_iter().filter(|p| pred(p)).collect();
     let entries: Vec<PathBuf> = caches.iter().flat_map(fs::read_dir).flatten().flatten().map(|e| e.path()).collect();
     let size = dir_size(&entries, &[]);
@@ -1100,19 +1234,25 @@ fn trim_slot_caches(
 
 fn evict_slot(c: &Reclaim, evict: Evict, max_percent: f64, quiet: bool) -> Result<bool> {
     let Some((s, _locks)) = lock_candidate(c)? else { return Ok(false) };
-    if s.state() == State::Held && evict == Evict::Unheld {
-        return Ok(false);
+    if s.state() == State::Held {
+        let still_idle = c.idle_cutoff.is_some_and(|cutoff| is_idle_held(&s, cutoff));
+        if c.idle_cutoff.is_some() && !still_idle {
+            return Ok(false);
+        }
+        if !still_idle && (evict == Evict::Unheld || c.excess_free) {
+            return Ok(false);
+        }
     }
     let mut from = String::new();
+    let mut _attach_lock = None;
     if let (State::Held, Some(l)) = (s.state(), &s.meta.lease) {
-        let link = l.worktree.join("target");
-        if fs::read_link(&link).is_ok_and(|t| t == s.target()) {
-            if let Some(marker) = attach_marker(&l.worktree) {
-                fs::write(marker, "")?;
-            }
-            fs::remove_file(&link)?;
-            fs::create_dir_all(&link)?;
+        if let Some(marker) = attach_marker(&l.worktree) {
+            let Some(lock) = FileLock::acquire(&marker.with_added_extension("lock"), false).ok().flatten() else {
+                return Ok(false);
+            };
+            _attach_lock = Some(lock);
         }
+        rearm_deferred_attach(&l.worktree, &s.target())?;
         from = format!(", taken from worktree {}", l.worktree.display());
     }
     let size = dir_size([&s.dir], &[]);
@@ -1389,7 +1529,7 @@ fn check_disk_during_build(rustc_bin: &OsString, rustc_args: &[OsString]) -> Res
         }
         slot_dir = Some(dir);
     }
-    let git_dir = PathBuf::from(fs::read_to_string(root.join(pool).join("repo")).unwrap_or_default());
+    let git_dir = pool_git_dir(&root.join(pool));
     let max_disk = setting(&git_dir, "CARGO_POOL_MAX_DISK_PERCENT", "cargo-pool.maxDiskPercent", 90.0);
     // Every filesystem, not just this build's: new slots go where there's room, so a full one
     // might otherwise never see another build.
@@ -4345,7 +4485,7 @@ fn lease_slot(repo: &Repo, seed: bool, wait_for_build: bool, rustc_bin: Option<&
     // Best free slot: closest commit, then most recently used.
     let pending =
         slots.iter().position(|s| s.meta.lease.as_ref().is_some_and(|l| l.pending && l.worktree == repo.workspace));
-    let pick = slots
+    let mut pick = slots
         .iter()
         .enumerate()
         .filter(|(_, s)| !adopting && s.state() == State::Free)
@@ -4353,6 +4493,36 @@ fn lease_slot(repo: &Repo, seed: bool, wait_for_build: bool, rustc_bin: Option<&
             (distance(&repo.workspace, s.meta.last_head.as_deref(), &head), u64::MAX - s.meta.last_used)
         })
         .map(|(i, _)| i);
+
+    // If no free slot is available and idle-lease expiry is configured, demote the least recently
+    // active eligible idle held slot instead of creating and seeding a redundant slot.
+    if !adopting && pending.is_none() && pick.is_none()
+        && let Some(days) = repo.idle_lease_days()
+    {
+        let idle_cutoff = now().saturating_sub(days.saturating_mul(86400));
+        let mut idle_indices: Vec<usize> = slots
+            .iter()
+            .enumerate()
+            .filter(|(_, s)| {
+                !s.meta.seed_pending
+                    && is_idle_held(s, idle_cutoff)
+                    && s.meta.lease.as_ref().is_some_and(|l| l.worktree != repo.workspace)
+            })
+            .map(|(i, _)| i)
+            .collect();
+        idle_indices.sort_by_key(|&i| {
+            let s = &slots[i];
+            let slot_head = s.meta.lease.as_ref().map(|l| l.head.as_str()).or(s.meta.last_head.as_deref());
+            (s.last_active(), distance(&repo.workspace, slot_head, &head))
+        });
+        for i in idle_indices {
+            if let Some(worktree) = release_idle_slot(&mut slots[i], idle_cutoff)? {
+                eprintln!("cargo-pool: released idle slot {} from {} for reuse", slots[i].id, worktree.display());
+                pick = Some(i);
+                break;
+            }
+        }
+    }
 
     let slot_idx = match pending.or(pick) {
         Some(i) => {
@@ -5440,39 +5610,104 @@ fn dur(ms: u64) -> String {
     }
 }
 
-fn gc(max_age_days: Option<u64>, dry_run: bool) -> Result<()> {
+fn gc(max_age_days: Option<u64>, detach_idle_days: Option<u64>, dry_run: bool) -> Result<()> {
     let cwd = std::env::current_dir()?;
-    let repos = Repo::discover(&cwd)?;
+    let repos = Repo::discover(&cwd).unwrap_or_default();
     let roots = pool_roots()?;
-    let cutoff = max_age_days.map_or(0, |d| now().saturating_sub(d * 86400));
-    for (repo, root) in repos.iter().flat_map(|r| roots.iter().map(move |root| (r, root))) {
-        let repo = Repo { pool: fs::canonicalize(root)?.join(repo.pool.file_name().unwrap()), ..repo.clone() };
-        let lock = repo.lock()?;
-        let mut slots = load_slots(&repo.slots_dir())?;
+    let cutoff = max_age_days.map_or(0, |d| now().saturating_sub(d.saturating_mul(86400)));
+    let pools: Vec<(PathBuf, PathBuf)> = if !repos.is_empty() {
+        let mut out = Vec::new();
+        for (repo, root) in repos.iter().flat_map(|r| roots.iter().map(move |root| (r, root))) {
+            let pool = fs::canonicalize(root).unwrap_or_else(|_| root.clone()).join(repo.pool.file_name().unwrap());
+            if pool.join("slots").is_dir() {
+                out.push((pool, repo.common_dir.clone()));
+            }
+        }
+        out
+    } else {
+        let mut out = Vec::new();
+        for root in &roots {
+            let mut entries: Vec<PathBuf> = fs::read_dir(root)
+                .into_iter()
+                .flatten()
+                .flatten()
+                .filter(|e| e.file_name() != SHARED_DIR && e.path().join("slots").is_dir())
+                .map(|e| e.path())
+                .collect();
+            entries.sort();
+            for pool in entries {
+                let git_dir = pool_git_dir(&pool);
+                out.push((pool, git_dir));
+            }
+        }
+        out
+    };
+    let mut total_detached = 0usize;
+    let mut total_removed = 0usize;
+    for (pool, git_dir) in &pools {
+        let lock = FileLock::acquire(&pool.join(".lock"), true)?.ok_or_else(|| anyhow!("could not lock pool"))?;
+        let mut slots = load_slots(&pool.join("slots"))?;
         if !dry_run {
             reclaim_stale(&mut slots)?;
         }
-        let removed: BTreeMap<_, _> = slots
-            .iter()
-            .filter(|s| s.state() != State::Held && s.last_used() < cutoff)
-            .map(|s| (s.id, s.dir.clone()))
-            .collect();
-        for (id, dir) in &removed {
-            if !dry_run {
-                let Some(_seed_lock) = FileLock::acquire(&dir.join("seed.lock"), false)? else { continue };
-                let Some(_build_locks) = lock_target(&dir.join("target"), false) else { continue };
-                println!("removing slot {id} ({})", dir.display());
-                let size = dir_size([dir], &[]);
-                fs::remove_dir_all(dir)?;
-                record(dir, Event::Evict { bytes: size });
-            } else {
-                println!("would remove slot {id} ({})", dir.display());
+        let mut dry_detached = HashSet::new();
+        if let Some(d) = detach_idle_days.or_else(|| idle_lease_days(git_dir)) {
+            let idle_cutoff = now().saturating_sub(d.saturating_mul(86400));
+            for s in &mut slots {
+                if !is_idle_held(s, idle_cutoff) {
+                    continue;
+                }
+                if dry_run {
+                    if let Some(l) = &s.meta.lease
+                        && attach_marker(&l.worktree).is_some()
+                    {
+                        println!(
+                            "would detach idle slot {} from {} ({})",
+                            s.id,
+                            l.worktree.display(),
+                            s.dir.display()
+                        );
+                        dry_detached.insert(s.id);
+                        total_detached += 1;
+                    }
+                } else if let Some(worktree) = release_idle_slot(s, idle_cutoff)? {
+                    println!("detached idle slot {} from {} ({})", s.id, worktree.display(), s.dir.display());
+                    total_detached += 1;
+                }
             }
         }
-        if let (Some(d), true) = (max_age_days, removed.is_empty()) {
-            println!("no free slots unused for more than {d} days");
+        if max_age_days.is_some() {
+            let removed: BTreeMap<_, _> = slots
+                .iter()
+                .filter(|s| {
+                    let is_free = s.state() != State::Held || dry_detached.contains(&s.id);
+                    let age_ts = if dry_detached.contains(&s.id) { s.last_active() } else { s.last_used() };
+                    is_free && age_ts < cutoff
+                })
+                .map(|s| (s.id, s.dir.clone()))
+                .collect();
+            for (id, dir) in &removed {
+                if !dry_run {
+                    let Some(_seed_lock) = FileLock::acquire(&dir.join("seed.lock"), false)? else { continue };
+                    let Some(_build_locks) = lock_target(&dir.join("target"), false) else { continue };
+                    println!("removing slot {id} ({})", dir.display());
+                    let size = dir_size([dir], &[]);
+                    fs::remove_dir_all(dir)?;
+                    record(dir, Event::Evict { bytes: size });
+                    total_removed += 1;
+                } else {
+                    println!("would remove slot {id} ({})", dir.display());
+                    total_removed += 1;
+                }
+            }
         }
         drop(lock);
+    }
+    if let (Some(d), 0) = (detach_idle_days, total_detached) {
+        println!("no held slots idle for more than {d} days");
+    }
+    if let (Some(d), 0) = (max_age_days, total_removed) {
+        println!("no free slots unused for more than {d} days");
     }
     if max_age_days.is_some() {
         let cutoff_ns = cutoff.saturating_mul(1_000_000_000);
