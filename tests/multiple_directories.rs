@@ -66,6 +66,7 @@ impl Fixture {
             .env("CARGO_POOL_MAX_DISK_PERCENT", "100")
             .env_remove("CARGO_POOL_DIR")
             .env_remove("CARGO_POOL_DIRS")
+            .env_remove("CARGO_POOL_IDLE_LEASE_DAYS")
             .env_remove("CARGO_POOL_RUSTC_WRAPPER")
             .env_remove("GIT_DIR")
             .env_remove("GIT_WORK_TREE")
@@ -2554,4 +2555,307 @@ fn non_cow_seeds_and_hydrates_profiles_on_demand() {
     assert!(target1.join("release").is_dir(), "release profile should be seeded on demand");
     let snap_lock2 = fs::OpenOptions::new().create(true).truncate(false).write(true).open(slot1.join("snapshot.lock")).unwrap();
     assert_eq!(unsafe { libc::flock(snap_lock2.as_raw_fd(), libc::LOCK_EX) }, 0);
+}
+
+fn backdate_slot(slot_dir: &Path, age_secs: u64) {
+    let ts = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs().saturating_sub(age_secs);
+    let meta = slot_dir.join("slot.json");
+    let mut json: serde_json::Value = serde_json::from_slice(&fs::read(&meta).unwrap()).unwrap();
+    json["last_used"] = ts.into();
+    if let Some(lease) = json.get_mut("lease").and_then(|v| v.as_object_mut()) {
+        lease.insert("acquired_at".into(), ts.into());
+    }
+    fs::write(&meta, serde_json::to_vec(&json).unwrap()).unwrap();
+    let old = SystemTime::now() - std::time::Duration::from_secs(age_secs);
+    if slot_dir.join("last-compile").exists() {
+        fs::File::open(slot_dir.join("last-compile")).unwrap().set_modified(old).unwrap();
+    }
+    for rel in ["target/debug/deps", "target/debug/.fingerprint", "target/debug/incremental", "target/debug/build"] {
+        let p = slot_dir.join(rel);
+        if p.exists() {
+            fs::File::open(&p).unwrap().set_modified(old).unwrap();
+        }
+    }
+}
+
+#[test]
+fn gc_detach_idle_days_releases_idle_leases_and_rearms_worktree() {
+    let f = Fixture::new();
+    let roots = &f.roots[..1];
+    f.pool(&f.repo, roots, &["install-wrapper"]);
+    let a = f.worktree("a");
+    let b = f.worktree("b");
+    f.pool(&a, roots, &["attach", "--no-seed"]);
+    f.pool(&b, roots, &["attach", "--no-seed"]);
+    let target_a = fs::read_link(a.join("target")).unwrap();
+    let slot_a = target_a.parent().unwrap().to_path_buf();
+    let target_b = fs::read_link(b.join("target")).unwrap();
+    fs::write(target_a.join("warm-artifact"), "from-a").unwrap();
+    fs::write(target_b.join("warm-artifact"), "from-b").unwrap();
+
+    // Backdate slot A to 10 days ago; keep slot B fresh.
+    backdate_slot(&slot_a, 10 * 86_400);
+
+    // Dry-run reports the detachment without mutating slot A or worktree A.
+    let dry = f.pool(&f.repo, roots, &["gc", "--detach-idle-days", "5", "--dry-run"]);
+    assert!(dry.contains("would detach idle slot"), "dry-run output: {dry}");
+    assert_eq!(fs::read_link(a.join("target")).unwrap(), target_a);
+
+    // Real run releases slot A back to the free pool while preserving its warm artifacts and age.
+    let out = f.pool(&f.repo, roots, &["gc", "--detach-idle-days", "5"]);
+    assert!(out.contains("detached idle slot"), "gc output: {out}");
+    assert!(target_a.join("warm-artifact").exists(), "warm artifacts must remain in the free slot");
+    let meta_a: serde_json::Value = serde_json::from_slice(&fs::read(slot_a.join("slot.json")).unwrap()).unwrap();
+    assert!(meta_a["lease"].is_null(), "slot A must be free");
+    let now_secs = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
+    assert!(
+        now_secs.saturating_sub(meta_a["last_used"].as_u64().unwrap()) >= 9 * 86_400,
+        "releasing an idle lease must preserve its true last_used timestamp"
+    );
+    // Worktree A has an empty target/ dir and is armed for deferred re-attach; B stays attached.
+    let meta_link_a = fs::symlink_metadata(a.join("target")).unwrap();
+    assert!(meta_link_a.is_dir() && !meta_link_a.file_type().is_symlink());
+    assert!(fs::read_dir(a.join("target")).unwrap().next().is_none());
+    assert_eq!(fs::read_link(b.join("target")).unwrap(), target_b);
+
+    // `--max-age-days 30` keeps the 10-day-old free slot warm.
+    f.pool(&f.repo, roots, &["gc", "--max-age-days", "30"]);
+    assert!(target_a.exists());
+
+    // Next cargo probe in A transparently re-attaches to the warm slot with its artifacts intact.
+    assert_eq!(f.pool(&a, roots, &["/bin/true", "-vV"]), "");
+    assert_eq!(fs::read_link(a.join("target")).unwrap(), target_a);
+    assert_eq!(fs::read_to_string(a.join("target/warm-artifact")).unwrap(), "from-a");
+}
+
+#[test]
+fn idle_lease_release_skips_building_seeding_and_pending_slots() {
+    let f = Fixture::new();
+    let roots = &f.roots[..1];
+    let building = f.worktree("building");
+    let seeding = f.worktree("seeding");
+    let pending = f.worktree("pending");
+    let idle = f.worktree("idle");
+    for wt in [&building, &seeding, &pending, &idle] {
+        f.pool(wt, roots, &["attach", "--no-seed"]);
+    }
+    let t_building = fs::read_link(building.join("target")).unwrap();
+    let t_seeding = fs::read_link(seeding.join("target")).unwrap();
+    let t_pending = fs::read_link(pending.join("target")).unwrap();
+    let t_idle = fs::read_link(idle.join("target")).unwrap();
+    for t in [&t_building, &t_seeding, &t_pending, &t_idle] {
+        backdate_slot(t.parent().unwrap(), 10 * 86_400);
+    }
+
+    // Hold cargo's build lock on `building`.
+    fs::create_dir_all(t_building.join("debug")).unwrap();
+    let build_lock = fs::File::create(t_building.join("debug/.cargo-lock")).unwrap();
+    assert_eq!(unsafe { libc::flock(build_lock.as_raw_fd(), libc::LOCK_EX) }, 0);
+
+    // Hold `seed.lock` on `seeding`.
+    let seed_lock = fs::File::create(t_seeding.parent().unwrap().join("seed.lock")).unwrap();
+    assert_eq!(unsafe { libc::flock(seed_lock.as_raw_fd(), libc::LOCK_EX) }, 0);
+
+    // Mark `pending` as pending attach.
+    let pending_meta = t_pending.parent().unwrap().join("slot.json");
+    let mut json: serde_json::Value = serde_json::from_slice(&fs::read(&pending_meta).unwrap()).unwrap();
+    json["lease"]["pending"] = true.into();
+    fs::write(&pending_meta, serde_json::to_vec(&json).unwrap()).unwrap();
+
+    f.pool(&f.repo, roots, &["gc", "--detach-idle-days", "5"]);
+
+    assert_eq!(fs::read_link(building.join("target")).unwrap(), t_building, "building slot must not be detached");
+    assert_eq!(fs::read_link(seeding.join("target")).unwrap(), t_seeding, "seeding slot must not be detached");
+    assert_eq!(fs::read_link(pending.join("target")).unwrap(), t_pending, "pending slot must not be detached");
+    assert!(
+        fs::symlink_metadata(idle.join("target")).unwrap().is_dir()
+            && !fs::symlink_metadata(idle.join("target")).unwrap().file_type().is_symlink(),
+        "unlocked idle slot should be detached"
+    );
+    drop(build_lock);
+    drop(seed_lock);
+}
+
+#[test]
+fn idle_lease_days_reuses_idle_slot_on_attach_and_evicts_before_shared_cache() {
+    let f = Fixture::exclusive();
+    let roots = &f.roots[..1];
+    f.pool(&f.repo, roots, &["install-wrapper"]);
+
+    // Part 1: with `cargo-pool.idleLeaseDays` set and no free slots, attaching a new worktree
+    // reuses the idle held slot directly instead of creating/seeding a redundant slot.
+    f.git(&f.repo, &["config", "cargo-pool.idleLeaseDays", "5"]);
+    let a = f.worktree("a");
+    let b = f.worktree("b");
+    f.pool(&a, roots, &["attach", "--no-seed"]);
+    let target_a = fs::read_link(a.join("target")).unwrap();
+    let slot_a = target_a.parent().unwrap().to_path_buf();
+    fs::write(target_a.join("warm"), "reused").unwrap();
+    backdate_slot(&slot_a, 10 * 86_400);
+
+    f.pool(&b, roots, &["attach"]);
+    assert_eq!(fs::read_link(b.join("target")).unwrap(), target_a, "b should reuse idle slot a directly");
+    let a_meta = fs::symlink_metadata(a.join("target")).unwrap();
+    assert!(a_meta.is_dir() && !a_meta.file_type().is_symlink(), "a should be deferred-armed");
+    // When `a` later builds, it transparently re-attaches.
+    f.pool(&a, roots, &["/bin/true", "-vV"]);
+    assert!(fs::read_link(a.join("target")).unwrap().exists());
+
+    // Part 2: under disk pressure with `CARGO_POOL_IDLE_LEASE_DAYS=5`, excess expired idle-held
+    // slots are evicted (re-arming their worktrees) before active held incremental caches and
+    // before the global shared dependency cache.
+    let rustc = write_fake_rustc(&f.dir);
+    let lock = "version = 4\n\n[[package]]\nname = \"dep\"\nversion = \"1.0.0\"\nsource = \"registry+https://github.com/rust-lang/crates.io-index\"\n";
+    fs::write(f.repo.join("Cargo.lock"), lock).unwrap();
+
+    // Populate a 4 MiB shared dependency unit.
+    f.pool(&f.repo, roots, &["attach", "--no-seed"]);
+    let active_target = fs::read_link(f.repo.join("target")).unwrap();
+    let active_slot = active_target.parent().unwrap().to_path_buf();
+    fs::write(active_slot.join("last-rustc"), rustc.as_os_str().as_encoded_bytes()).unwrap();
+    let big = vec![b'x'; 4 << 20];
+    seed_external_unit(&active_target.join("debug"), &active_target, "dep", "1.0.0", "1111111111111111", 55, 3001, &[], &big);
+    f.pool(&f.repo, roots, &["snapshot-after-build", active_slot.to_str().unwrap()]);
+    let shared_unit = f.roots[0].join("shared/units/reg/dep-1.0.0/debug__1111111111111111__55__3001");
+    assert!(shared_unit.is_dir());
+
+    // Give the active held slot an active `debug/incremental` cache.
+    fs::create_dir_all(active_target.join("debug/incremental/app-0")).unwrap();
+    fs::write(active_target.join("debug/incremental/app-0/cache"), vec![1; 4 << 20]).unwrap();
+
+    // Make `a` (15d old) and `b` (10d old) idle held slots, each holding 8 MiB.
+    let t_a = fs::read_link(a.join("target")).unwrap();
+    let t_b = fs::read_link(b.join("target")).unwrap();
+    fs::write(t_a.join("blob"), vec![2; 8 << 20]).unwrap();
+    fs::write(t_b.join("blob"), vec![3; 8 << 20]).unwrap();
+    backdate_slot(t_a.parent().unwrap(), 15 * 86_400);
+    backdate_slot(t_b.parent().unwrap(), 10 * 86_400);
+
+    // Trigger disk pressure directly during a build (via the rustc wrapper) with
+    // `CARGO_POOL_IDLE_LEASE_DAYS=5` and needing 4 MiB freed.
+    let limit = limit_with_room(&f.roots[0], -(4 << 20));
+    let out_dir = active_target.join("debug/deps");
+    fs::create_dir_all(&out_dir).unwrap();
+    let snap_lock = fs::File::create(active_slot.join("snapshot.lock")).unwrap();
+    assert_eq!(unsafe { libc::flock(snap_lock.as_raw_fd(), libc::LOCK_EX) }, 0);
+    success(
+        f.command(env!("CARGO_BIN_EXE_cargo-pool"), &f.repo)
+            .env("CARGO_POOL_DIRS", &f.roots[0])
+            .env("CARGO_POOL_MAX_DISK_PERCENT", format!("{limit:.6}"))
+            .env("CARGO_POOL_IDLE_LEASE_DAYS", "5")
+            .args(["/bin/true", "--out-dir", out_dir.to_str().unwrap()])
+            .output()
+            .unwrap(),
+    );
+    drop(snap_lock);
+
+    assert!(!t_a.exists(), "oldest excess idle-held slot should be evicted under pressure");
+    assert!(
+        fs::symlink_metadata(a.join("target")).unwrap().is_dir()
+            && !fs::symlink_metadata(a.join("target")).unwrap().file_type().is_symlink(),
+        "evicted idle worktree should have deferred attach re-armed"
+    );
+    assert!(t_b.exists(), "newest idle slot reserve should survive");
+    assert!(shared_unit.exists(), "shared dependency cache must survive when evicting excess idle slots suffices");
+    assert_eq!(
+        fs::read_dir(active_target.join("debug/incremental")).unwrap().count(),
+        1,
+        "active held slot's incremental cache must survive"
+    );
+}
+
+#[test]
+fn gc_runs_globally_outside_git_repository() {
+    let f = Fixture::new();
+    let roots = &f.roots;
+    f.pool(&f.repo, roots, &["install-wrapper"]);
+
+    // Second independent repository in `f.dir/repo-b`.
+    let repo_b = f.dir.join("repo-b");
+    fs::create_dir_all(repo_b.join("src")).unwrap();
+    fs::write(repo_b.join("Cargo.toml"), "[package]\nname = \"repo-b\"\nversion = \"0.1.0\"\n").unwrap();
+    fs::write(repo_b.join("src/main.rs"), "fn main() {}\n").unwrap();
+    f.git(&repo_b, &["init", "-q"]);
+    f.git(&repo_b, &["add", "."]);
+    f.git(&repo_b, &["commit", "-qm", "init"]);
+
+    // Repo A on root 0: one stale slot (worktree deleted), one idle held slot (10d), one active held slot.
+    let stale_wt = f.worktree("stale");
+    let idle_a = f.worktree("idle-a");
+    let active_a = f.worktree("active-a");
+    f.pool(&stale_wt, &roots[..1], &["attach", "--no-seed"]);
+    f.pool(&idle_a, &roots[..1], &["attach", "--no-seed"]);
+    f.pool(&active_a, &roots[..1], &["attach", "--no-seed"]);
+    let stale_target = fs::read_link(stale_wt.join("target")).unwrap();
+    let idle_a_target = fs::read_link(idle_a.join("target")).unwrap();
+    let active_a_target = fs::read_link(active_a.join("target")).unwrap();
+    fs::remove_dir_all(&stale_wt).unwrap();
+    backdate_slot(idle_a_target.parent().unwrap(), 10 * 86_400);
+
+    // Repo B on root 1: one very old free slot (40d), one idle held slot (10d).
+    let wt_b_free = f.dir.join("wt-b-free");
+    f.git(&repo_b, &["worktree", "add", "-qb", "b-free", wt_b_free.to_str().unwrap()]);
+    let wt_b_idle = f.dir.join("wt-b-idle");
+    f.git(&repo_b, &["worktree", "add", "-qb", "b-idle", wt_b_idle.to_str().unwrap()]);
+    f.pool(&wt_b_free, &roots[1..], &["attach", "--no-seed"]);
+    f.pool(&wt_b_idle, &roots[1..], &["attach", "--no-seed"]);
+    let b_free_target = fs::read_link(wt_b_free.join("target")).unwrap();
+    let b_idle_target = fs::read_link(wt_b_idle.join("target")).unwrap();
+    f.pool(&wt_b_free, &roots[1..], &["detach"]);
+    backdate_slot(b_free_target.parent().unwrap(), 40 * 86_400);
+    backdate_slot(b_idle_target.parent().unwrap(), 10 * 86_400);
+
+    // Old shared dependency unit (40d) in root 0.
+    let old_shared = roots[0].join("shared/units/reg/old-1.0.0/debug__1111111111111111__55__3001");
+    fs::create_dir_all(&old_shared).unwrap();
+    fs::write(old_shared.join("meta.json"), "{}").unwrap();
+    let forty_days_ago = SystemTime::now() - std::time::Duration::from_secs(40 * 86_400);
+    fs::File::open(&old_shared).unwrap().set_modified(forty_days_ago).unwrap();
+
+    // Run `gc` from `f.dir` (outside any git repository!).
+    let dry = f.pool(&f.dir, roots, &["gc", "--detach-idle-days", "5", "--max-age-days", "30", "--dry-run"]);
+    assert!(dry.contains("would detach idle slot"));
+    assert!(dry.contains("would remove slot"));
+    assert!(dry.contains("would remove 1 shared dependency units"));
+    assert!(b_free_target.exists() && old_shared.exists());
+
+    let out = f.pool(&f.dir, roots, &["gc", "--detach-idle-days", "5", "--max-age-days", "30"]);
+    assert!(out.contains("detached idle slot"));
+    assert!(out.contains("removing slot"));
+    assert!(out.contains("removed 1 shared dependency units"));
+
+    // Stale slot in Repo A was reclaimed to free.
+    let stale_meta: serde_json::Value =
+        serde_json::from_slice(&fs::read(stale_target.parent().unwrap().join("slot.json")).unwrap()).unwrap();
+    assert!(stale_meta["lease"].is_null(), "stale slot should be reclaimed globally");
+
+    // Idle held slots in BOTH repos were detached to free (and kept warm since 10d < 30d), with
+    // deferred attach re-armed on their worktrees.
+    for (wt, target) in [(&idle_a, &idle_a_target), (&wt_b_idle, &b_idle_target)] {
+        assert!(target.exists(), "10d idle slot should stay warm under --max-age-days 30");
+        let meta: serde_json::Value =
+            serde_json::from_slice(&fs::read(target.parent().unwrap().join("slot.json")).unwrap()).unwrap();
+        assert!(meta["lease"].is_null(), "idle slot should be free");
+        let link_meta = fs::symlink_metadata(wt.join("target")).unwrap();
+        assert!(link_meta.is_dir() && !link_meta.file_type().is_symlink());
+    }
+
+    // Active held slot in Repo A is untouched.
+    assert_eq!(fs::read_link(active_a.join("target")).unwrap(), active_a_target);
+
+    // 40-day-old free slot in Repo B and 40-day-old shared unit were pruned.
+    assert!(!b_free_target.exists(), "40d free slot in repo-b should be pruned globally");
+    assert!(!old_shared.exists(), "40d shared unit should be pruned globally");
+
+    // Re-running globally with `--max-age-days 7` prunes the 10-day-old detached slots too.
+    f.pool(&f.dir, roots, &["gc", "--max-age-days", "7"]);
+    assert!(!idle_a_target.exists() && !b_idle_target.exists());
+
+    // Global `cargo-pool.idleLeaseDays` in ~/.gitconfig also applies when running `gc` outside a repo.
+    f.git(&f.repo, &["config", "--global", "cargo-pool.idleLeaseDays", "5"]);
+    backdate_slot(active_a_target.parent().unwrap(), 10 * 86_400);
+    f.pool(&f.dir, roots, &["gc"]);
+    let active_meta: serde_json::Value =
+        serde_json::from_slice(&fs::read(active_a_target.parent().unwrap().join("slot.json")).unwrap()).unwrap();
+    assert!(active_meta["lease"].is_null(), "global git config idleLeaseDays should detach idle slot outside a repo");
 }

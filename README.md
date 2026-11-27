@@ -69,20 +69,27 @@ Share warm cargo `target/` directories between git worktrees, so a fresh worktre
   directories, until usage is back under the limit. This happens on every attach, on every pooled build (with the rustc wrapper
   installed, see below) and on `gc`, for the disks of all configured directories, not only the
   one being written to: new slots go to the disk with the most room, so a full disk might
-  otherwise never see another build. Space is reclaimed in order: unheld slots' `incremental/`
-  caches, held slots' inactive (older) `incremental/` caches, excess free slots (keeping the
-  newest free slot per pool), held slots' active (newest) `incremental/` caches, least recently
-  used entries from the global shared dependency cache, and finally remaining slots (whether or
-  not a worktree holds them). A slot counts as used when something is compiled into it or it is released. A worktree whose slot is deleted loses its `target` link and
-  gets a new slot on its next cargo command. Slots with a build running or being seeded
-  are never touched. Once attached, the main checkout's slot follows the same eviction rules.
+  otherwise never see another build. Space is reclaimed in order: unheld (and expired idle-held)
+  slots' `incremental/` caches, active held slots' inactive (older) `incremental/` caches, excess
+  free or expired idle-held slots (keeping the newest warm reserve per pool), active held slots'
+  active (newest) `incremental/` caches, least recently used entries from the global shared
+  dependency cache, and finally remaining slots (whether or not a worktree holds them). A slot
+  counts as used when something is compiled into it or it is released. A worktree whose slot is
+  deleted or released for idleness loses its `target` link and gets a new slot on its next cargo
+  command. Slots with a build running, seeding, or pending attach are never touched. Once
+  attached, the main checkout's slot follows the same eviction rules.
   A new slot is only seeded if the copy fits under the limit (with reflinks counted as 0
   extra bytes on CoW filesystems). Making room for it deletes
-  incremental caches, excess free slots, shared dependency units, and remaining unheld slots; if that isn't enough,
+  incremental caches, excess free slots, shared dependency units, and remaining unheld (or expired
+  idle-held) slots; if that isn't enough,
   nothing is deleted and the slot falls back to hydrating from `shared/` (narrowing to the
   active profile if needed) or starts empty.
-- Leases end on their own when the worktree is deleted (`git worktree remove`),
-  or explicitly with `cargo-pool detach`.
+- Leases end on their own when the worktree is deleted (`git worktree remove`), explicitly with
+  `cargo-pool detach`, or when idle past `cargo pool gc --detach-idle-days <D>` /
+  `cargo-pool.idleLeaseDays`. An idle-released slot returns to the free pool with its warm
+  artifacts intact, and its worktree's deferred attach marker is restored so the next cargo
+  command re-attaches transparently. When `idleLeaseDays` is set and no free slot is available,
+  `attach` reuses the least recently active expired idle slot instead of seeding a redundant one.
 - `/target` is added to `.git/info/exclude`, because `target/` patterns in `.gitignore`
   don't match symlinks.
 
@@ -241,7 +248,7 @@ with nothing to compile don't show up, and without the wrapper no builds are rec
 | `cargo pool detach [path]` | release the slots and remove the symlinks, or cancel a deferred attach or unfinished copy |
 | `cargo pool status [--size]` | show slots for this repo (all pools and shared dependency cache outside a repo) |
 | `cargo pool stats [--days D]` | show recorded metrics for this repo (all pools outside a repo) |
-| `cargo pool gc [--max-age-days D] [--dry-run]` | free disk space if over the limit; optionally delete free slots and shared dependency units older than D days |
+| `cargo pool gc [--max-age-days D] [--detach-idle-days D] [--dry-run]` | reclaim stale leases and free disk space if over the limit (for this repo, or all pools outside a repo); optionally release idle held leases back to the free pool and delete free slots and shared dependency units older than D days |
 | `cargo pool install [--no-wrapper]` / `uninstall` | set up / remove the hook and the rustc wrapper |
 | `cargo pool install-hook [path] [--repo]` / `uninstall-hook [path]` | only the hook (global if supported, else per repo) |
 | `cargo pool install-wrapper` / `uninstall-wrapper` | only the rustc wrapper |
@@ -255,6 +262,7 @@ Each setting comes from an environment variable or git config, with the env var 
 | `CARGO_POOL_DIRS` | global `cargo-pool.directory` entries | unset |
 | `CARGO_POOL_DIR` | – | `$XDG_CACHE_HOME/cargo-pool` or `~/.cache/cargo-pool` |
 | `CARGO_POOL_MAX_DISK_PERCENT` | `cargo-pool.maxDiskPercent` | 90 |
+| `CARGO_POOL_IDLE_LEASE_DAYS` | `cargo-pool.idleLeaseDays` | unset (0 turns it off) |
 | `CARGO_POOL_BACKDATE` | `cargo-pool.backdate` | true |
 | `CARGO_POOL_JOBS` | global `cargo-pool.jobs` | number of CPUs (0 turns the cap off) |
 | `CARGO_POOL_RUSTC_WRAPPER` | – | none (e.g. `sccache`) |
